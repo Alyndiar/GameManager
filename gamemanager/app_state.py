@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from gamemanager.db import Database
@@ -30,9 +31,17 @@ class AppState:
     def list_roots(self) -> list[RootFolder]:
         return self.db.list_roots()
 
-    def add_root(self, path: str) -> None:
-        normalized = str(Path(path).resolve())
-        self.db.add_root(normalized)
+    def add_root(self, path: str) -> str:
+        if not path or not path.strip():
+            raise ValueError("Path is empty.")
+        normalized = os.path.normpath(os.path.abspath(path.strip()))
+        root_path = Path(normalized)
+        if not root_path.exists():
+            raise ValueError(f"Folder does not exist: {normalized}")
+        if not root_path.is_dir():
+            raise ValueError(f"Path is not a folder: {normalized}")
+        inserted = self.db.add_root(str(root_path))
+        return "added" if inserted else "duplicate"
 
     def remove_root(self, root_id: int) -> None:
         self.db.remove_root(root_id)
@@ -101,4 +110,3 @@ class AppState:
         self, plan_items: list[MovePlanItem]
     ) -> OperationReport:
         return execute_move_plan(plan_items)
-

@@ -171,7 +171,20 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(self, "Select Root Folder")
         if not selected:
             return
-        self.state.add_root(selected)
+        try:
+            result = self.state.add_root(selected)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Add Root", str(exc))
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot Add Root", f"Filesystem error: {exc}")
+            return
+        if result == "duplicate":
+            QMessageBox.information(
+                self,
+                "Already Added",
+                f"Root is already in the list:\n{selected}",
+            )
         self.refresh_all()
 
     def _on_remove_root(self) -> None:
@@ -317,4 +330,3 @@ class MainWindow(QMainWindow):
             lines.extend(report.details[:8])
         QMessageBox.information(self, "Move Result", "\n".join(lines))
         self.refresh_all()
-

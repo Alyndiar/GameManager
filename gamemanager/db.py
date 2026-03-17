@@ -70,15 +70,16 @@ class Database:
             for row in rows
         ]
 
-    def add_root(self, path: str) -> None:
+    def add_root(self, path: str) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO root_folders(path, enabled, added_at)
                 VALUES (?, 1, ?)
                 """,
                 (path, utc_now_iso()),
             )
+        return cursor.rowcount > 0
 
     def remove_root(self, root_id: int) -> None:
         with self._connect() as conn:
@@ -152,4 +153,3 @@ class Database:
                 """,
                 [(c, o, n, e, now) for c, o, n, e in rows],
             )
-
