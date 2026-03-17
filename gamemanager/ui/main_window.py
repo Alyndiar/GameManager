@@ -6,14 +6,18 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QEvent, QProcess, Qt, QTimer
+from PySide6.QtGui import QAction, QKeyEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -22,14 +26,16 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QMenu,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from gamemanager.app_state import AppState
-from gamemanager.models import InventoryItem, RootDisplayInfo
+from gamemanager.models import InventoryItem, MovePlanItem, OperationReport, RootDisplayInfo
 from gamemanager.services.sorting import natural_key
 from gamemanager.services.storage import mountpoint_sort_key
+from gamemanager.services.teracopy import DEFAULT_TERACOPY_PATH, resolve_teracopy_path
 from gamemanager.ui.dialogs import (
     CleanupPreviewDialog,
     DeleteGroupDialog,
@@ -48,6 +54,11 @@ LEFT_LABEL_OPTIONS = {
     "Letter/mountpoint": "source",
     "Drive name": "name",
     "Both": "both",
+}
+
+MOVE_BACKEND_OPTIONS = {
+    "System": "system",
+    "TeraCopy": "teracopy",
 }
 
 RIGHT_COLUMNS = [
@@ -131,6 +142,23 @@ def _filter_only_duplicate_cleaned_names(items: list[InventoryItem]) -> list[Inv
     ]
 
 
+def _filter_by_root_id(
+    items: list[InventoryItem], selected_root_id: int | None
+) -> list[InventoryItem]:
+    if selected_root_id is None:
+        return items
+    return [item for item in items if item.root_id == selected_root_id]
+
+
+def _filter_by_cleaned_name_query(
+    items: list[InventoryItem], query_text: str
+) -> list[InventoryItem]:
+    needle = query_text.strip().casefold()
+    if not needle:
+        return items
+    return [item for item in items if needle in item.cleaned_name.casefold()]
+
+
 class MainWindow(QMainWindow):
     def __init__(self, state: AppState):
         super().__init__()
@@ -144,6 +172,22 @@ class MainWindow(QMainWindow):
         self._initial_split_applied = False
         self._show_only_duplicates = False
         self._visible_right_items: list[InventoryItem] = []
+        self._loaded_roots_count = 0
+        self._loaded_entries_count = 0
+        self._teracopy_path_pref = DEFAULT_TERACOPY_PATH
+        self._teracopy_executable: str | None = None
+        self._teracopy_process: QProcess | None = None
+        self._teracopy_pending_batches: list[tuple[str, str, int]] = []
+        self._teracopy_temp_files: list[str] = []
+        self._teracopy_current_batch_size = 0
+        self._teracopy_current_target = ""
+        self._teracopy_current_output = ""
+        self._teracopy_completion_title = "Move Completed"
+        self._teracopy_total_items = 0
+        self._teracopy_succeeded_items = 0
+        self._teracopy_failed_items = 0
+        self._teracopy_failure_details: list[str] = []
+        self._teracopy_finish_callback: Callable[[int, int, list[str]], None] | None = None
 
         root = QWidget(self)
         root_layout = QVBoxLayout(root)
@@ -159,6 +203,9 @@ class MainWindow(QMainWindow):
         self.cleanup_btn = QPushButton("Cleanup Names (Disk)")
         self.tags_btn = QPushButton("Find Tags")
         self.move_btn = QPushButton("Move ISO/Archives")
+        self.move_backend_combo = QComboBox(self)
+        self.move_backend_combo.addItems(MOVE_BACKEND_OPTIONS.keys())
+        self.locate_teracopy_btn = QPushButton("Locate TeraCopy")
         top_controls.addWidget(self.add_root_btn)
         top_controls.addWidget(self.remove_root_btn)
         top_controls.addWidget(self.refresh_btn)
@@ -168,6 +215,9 @@ class MainWindow(QMainWindow):
         top_controls.addWidget(self.cleanup_btn)
         top_controls.addWidget(self.tags_btn)
         top_controls.addWidget(self.move_btn)
+        top_controls.addWidget(QLabel("Move backend:"))
+        top_controls.addWidget(self.move_backend_combo)
+        top_controls.addWidget(self.locate_teracopy_btn)
         top_controls.addStretch(1)
         root_layout.addLayout(top_controls)
 
@@ -196,7 +246,27 @@ class MainWindow(QMainWindow):
         self.left_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.left_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.left_table.setShowGrid(True)
+        self.left_table.setAcceptDrops(True)
+        self.left_table.viewport().setAcceptDrops(True)
         left_layout.addWidget(self.left_table, 1)
+
+        self.left_filter_section = QFrame(self.left_panel)
+        self.left_filter_section.setFrameShape(QFrame.Shape.StyledPanel)
+        self.left_filter_section.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        filter_layout = QVBoxLayout(self.left_filter_section)
+        filter_layout.setContentsMargins(8, 6, 8, 6)
+        filter_layout.setSpacing(4)
+        filter_layout.addWidget(QLabel("Filter (Cleaned Name):", self.left_filter_section))
+
+        self.left_filter_edit = QLineEdit(self.left_filter_section)
+        self.left_filter_edit.setPlaceholderText(
+            "Type anywhere to filter by cleaned name"
+        )
+        self.left_filter_edit.setClearButtonEnabled(True)
+        filter_layout.addWidget(self.left_filter_edit)
+        left_layout.addWidget(self.left_filter_section, 0)
 
         right_panel = QWidget(self.splitter)
         right_layout = QVBoxLayout(right_panel)
@@ -208,7 +278,13 @@ class MainWindow(QMainWindow):
         self.right_table.setWordWrap(True)
         self.right_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.right_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.right_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
         self.right_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.right_table.setDragEnabled(True)
+        self.right_table.setDragDropMode(QTableWidget.DragDropMode.DragOnly)
+        self.right_table.setDefaultDropAction(Qt.DropAction.MoveAction)
         right_layout.addWidget(self.right_table, 1)
 
         self.splitter.addWidget(self.left_panel)
@@ -216,9 +292,21 @@ class MainWindow(QMainWindow):
         self.splitter.setSizes([300, 1000])
 
         self.setCentralWidget(root)
-        self.statusBar().showMessage("Ready")
+        self._status_left_label = QLabel("", self)
+        self._status_left_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.statusBar().addWidget(self._status_left_label, 1)
+        self._status_selected_label = QLabel("| Selected: 0 games, 0 B", self)
+        self._status_selected_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.statusBar().addPermanentWidget(self._status_selected_label, 0)
 
         self._wire_events()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._load_prefs()
         self.refresh_all()
         QTimer.singleShot(0, self._apply_initial_splitter_sizes)
@@ -233,17 +321,27 @@ class MainWindow(QMainWindow):
         self.cleanup_btn.clicked.connect(self._on_cleanup)
         self.tags_btn.clicked.connect(self._on_find_tags)
         self.move_btn.clicked.connect(self._on_move_archives)
+        self.move_backend_combo.currentTextChanged.connect(self._on_move_backend_changed)
+        self.locate_teracopy_btn.clicked.connect(self._on_locate_teracopy)
         self.left_sort_combo.currentTextChanged.connect(self._on_left_pref_changed)
         self.left_label_combo.currentTextChanged.connect(self._on_left_pref_changed)
+        self.left_filter_edit.textChanged.connect(self._on_left_filter_changed)
+        self.left_table.itemSelectionChanged.connect(self._on_left_selection_changed)
+        self.left_table.viewport().installEventFilter(self)
         self.right_table.horizontalHeader().sectionClicked.connect(
             self._on_right_header_clicked
         )
         self.right_table.itemDoubleClicked.connect(self._on_right_item_double_clicked)
         self.right_table.customContextMenuRequested.connect(self._on_right_context_menu)
+        self.right_table.itemSelectionChanged.connect(self._on_right_selection_changed)
 
     def _load_prefs(self) -> None:
         sort_pref = self.state.get_ui_pref("left_sort", "source_label")
         label_pref = self.state.get_ui_pref("left_label_mode", "source")
+        move_backend_pref = self.state.get_ui_pref("move_backend", "system")
+        self._teracopy_path_pref = self.state.get_ui_pref(
+            "teracopy_path", DEFAULT_TERACOPY_PATH
+        )
 
         for text, value in LEFT_SORT_OPTIONS.items():
             if value == sort_pref:
@@ -253,6 +351,12 @@ class MainWindow(QMainWindow):
             if value == label_pref:
                 self.left_label_combo.setCurrentText(text)
                 break
+        for text, value in MOVE_BACKEND_OPTIONS.items():
+            if value == move_backend_pref:
+                self.move_backend_combo.setCurrentText(text)
+                break
+        self._teracopy_executable = resolve_teracopy_path(self._teracopy_path_pref)
+        self._update_move_backend_ui()
 
     def _on_left_pref_changed(self) -> None:
         sort_key = LEFT_SORT_OPTIONS[self.left_sort_combo.currentText()]
@@ -262,19 +366,159 @@ class MainWindow(QMainWindow):
         self._populate_left(self.root_infos)
         self._populate_right(self.inventory)
 
+    def _current_move_backend(self) -> str:
+        return MOVE_BACKEND_OPTIONS.get(self.move_backend_combo.currentText(), "system")
+
+    def _update_move_backend_ui(self) -> None:
+        use_teracopy = self._current_move_backend() == "teracopy"
+        self.locate_teracopy_btn.setEnabled(use_teracopy)
+        if use_teracopy:
+            path = resolve_teracopy_path(self._teracopy_path_pref)
+            self._teracopy_executable = path
+            if path:
+                self.locate_teracopy_btn.setToolTip(path)
+            else:
+                self.locate_teracopy_btn.setToolTip(
+                    "TeraCopy not found. Click to auto-locate or choose manually."
+                )
+        else:
+            self.locate_teracopy_btn.setToolTip("")
+
+    def _on_move_backend_changed(self, _text: str) -> None:
+        backend = self._current_move_backend()
+        self.state.set_ui_pref("move_backend", backend)
+        self._update_move_backend_ui()
+
+    def _on_locate_teracopy(self) -> None:
+        resolved = resolve_teracopy_path(self._teracopy_path_pref)
+        if resolved:
+            self._teracopy_path_pref = resolved
+            self._teracopy_executable = resolved
+            self.state.set_ui_pref("teracopy_path", resolved)
+            self._update_move_backend_ui()
+            QMessageBox.information(self, "TeraCopy", f"Using:\n{resolved}")
+            return
+
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Locate TeraCopy.exe",
+            r"C:\Program Files\TeraCopy",
+            "Executables (*.exe);;All Files (*)",
+        )
+        if not selected:
+            return
+        selected = os.path.normpath(selected)
+        if not os.path.isfile(selected):
+            QMessageBox.warning(
+                self, "Invalid TeraCopy Path", f"File does not exist:\n{selected}"
+            )
+            return
+        self._teracopy_path_pref = selected
+        self._teracopy_executable = selected
+        self.state.set_ui_pref("teracopy_path", selected)
+        self._update_move_backend_ui()
+        QMessageBox.information(self, "TeraCopy", f"Using:\n{selected}")
+
     def _on_reset_right_sort(self) -> None:
         self._right_sort_column = _column_index_for_field("cleaned_name")
         self._right_sort_ascending = True
         self._update_right_headers()
         self._populate_right(self.inventory)
 
+    def _on_left_selection_changed(self) -> None:
+        self._populate_right(self.inventory)
+
+    def _on_left_filter_changed(self, _text: str) -> None:
+        self._populate_right(self.inventory)
+
+    def _handle_global_filter_keypress(self, event: QKeyEvent) -> bool:
+        active_window = QApplication.activeWindow()
+        if active_window is not self:
+            return False
+        if event.modifiers() & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        ):
+            return False
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QComboBox)):
+            return False
+        key = event.key()
+        current = self.left_filter_edit.text()
+        if key == Qt.Key.Key_Backspace:
+            if current:
+                self.left_filter_edit.setText(current[:-1])
+                return True
+            return False
+        if key == Qt.Key.Key_Escape:
+            if current:
+                self.left_filter_edit.clear()
+                return True
+            return False
+        text = event.text()
+        if text and text.isprintable():
+            self.left_filter_edit.setText(f"{current}{text}")
+            self.left_filter_edit.setCursorPosition(len(self.left_filter_edit.text()))
+            return True
+        return False
+
+    def eventFilter(self, watched, event):  # type: ignore[override]
+        if event.type() == QEvent.Type.KeyPress and self._handle_global_filter_keypress(
+            event
+        ):
+            return True
+        if watched is self.left_table.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    idx = self.left_table.indexAt(event.pos())
+                    selected_rows = {row.row() for row in self.left_table.selectionModel().selectedRows()}
+                    if not idx.isValid():
+                        if selected_rows:
+                            self.left_table.clearSelection()
+                        return False
+                    if (
+                        idx.row() in selected_rows
+                        and len(selected_rows) == 1
+                        and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                    ):
+                        self.left_table.clearSelection()
+                        return True
+            if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                if event.source() is self.right_table:
+                    idx = self.left_table.indexAt(event.pos())
+                    if idx.isValid() and self._selected_right_entries():
+                        event.acceptProposedAction()
+                        return True
+                event.ignore()
+                return True
+            if event.type() == QEvent.Type.Drop:
+                if event.source() is not self.right_table:
+                    event.ignore()
+                    return True
+                idx = self.left_table.indexAt(event.pos())
+                if not idx.isValid():
+                    event.ignore()
+                    return True
+                dest_item = self.left_table.item(idx.row(), 0)
+                if dest_item is None:
+                    event.ignore()
+                    return True
+                root_id = dest_item.data(Qt.ItemDataRole.UserRole)
+                if root_id is None:
+                    event.ignore()
+                    return True
+                self._move_selected_entries_to_root(int(root_id))
+                event.acceptProposedAction()
+                return True
+        return super().eventFilter(watched, event)
+
     def _on_toggle_show_duplicates(self, checked: bool) -> None:
         self._show_only_duplicates = checked
         self._populate_right(self.inventory)
-        if checked:
-            self.statusBar().showMessage("Showing only duplicate cleaned names.")
-        else:
-            self.statusBar().showMessage("Showing all entries.")
+
+    def _on_right_selection_changed(self) -> None:
+        self._update_counts_status()
 
     def _on_right_header_clicked(self, column: int) -> None:
         if column < 0 or column >= len(RIGHT_COLUMNS):
@@ -326,13 +570,19 @@ class MainWindow(QMainWindow):
             self.right_table.selectRow(index.row())
 
         menu = QMenu(self.right_table)
+        rename_action = QAction("Edit Name...", menu)
+        rename_action.triggered.connect(self._on_manual_rename_selected_entry)
+        menu.addAction(rename_action)
         delete_action = QAction("Delete Selected", menu)
         delete_action.triggered.connect(self._on_delete_selected_entries)
         menu.addAction(delete_action)
         menu.exec(self.right_table.viewport().mapToGlobal(pos))
 
     def _selected_right_entries(self) -> list[InventoryItem]:
-        rows = sorted({idx.row() for idx in self.right_table.selectionModel().selectedRows()})
+        model = self.right_table.selectionModel()
+        if model is None:
+            return []
+        rows = sorted({idx.row() for idx in model.selectedRows()})
         return [
             self._visible_right_items[row]
             for row in rows
@@ -344,6 +594,388 @@ class MainWindow(QMainWindow):
             shutil.rmtree(full_path)
             return
         os.remove(full_path)
+
+    def _move_selected_entries_to_root(self, destination_root_id: int) -> None:
+        selected = self._selected_right_entries()
+        if not selected:
+            return
+        destination = next(
+            (info for info in self.root_infos if info.root_id == destination_root_id), None
+        )
+        if destination is None:
+            QMessageBox.warning(self, "Invalid Destination", "Destination root not found.")
+            return
+
+        total_size = sum(item.size_bytes for item in selected)
+        try:
+            free_space = shutil.disk_usage(destination.root_path).free
+        except OSError:
+            free_space = destination.free_space_bytes
+        if total_size > free_space:
+            QMessageBox.warning(
+                self,
+                "Not Enough Space",
+                "Drag and drop cancelled: not enough free space on destination root.\n\n"
+                f"Selected size: {_format_bytes(total_size)}\n"
+                f"Free on destination: {_format_bytes(free_space)}\n"
+                f"Destination root: {destination.root_path}",
+            )
+            return
+
+        conflicts: list[str] = []
+        move_pairs: list[tuple[str, str]] = []
+        for entry in selected:
+            src = os.path.normpath(entry.full_path)
+            dst = os.path.normpath(os.path.join(destination.root_path, entry.full_name))
+            if os.path.normcase(src) == os.path.normcase(dst):
+                continue
+            if os.path.exists(dst):
+                conflicts.append(f"{entry.full_name} -> {dst}")
+                continue
+            move_pairs.append((src, dst))
+        if conflicts:
+            details = "\n".join(conflicts[:8])
+            QMessageBox.warning(
+                self,
+                "Destination Conflicts",
+                "Drag and drop cancelled: destination already has item(s).\n\n"
+                f"{details}",
+            )
+            return
+        if not move_pairs:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Confirm Move",
+            "Move selected games to destination root?\n\n"
+            f"Games selected: {len(move_pairs)}\n"
+            f"Total size: {_format_bytes(total_size)}\n"
+            f"Destination root: {destination.root_path}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+
+        if self._current_move_backend() == "teracopy":
+            if self._teracopy_process is not None:
+                QMessageBox.information(
+                    self,
+                    "Move In Progress",
+                    "Wait for the current TeraCopy operation to finish first.",
+                )
+                return
+            if self._start_teracopy_move_pairs(
+                move_pairs, completion_title="Move Completed"
+            ):
+                return
+            QMessageBox.warning(
+                self,
+                "TeraCopy Unavailable",
+                "TeraCopy could not be located. Falling back to system move.",
+            )
+
+        moved = 0
+        failed: list[str] = []
+        for src, dst in move_pairs:
+            try:
+                shutil.move(src, dst)
+                moved += 1
+            except OSError as exc:
+                failed.append(f"{src} -> {dst}: {exc}")
+        self.refresh_all()
+        if failed:
+            details = "\n".join(failed[:8])
+            QMessageBox.warning(
+                self,
+                "Move Completed with Errors",
+                f"Moved: {moved}\nFailed: {len(failed)}\n\n{details}",
+            )
+            return
+        QMessageBox.information(self, "Move Completed", f"Moved: {moved}")
+
+    def _set_move_controls_busy(self, busy: bool) -> None:
+        self.move_btn.setEnabled(not busy)
+        self.move_backend_combo.setEnabled(not busy)
+        self.locate_teracopy_btn.setEnabled(
+            (not busy) and self._current_move_backend() == "teracopy"
+        )
+        self.right_table.setDragEnabled(not busy)
+
+    def _resolve_teracopy_for_move(self, allow_manual_pick: bool) -> str | None:
+        resolved = resolve_teracopy_path(self._teracopy_path_pref)
+        if resolved:
+            if resolved != self._teracopy_path_pref:
+                self._teracopy_path_pref = resolved
+                self.state.set_ui_pref("teracopy_path", resolved)
+            self._teracopy_executable = resolved
+            self._update_move_backend_ui()
+            return resolved
+        if not allow_manual_pick:
+            return None
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Locate TeraCopy.exe",
+            r"C:\Program Files\TeraCopy",
+            "Executables (*.exe);;All Files (*)",
+        )
+        if not selected:
+            return None
+        selected = os.path.normpath(selected)
+        if not os.path.isfile(selected):
+            QMessageBox.warning(
+                self, "Invalid TeraCopy Path", f"File does not exist:\n{selected}"
+            )
+            return None
+        self._teracopy_path_pref = selected
+        self._teracopy_executable = selected
+        self.state.set_ui_pref("teracopy_path", selected)
+        self._update_move_backend_ui()
+        return selected
+
+    def _start_teracopy_move_pairs(
+        self,
+        move_pairs: list[tuple[str, str]],
+        completion_title: str,
+        on_finish: Callable[[int, int, list[str]], None] | None = None,
+    ) -> bool:
+        if self._teracopy_process is not None:
+            QMessageBox.information(
+                self,
+                "Move In Progress",
+                "Wait for the current TeraCopy operation to finish first.",
+            )
+            return False
+
+        teracopy_exe = self._resolve_teracopy_for_move(allow_manual_pick=True)
+        if not teracopy_exe:
+            return False
+
+        grouped: dict[str, list[str]] = {}
+        unsupported: list[tuple[str, str]] = []
+        for src, dst in move_pairs:
+            src_name = os.path.basename(src)
+            dst_name = os.path.basename(dst)
+            if src_name.casefold() != dst_name.casefold():
+                unsupported.append((src, dst))
+                continue
+            target_dir = os.path.dirname(dst)
+            grouped.setdefault(target_dir, []).append(src)
+
+        self._teracopy_pending_batches = []
+        self._teracopy_temp_files = []
+        self._teracopy_total_items = 0
+        self._teracopy_succeeded_items = 0
+        self._teracopy_failed_items = len(unsupported)
+        self._teracopy_current_batch_size = 0
+        self._teracopy_current_target = ""
+        self._teracopy_current_output = ""
+        self._teracopy_completion_title = completion_title
+        self._teracopy_finish_callback = on_finish
+        self._teracopy_failure_details = [
+            f"Fallback needed (renamed destination): {src} -> {dst}"
+            for src, dst in unsupported
+        ]
+
+        for target_dir, sources in grouped.items():
+            if not sources:
+                continue
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except OSError as exc:
+                self._teracopy_failed_items += len(sources)
+                self._teracopy_failure_details.append(
+                    f"Cannot create target folder {target_dir}: {exc}"
+                )
+                continue
+            handle = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8-sig", suffix=".txt", delete=False
+            )
+            with handle:
+                for src in sources:
+                    handle.write(f"{src}\n")
+            list_path = os.path.normpath(handle.name)
+            self._teracopy_temp_files.append(list_path)
+            self._teracopy_pending_batches.append((list_path, target_dir, len(sources)))
+            self._teracopy_total_items += len(sources)
+
+        if not self._teracopy_pending_batches:
+            self._cleanup_teracopy_temp_files()
+            self.refresh_all()
+            if self._teracopy_finish_callback is not None:
+                callback = self._teracopy_finish_callback
+                self._teracopy_finish_callback = None
+                callback(0, self._teracopy_failed_items, self._teracopy_failure_details)
+            elif self._teracopy_failed_items:
+                details = "\n".join(self._teracopy_failure_details[:8])
+                QMessageBox.warning(
+                    self,
+                    completion_title,
+                    f"Moved: 0\nFailed: {self._teracopy_failed_items}\n\n{details}",
+                )
+            return True
+
+        self._set_move_controls_busy(True)
+        self._teracopy_executable = teracopy_exe
+        self._launch_next_teracopy_batch()
+        return True
+
+    def _launch_next_teracopy_batch(self) -> None:
+        if not self._teracopy_pending_batches:
+            self._finish_teracopy_session()
+            return
+        list_path, target_dir, batch_size = self._teracopy_pending_batches.pop(0)
+        self._teracopy_current_batch_size = batch_size
+        self._teracopy_current_target = target_dir
+        self._teracopy_current_output = ""
+
+        proc = QProcess(self)
+        self._teracopy_process = proc
+        proc.readyReadStandardOutput.connect(self._on_teracopy_ready_read)
+        proc.readyReadStandardError.connect(self._on_teracopy_ready_read)
+        proc.errorOccurred.connect(self._on_teracopy_error)
+        proc.finished.connect(self._on_teracopy_finished)
+        proc.setProgram(self._teracopy_executable or "")
+        proc.setArguments(["Move", f"*{list_path}", target_dir, "/Close"])
+        proc.start()
+
+    def _on_teracopy_ready_read(self) -> None:
+        if self._teracopy_process is None:
+            return
+        out = bytes(self._teracopy_process.readAllStandardOutput()).decode(
+            "utf-8", errors="ignore"
+        )
+        err = bytes(self._teracopy_process.readAllStandardError()).decode(
+            "utf-8", errors="ignore"
+        )
+        chunk = (out + "\n" + err).strip()
+        if chunk:
+            self._teracopy_current_output = (
+                f"{self._teracopy_current_output}\n{chunk}".strip()
+            )
+
+    def _on_teracopy_error(self, process_error: QProcess.ProcessError) -> None:
+        self._teracopy_failure_details.append(
+            f"TeraCopy process error {int(process_error)} for {self._teracopy_current_target}"
+        )
+
+    def _on_teracopy_finished(
+        self, exit_code: int, exit_status: QProcess.ExitStatus
+    ) -> None:
+        if exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0:
+            self._teracopy_succeeded_items += self._teracopy_current_batch_size
+        else:
+            self._teracopy_failed_items += self._teracopy_current_batch_size
+            details = self._teracopy_current_output
+            if details:
+                details = details.splitlines()[-1].strip()
+            if not details:
+                details = f"exit_code={exit_code}"
+            self._teracopy_failure_details.append(
+                f"TeraCopy failed for {self._teracopy_current_target}: {details}"
+            )
+
+        if self._teracopy_process is not None:
+            self._teracopy_process.deleteLater()
+            self._teracopy_process = None
+        self._launch_next_teracopy_batch()
+
+    def _cleanup_teracopy_temp_files(self) -> None:
+        for path in self._teracopy_temp_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._teracopy_temp_files.clear()
+
+    def _finish_teracopy_session(self) -> None:
+        self._cleanup_teracopy_temp_files()
+        self._set_move_controls_busy(False)
+        succeeded = self._teracopy_succeeded_items
+        failed = self._teracopy_failed_items
+        details = list(self._teracopy_failure_details)
+        callback = self._teracopy_finish_callback
+        self._teracopy_finish_callback = None
+        self.refresh_all()
+        if callback is not None:
+            callback(succeeded, failed, details)
+            return
+        if failed:
+            detail_text = "\n".join(details[:8])
+            QMessageBox.warning(
+                self,
+                self._teracopy_completion_title,
+                f"Moved: {succeeded}\nFailed: {failed}\n\n{detail_text}",
+            )
+            return
+        QMessageBox.information(
+            self, self._teracopy_completion_title, f"Moved: {succeeded}"
+        )
+
+    def _on_manual_rename_selected_entry(self) -> None:
+        selected = self._selected_right_entries()
+        if len(selected) != 1:
+            QMessageBox.information(
+                self,
+                "Select One Entry",
+                "Select exactly one row to use manual rename.",
+            )
+            return
+        entry = selected[0]
+        old_path = os.path.normpath(entry.full_path)
+        parent_dir = os.path.dirname(old_path)
+        old_name = os.path.basename(old_path)
+
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Manual Rename",
+            "New name:",
+            text=old_name,
+        )
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Invalid Name", "New name cannot be empty.")
+            return
+        if any(ch in new_name for ch in ("/", "\\")):
+            QMessageBox.warning(
+                self, "Invalid Name", "New name cannot include path separators."
+            )
+            return
+        if new_name == old_name:
+            return
+        new_path = os.path.join(parent_dir, new_name)
+        if os.path.exists(new_path):
+            QMessageBox.warning(
+                self,
+                "Name Conflict",
+                f"Destination already exists:\n{new_path}",
+            )
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Rename",
+            "Rename this item on disk?\n\n"
+            f"From: {old_name}\n"
+            f"To:   {new_name}\n\n"
+            f"Folder: {parent_dir}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            os.rename(old_path, new_path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Rename Failed",
+                f"Could not rename:\n{old_path}\n\nto:\n{new_path}\n\n{exc}",
+            )
+            return
+        self.refresh_all()
 
     def _delete_path_with_elevation(self, full_path: str) -> tuple[bool, str]:
         path = os.path.normpath(full_path)
@@ -469,6 +1101,22 @@ class MainWindow(QMainWindow):
             return None
         return item.data(Qt.ItemDataRole.UserRole)
 
+    def _status_base_text(self) -> str:
+        active_roots = 1 if self._selected_root_id() is not None else len(self.root_infos)
+        visible_games = len(self._visible_right_items)
+        return (
+            f"Roots active: {active_roots}/{self._loaded_roots_count} | "
+            f"Games visible: {visible_games}/{self._loaded_entries_count}"
+        )
+
+    def _update_counts_status(self) -> None:
+        selected = self._selected_right_entries()
+        selected_size = sum(item.size_bytes for item in selected)
+        self._status_left_label.setText(self._status_base_text())
+        self._status_selected_label.setText(
+            f"| Selected: {len(selected)} games, {_format_bytes(selected_size)}"
+        )
+
     def _on_add_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select Root Folder")
         if not selected:
@@ -489,11 +1137,10 @@ class MainWindow(QMainWindow):
             )
             return
         self.root_infos = self.state.refresh_roots_only()
+        self._loaded_roots_count = len(self.root_infos)
         self._populate_left(self.root_infos)
         self._mark_refresh_needed(True)
-        self.statusBar().showMessage(
-            "Root added. Manual refresh required to scan inventory."
-        )
+        self._update_counts_status()
 
     def _on_remove_root(self) -> None:
         root_id = self._selected_root_id()
@@ -505,12 +1152,12 @@ class MainWindow(QMainWindow):
 
     def refresh_all(self) -> None:
         self.root_infos, self.inventory = self.state.refresh()
+        self._loaded_roots_count = len(self.root_infos)
+        self._loaded_entries_count = len(self.inventory)
         self._populate_left(self.root_infos)
         self._populate_right(self.inventory)
         self._mark_refresh_needed(False)
-        self.statusBar().showMessage(
-            f"Loaded {len(self.root_infos)} roots and {len(self.inventory)} root entries"
-        )
+        self._update_counts_status()
 
     def _apply_initial_splitter_sizes(self) -> None:
         if self._initial_split_applied:
@@ -625,6 +1272,7 @@ class MainWindow(QMainWindow):
         return container
 
     def _populate_left(self, roots: list[RootDisplayInfo]) -> None:
+        selected_root_id = self._selected_root_id()
         ordered = self._sorted_roots(roots)
         self.left_table.setRowCount(len(ordered))
         for row, info in enumerate(ordered):
@@ -638,14 +1286,21 @@ class MainWindow(QMainWindow):
             )
             self.left_table.setItem(row, 0, item)
             self.left_table.setCellWidget(row, 0, self._build_root_cell_widget(info))
+            if selected_root_id is not None and info.root_id == selected_root_id:
+                self.left_table.selectRow(row)
         self.left_table.resizeRowsToContents()
 
     def _populate_right(self, items: list[InventoryItem]) -> None:
         root_info_by_id = {info.root_id: info for info in self.root_infos}
+        selected_root_id = self._selected_root_id()
+        visible_items = _filter_by_root_id(items, selected_root_id)
+        visible_items = _filter_by_cleaned_name_query(
+            visible_items, self.left_filter_edit.text()
+        )
         visible_items = (
-            _filter_only_duplicate_cleaned_names(items)
+            _filter_only_duplicate_cleaned_names(visible_items)
             if self._show_only_duplicates
-            else items
+            else visible_items
         )
         sorted_items = self._sorted_inventory(visible_items, root_info_by_id)
         self._visible_right_items = sorted_items
@@ -667,6 +1322,7 @@ class MainWindow(QMainWindow):
                 f"Path: {entry.full_path}\nCleaned: {entry.cleaned_name}"
             )
         self.right_table.resizeColumnsToContents()
+        self._update_counts_status()
 
     def _on_find_tags(self) -> None:
         if not self.inventory:
@@ -691,7 +1347,6 @@ class MainWindow(QMainWindow):
         payload = dialog.result_payload()
         self.state.save_tag_decisions(payload.decisions, payload.display_map)
         self.refresh_all()
-        self.statusBar().showMessage("Tag decisions saved and inventory refreshed.")
 
     def _on_cleanup(self) -> None:
         plan = self.state.build_cleanup_plan()
@@ -731,7 +1386,16 @@ class MainWindow(QMainWindow):
         dialog = MovePreviewDialog(plan, self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        report = self.state.execute_archive_move_plan(dialog.applied_items())
+        applied_items = dialog.applied_items()
+        if self._current_move_backend() == "teracopy":
+            self._execute_archive_moves_with_teracopy(applied_items)
+            return
+
+        report = self.state.execute_archive_move_plan(applied_items)
+        self._show_archive_move_report(report)
+        self.refresh_all()
+
+    def _show_archive_move_report(self, report: OperationReport) -> None:
         lines = [
             f"Attempted: {report.total}",
             f"Succeeded: {report.succeeded}",
@@ -743,4 +1407,101 @@ class MainWindow(QMainWindow):
             lines.append("")
             lines.extend(report.details[:8])
         QMessageBox.information(self, "Move Result", "\n".join(lines))
+
+    def _execute_archive_moves_with_teracopy(
+        self, plan_items: list[MovePlanItem]
+    ) -> None:
+        if self._teracopy_process is not None:
+            QMessageBox.information(
+                self,
+                "Move In Progress",
+                "Wait for the current TeraCopy operation to finish first.",
+            )
+            return
+        if not self._resolve_teracopy_for_move(allow_manual_pick=True):
+            QMessageBox.warning(
+                self,
+                "TeraCopy Unavailable",
+                "TeraCopy could not be located. Falling back to system move.",
+            )
+            fallback_report = self.state.execute_archive_move_plan(plan_items)
+            self._show_archive_move_report(fallback_report)
+            self.refresh_all()
+            return
+
+        report = OperationReport(total=len(plan_items))
+        teracopy_pairs: list[tuple[str, str]] = []
+
+        for item in plan_items:
+            action = item.selected_action
+            if action == "skip":
+                report.skipped += 1
+                if item.status == "conflict":
+                    report.conflicts += 1
+                continue
+
+            src_path = os.path.normpath(str(item.src_path))
+            dst_path = os.path.normpath(str(item.dst_path))
+            dst_folder = os.path.normpath(str(item.dst_folder))
+            if action == "rename":
+                if not item.manual_name:
+                    report.failed += 1
+                    report.details.append(
+                        f"Missing manual name for {src_path}; action skipped."
+                    )
+                    continue
+                dst_path = os.path.normpath(os.path.join(dst_folder, item.manual_name))
+
+            if action in {"overwrite", "delete_destination"} and os.path.exists(dst_path):
+                try:
+                    self._delete_path(dst_path)
+                except OSError as exc:
+                    report.failed += 1
+                    report.details.append(f"Failed removing destination {dst_path}: {exc}")
+                    continue
+
+            if os.path.exists(dst_path):
+                report.conflicts += 1
+                report.skipped += 1
+                report.details.append(f"Conflict remains at destination: {dst_path}")
+                continue
+            if not os.path.exists(src_path):
+                report.failed += 1
+                report.details.append(f"Source does not exist: {src_path}")
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            except OSError as exc:
+                report.failed += 1
+                report.details.append(
+                    f"Failed creating destination folder for {dst_path}: {exc}"
+                )
+                continue
+
+            if os.path.basename(src_path).casefold() != os.path.basename(dst_path).casefold():
+                try:
+                    shutil.move(src_path, dst_path)
+                    report.succeeded += 1
+                except OSError as exc:
+                    report.failed += 1
+                    report.details.append(f"Failed move {src_path}: {exc}")
+                continue
+            teracopy_pairs.append((src_path, dst_path))
+
+        def _on_finish(succeeded: int, failed: int, details: list[str]) -> None:
+            report.succeeded += succeeded
+            report.failed += failed
+            report.details.extend(details)
+            self._show_archive_move_report(report)
+
+        if teracopy_pairs:
+            if self._start_teracopy_move_pairs(
+                teracopy_pairs,
+                completion_title="Move Result",
+                on_finish=_on_finish,
+            ):
+                return
+            return
+
         self.refresh_all()
+        self._show_archive_move_report(report)

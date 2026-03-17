@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from gamemanager.ui.main_window import (
+    _filter_by_root_id,
     _filter_only_duplicate_cleaned_names,
     _format_size_and_free,
     _source_display_text,
@@ -27,9 +28,17 @@ def test_size_free_format_uses_required_spacing_and_rounding() -> None:
 @dataclass
 class _Item:
     cleaned_name: str
+    root_id: int = 0
 
 
 def test_duplicate_filter_keeps_only_repeated_cleaned_names() -> None:
     items = [_Item("Alpha"), _Item("Beta"), _Item("alpha"), _Item("Gamma")]
     filtered = _filter_only_duplicate_cleaned_names(items)
     assert [x.cleaned_name for x in filtered] == ["Alpha", "alpha"]
+
+
+def test_root_filter_keeps_only_selected_root_items() -> None:
+    items = [_Item("A", root_id=1), _Item("B", root_id=2), _Item("C", root_id=1)]
+    filtered = _filter_by_root_id(items, 1)
+    assert [x.cleaned_name for x in filtered] == ["A", "C"]
+    assert _filter_by_root_id(items, None) == items
