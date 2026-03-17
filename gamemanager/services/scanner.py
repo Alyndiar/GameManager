@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +12,28 @@ from gamemanager.services.storage import get_root_display_info
 
 def list_root_display_infos(roots: list[RootFolder]) -> list[RootDisplayInfo]:
     return [get_root_display_info(root) for root in roots]
+
+
+def _directory_size_bytes(path: Path) -> int:
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
 
 
 def scan_roots(
@@ -46,7 +69,7 @@ def scan_roots(
                     full_path=str(child),
                     is_dir=is_dir,
                     extension=child.suffix.casefold() if child.is_file() else "",
-                    size_bytes=0 if is_dir else stat.st_size,
+                    size_bytes=_directory_size_bytes(child) if is_dir else stat.st_size,
                     created_at=datetime.fromtimestamp(stat.st_ctime),
                     modified_at=datetime.fromtimestamp(stat.st_mtime),
                     cleaned_name=cleaned_name,
@@ -61,4 +84,3 @@ def scan_roots(
         )
     )
     return items
-

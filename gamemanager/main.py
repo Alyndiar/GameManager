@@ -21,10 +21,12 @@ def run() -> int:
     app = QApplication(sys.argv)
     state = AppState(_default_db_path())
     window = MainWindow(state)
-    window.show()
+    screen = app.primaryScreen()
+    if screen is not None:
+        window.setGeometry(screen.availableGeometry())
+    window.showMaximized()
     return app.exec()
 
 
 if __name__ == "__main__":
     raise SystemExit(run())
-
