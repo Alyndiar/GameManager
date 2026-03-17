@@ -19,6 +19,7 @@ class RootDisplayInfo:
     root_path: str
     source_label: str
     drive_name: str
+    total_size_bytes: int
     free_space_bytes: int
     mountpoint: str
 
@@ -89,4 +90,3 @@ class OperationReport:
     conflicts: int = 0
     failed: int = 0
     details: list[str] = field(default_factory=list)
-

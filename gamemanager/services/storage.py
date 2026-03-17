@@ -11,12 +11,16 @@ import psutil
 from gamemanager.models import RootDisplayInfo, RootFolder
 
 
-_MOUNT_BASE = Path(r"E:\Mounts")
+_MOUNT_BASE = Path(r"E:\Mount")
 _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:\\?$")
 
 
 def _norm_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
+
+
+def mountpoint_sort_key(mountpoint: str) -> str:
+    return _norm_path(mountpoint)
 
 
 def _resolve_mountpoint(path: Path) -> str:
@@ -59,15 +63,28 @@ def _volume_label(volume_root: str) -> str:
     return root_path.rstrip("\\")
 
 
+def _mount_name_under_base(path_value: Path) -> str | None:
+    path_parts = path_value.parts
+    base_parts = _MOUNT_BASE.parts
+    if len(path_parts) <= len(base_parts):
+        return None
+    matches_base = all(
+        os.path.normcase(path_parts[idx].rstrip("\\/"))
+        == os.path.normcase(base_parts[idx].rstrip("\\/"))
+        for idx in range(len(base_parts))
+    )
+    if not matches_base:
+        return None
+    return path_parts[len(base_parts)]
+
+
 def source_label_for_path(root_path: Path, mountpoint: str) -> str:
-    root_norm = Path(_norm_path(str(root_path)))
-    mount_base_norm = Path(_norm_path(str(_MOUNT_BASE)))
-    try:
-        relative = root_norm.relative_to(mount_base_norm)
-        if relative.parts:
-            return relative.parts[0]
-    except ValueError:
-        pass
+    root_mount_name = _mount_name_under_base(root_path)
+    if root_mount_name:
+        return root_mount_name
+    mount_mount_name = _mount_name_under_base(Path(mountpoint))
+    if mount_mount_name:
+        return mount_mount_name
     if _DRIVE_LETTER_RE.match(mountpoint):
         return mountpoint[:2].upper()
     clean_mount = mountpoint.rstrip("\\/")
@@ -78,18 +95,37 @@ def get_root_display_info(root: RootFolder) -> RootDisplayInfo:
     root_path = Path(root.path)
     mountpoint = _resolve_mountpoint(root_path)
     source_label = source_label_for_path(root_path, mountpoint)
-    drive_name = _volume_label(mountpoint)
+    # For managed mount roots, drive_name must be the mount folder name.
+    # Prefer root-path derivation in case mountpoint resolution falls back to drive letter.
+    mount_name = _mount_name_under_base(root_path) or _mount_name_under_base(
+        Path(mountpoint)
+    )
+    if mount_name:
+        drive_name = mount_name
+    else:
+        drive_name = _volume_label(mountpoint)
+    total_size = 0
     free_space = 0
     try:
-        free_space = shutil.disk_usage(mountpoint).free
+        # Query from configured root path so mounted-volume free space is reported,
+        # not the host drive free space.
+        usage = shutil.disk_usage(root_path)
+        total_size = usage.total
+        free_space = usage.free
     except (FileNotFoundError, OSError):
-        free_space = 0
+        try:
+            usage = shutil.disk_usage(mountpoint)
+            total_size = usage.total
+            free_space = usage.free
+        except (FileNotFoundError, OSError):
+            total_size = 0
+            free_space = 0
     return RootDisplayInfo(
         root_id=root.id,
         root_path=root.path,
         source_label=source_label,
         drive_name=drive_name,
+        total_size_bytes=total_size,
         free_space_bytes=free_space,
         mountpoint=mountpoint,
     )
-

@@ -64,6 +64,10 @@ class AppState:
         items = scan_roots(roots, self.approved_tags())
         return root_infos, items
 
+    def refresh_roots_only(self) -> list[RootDisplayInfo]:
+        roots = self.list_roots()
+        return list_root_display_infos(roots)
+
     def find_tag_candidates(self, items: list[InventoryItem]) -> list[TagCandidate]:
         names = [(item.full_name, not item.is_dir) for item in items]
         non_tags = self.non_tags()

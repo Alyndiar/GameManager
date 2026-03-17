@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gamemanager.models import MovePlanItem, RenamePlanItem, TagCandidate
+from gamemanager.models import InventoryItem, MovePlanItem, RenamePlanItem, TagCandidate
 
 
 @dataclass(slots=True)
@@ -37,7 +37,6 @@ class TagReviewDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Tag Finder")
-        self.resize(850, 480)
         self._combos: dict[str, QComboBox] = {}
         self._display: dict[str, str] = {}
 
@@ -77,6 +76,7 @@ class TagReviewDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
     def result_payload(self) -> TagReviewResult:
         decisions: dict[str, str] = {}
@@ -91,8 +91,9 @@ class CleanupPreviewDialog(QDialog):
     def __init__(self, plan_items: list[RenamePlanItem], parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Cleanup Preview")
-        self.resize(950, 520)
         self.plan_items = plan_items
+        self.visible_items = [item for item in plan_items if item.status != "unchanged"]
+        self._action_by_item_id: dict[int, QComboBox] = {}
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -102,24 +103,27 @@ class CleanupPreviewDialog(QDialog):
             )
         )
 
-        self.table = QTableWidget(len(plan_items), 4, self)
+        self.table = QTableWidget(len(self.visible_items), 4, self)
         self.table.setHorizontalHeaderLabels(
             ["Source", "Proposed Name", "Destination", "Status"]
         )
         self.table.setWordWrap(True)
         self.table.verticalHeader().setVisible(False)
-        for row, item in enumerate(plan_items):
+        for row, item in enumerate(self.visible_items):
             status = item.status
-            if status == "ready":
-                status_text = "Ready"
-            elif status == "unchanged":
-                status_text = "Unchanged"
-            else:
-                status_text = "Conflict - manual rename required"
             self.table.setItem(row, 0, QTableWidgetItem(str(item.src_path)))
             self.table.setItem(row, 1, QTableWidgetItem(item.proposed_name))
             self.table.setItem(row, 2, QTableWidgetItem(str(item.dst_path)))
-            self.table.setItem(row, 3, QTableWidgetItem(status_text))
+            if status == "ready":
+                combo = QComboBox(self.table)
+                combo.addItems(["Rename", "Skip"])
+                combo.setCurrentText("Rename")
+                self.table.setCellWidget(row, 3, combo)
+                self._action_by_item_id[id(item)] = combo
+            else:
+                self.table.setItem(
+                    row, 3, QTableWidgetItem("Conflict - manual rename required")
+                )
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
@@ -132,16 +136,23 @@ class CleanupPreviewDialog(QDialog):
         self.apply_btn.clicked.connect(self.accept)
         self.cancel_btn.clicked.connect(self.reject)
         layout.addWidget(buttons)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
     def safe_items(self) -> list[RenamePlanItem]:
-        return [item for item in self.plan_items if item.status == "ready"]
+        selected: list[RenamePlanItem] = []
+        for item in self.plan_items:
+            if item.status != "ready":
+                continue
+            combo = self._action_by_item_id.get(id(item))
+            if combo is None or combo.currentText() == "Rename":
+                selected.append(item)
+        return selected
 
 
 class MovePreviewDialog(QDialog):
     def __init__(self, plan_items: list[MovePlanItem], parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Archive Move Preview")
-        self.resize(1100, 560)
         self.plan_items = plan_items
         self._widgets: list[tuple[QComboBox, QLineEdit]] = []
 
@@ -199,6 +210,7 @@ class MovePreviewDialog(QDialog):
         self.apply_btn.clicked.connect(self._validate_then_accept)
         self.cancel_btn.clicked.connect(self.reject)
         layout.addWidget(buttons)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
     def _validate_then_accept(self) -> None:
         for idx, (combo, line) in enumerate(self._widgets):
@@ -219,3 +231,110 @@ class MovePreviewDialog(QDialog):
             item.manual_name = manual if manual else None
         return self.plan_items
 
+
+class DeleteGroupDialog(QDialog):
+    def __init__(
+        self,
+        cleaned_name: str,
+        rows: list[tuple[InventoryItem, str]],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"Deleting {cleaned_name}")
+        self.cancel_all_requested = False
+        self.rows = list(
+            sorted(
+                rows,
+                key=lambda x: x[0].modified_at,
+                reverse=True,
+            )
+        )
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "Select versions to delete. The newest version is unselected by default."
+            )
+        )
+
+        self.table = QTableWidget(len(self.rows), 5, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Delete", "Full Name", "Modified", "Size", "Source"]
+        )
+        self.table.setWordWrap(True)
+        self.table.verticalHeader().setVisible(False)
+
+        for row_idx, (item, source_text) in enumerate(self.rows):
+            check_item = QTableWidgetItem("")
+            check_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            # Newest is first row after sort(desc), default unchecked.
+            check_item.setCheckState(
+                Qt.CheckState.Unchecked if row_idx == 0 else Qt.CheckState.Checked
+            )
+            self.table.setItem(row_idx, 0, check_item)
+            self.table.setItem(row_idx, 1, QTableWidgetItem(item.full_name))
+            self.table.setItem(
+                row_idx, 2, QTableWidgetItem(item.modified_at.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            self.table.setItem(row_idx, 3, QTableWidgetItem(str(item.size_bytes)))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(source_text))
+
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        buttons = QDialogButtonBox(self)
+        self.ok_btn = QPushButton("Confirm")
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_all_btn = QPushButton("Cancel All")
+        buttons.addButton(self.ok_btn, QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(self.cancel_btn, QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.addButton(self.cancel_all_btn, QDialogButtonBox.ButtonRole.RejectRole)
+        self.ok_btn.clicked.connect(self._validate_then_accept)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.cancel_all_btn.clicked.connect(self._cancel_all)
+        layout.addWidget(buttons)
+
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def selected_for_delete(self) -> list[InventoryItem]:
+        selected: list[InventoryItem] = []
+        for row_idx, (item, _) in enumerate(self.rows):
+            check_item = self.table.item(row_idx, 0)
+            if check_item and check_item.checkState() == Qt.CheckState.Checked:
+                selected.append(item)
+        return selected
+
+    def _validate_then_accept(self) -> None:
+        selected = self.selected_for_delete()
+        if not selected:
+            answer = QMessageBox.question(
+                self,
+                "No Selection",
+                "No versions are selected for deletion. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.accept()
+            return
+        if len(selected) == len(self.rows):
+            answer = QMessageBox.warning(
+                self,
+                "Delete All Versions",
+                "All versions are selected. Are you certain you want to delete all versions of this game?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.accept()
+
+    def _cancel_all(self) -> None:
+        self.cancel_all_requested = True
+        self.reject()
