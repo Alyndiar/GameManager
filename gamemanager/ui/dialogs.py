@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -18,13 +24,37 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gamemanager.models import InventoryItem, MovePlanItem, RenamePlanItem, TagCandidate
+from gamemanager.models import (
+    IconCandidate,
+    InventoryItem,
+    MovePlanItem,
+    RenamePlanItem,
+    TagCandidate,
+)
 
 
 @dataclass(slots=True)
 class TagReviewResult:
     decisions: dict[str, str]
     display_map: dict[str, str]
+
+
+@dataclass(slots=True)
+class IconPickerResult:
+    candidate: IconCandidate | None
+    local_image_path: str | None
+    info_tip: str
+    circular_ring: bool
+
+
+@dataclass(slots=True)
+class IconProviderSettingsResult:
+    steamgriddb_enabled: bool
+    steamgriddb_api_key: str
+    steamgriddb_api_base: str
+    iconfinder_enabled: bool
+    iconfinder_api_key: str
+    iconfinder_api_base: str
 
 
 class TagReviewDialog(QDialog):
@@ -230,6 +260,286 @@ class MovePreviewDialog(QDialog):
             manual = line.text().strip()
             item.manual_name = manual if manual else None
         return self.plan_items
+
+
+class IconPickerDialog(QDialog):
+    def __init__(
+        self,
+        folder_name: str,
+        candidates: list[IconCandidate],
+        preview_loader,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"Assign Folder Icon - {folder_name}")
+        self.candidates = candidates
+        self._preview_loader = preview_loader
+        self._local_image_path: str | None = None
+        self._preview_pix_cache: dict[tuple[int, int, bool], QPixmap] = {}
+        self._hover_row: int | None = None
+        self._hover_popup = QLabel(
+            None,
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint,
+        )
+        self._hover_popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self._hover_popup.setFrameStyle(QFrame.Shape.Panel | QFrame.Shadow.Plain)
+        self._hover_popup.setLineWidth(1)
+        self._hover_popup.setStyleSheet("background-color: #1c1c1c; padding: 4px;")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "Pick one candidate icon, or choose a local image. "
+                "Circular + ring styling is enabled by default."
+            )
+        )
+
+        self.table = QTableWidget(len(candidates), 5, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Preview", "Title", "Provider", "Size", "Source"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setIconSize(QSize(64, 64))
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
+        self.table.viewport().installEventFilter(self)
+        for row, candidate in enumerate(candidates):
+            preview_item = QTableWidgetItem("")
+            preview_item.setIcon(self._preview_icon(row, 64))
+            self.table.setItem(row, 0, preview_item)
+            self.table.setItem(row, 1, QTableWidgetItem(candidate.title))
+            self.table.setItem(row, 2, QTableWidgetItem(candidate.provider))
+            self.table.setItem(
+                row, 3, QTableWidgetItem(f"{candidate.width}x{candidate.height}")
+            )
+            source_item = QTableWidgetItem(candidate.source_url)
+            source_item.setToolTip(candidate.source_url)
+            self.table.setItem(row, 4, source_item)
+            self.table.setRowHeight(row, 72)
+        self.table.setColumnWidth(0, 84)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        options_row = QHBoxLayout()
+        self.circular_ring_check = QCheckBox("Circular + ring style")
+        self.circular_ring_check.setChecked(True)
+        self.circular_ring_check.toggled.connect(self._refresh_preview_icons)
+        options_row.addWidget(self.circular_ring_check)
+        options_row.addStretch(1)
+        self.local_btn = QPushButton("Use Local Image...")
+        self.local_btn.clicked.connect(self._on_pick_local)
+        options_row.addWidget(self.local_btn)
+        layout.addLayout(options_row)
+
+        layout.addWidget(QLabel("InfoTip (optional):"))
+        self.info_tip_edit = QPlainTextEdit(self)
+        self.info_tip_edit.setPlaceholderText("Optional folder tooltip text")
+        self.info_tip_edit.setFixedHeight(90)
+        layout.addWidget(self.info_tip_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_then_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def eventFilter(self, watched, event):  # type: ignore[override]
+        if watched is self.table.viewport():
+            if event.type() == QEvent.Type.MouseMove:
+                index = self.table.indexAt(event.pos())
+                if index.isValid() and index.column() == 0:
+                    cell_rect = self.table.visualRect(index)
+                    icon_hit = cell_rect.adjusted(0, 0, -(cell_rect.width() - 74), 0)
+                    if icon_hit.contains(event.pos()):
+                        self._show_hover_preview(
+                            index.row(),
+                            self.table.viewport().mapToGlobal(event.pos()),
+                        )
+                        return False
+                self._hide_hover_preview()
+            elif event.type() in (
+                QEvent.Type.Leave,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.Wheel,
+            ):
+                self._hide_hover_preview()
+        return super().eventFilter(watched, event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._hide_hover_preview()
+        super().closeEvent(event)
+
+    def _preview_icon(self, row: int, size: int) -> QIcon:
+        pix = self._preview_pixmap(row, size)
+        if pix is None or pix.isNull():
+            return QIcon()
+        return QIcon(pix)
+
+    def _preview_pixmap(self, row: int, size: int) -> QPixmap | None:
+        if row < 0 or row >= len(self.candidates):
+            return None
+        circular_ring = (
+            self.circular_ring_check.isChecked()
+            if hasattr(self, "circular_ring_check")
+            else True
+        )
+        cache_key = (row, size, circular_ring)
+        cached = self._preview_pix_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        candidate = self.candidates[row]
+        try:
+            preview_png = self._preview_loader(candidate, circular_ring, size)
+            pix = QPixmap()
+            if not pix.loadFromData(preview_png):
+                return None
+            self._preview_pix_cache[cache_key] = pix
+            return pix
+        except Exception:
+            return None
+
+    def _refresh_preview_icons(self) -> None:
+        self._hide_hover_preview()
+        for row in range(len(self.candidates)):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            item.setIcon(self._preview_icon(row, 64))
+
+    def _show_hover_preview(self, row: int, global_pos: QPoint) -> None:
+        pix = self._preview_pixmap(row, 256)
+        if pix is None or pix.isNull():
+            self._hide_hover_preview()
+            return
+        if self._hover_row != row:
+            self._hover_popup.setPixmap(pix)
+            self._hover_popup.adjustSize()
+            self._hover_row = row
+        self._position_hover_popup(global_pos)
+        self._hover_popup.show()
+
+    def _position_hover_popup(self, global_pos: QPoint) -> None:
+        popup_size = self._hover_popup.sizeHint()
+        x = global_pos.x() + 20
+        y = global_pos.y() + 20
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            rect = screen.availableGeometry()
+            x = min(max(rect.left(), x), max(rect.left(), rect.right() - popup_size.width()))
+            y = min(max(rect.top(), y), max(rect.top(), rect.bottom() - popup_size.height()))
+        self._hover_popup.move(x, y)
+
+    def _hide_hover_preview(self) -> None:
+        self._hover_popup.hide()
+        self._hover_row = None
+
+    def _on_pick_local(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All Files (*)",
+        )
+        if not selected:
+            return
+        self._local_image_path = selected
+        self.table.clearSelection()
+        QMessageBox.information(self, "Local Image Selected", selected)
+
+    def _validate_then_accept(self) -> None:
+        row = self.table.currentRow()
+        if row < 0 and not self._local_image_path:
+            QMessageBox.warning(
+                self,
+                "No Selection",
+                "Select one candidate row or choose a local image.",
+            )
+            return
+        self.accept()
+
+    def result_payload(self) -> IconPickerResult:
+        row = self.table.currentRow()
+        candidate = self.candidates[row] if 0 <= row < len(self.candidates) else None
+        return IconPickerResult(
+            candidate=candidate,
+            local_image_path=self._local_image_path,
+            info_tip=self.info_tip_edit.toPlainText().strip(),
+            circular_ring=self.circular_ring_check.isChecked(),
+        )
+
+
+class IconProviderSettingsDialog(QDialog):
+    def __init__(
+        self,
+        initial: IconProviderSettingsResult,
+        test_callback,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Icon Provider Settings")
+        self._test_callback = test_callback
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Configure API keys/endpoints for icon sources."))
+
+        self.steam_enabled = QCheckBox("Enable SteamGridDB")
+        self.steam_enabled.setChecked(initial.steamgriddb_enabled)
+        layout.addWidget(self.steam_enabled)
+        self.steam_key = QLineEdit(initial.steamgriddb_api_key)
+        self.steam_key.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.steam_key.setPlaceholderText("SteamGridDB API Key")
+        layout.addWidget(self.steam_key)
+        self.steam_base = QLineEdit(initial.steamgriddb_api_base)
+        self.steam_base.setPlaceholderText("SteamGridDB API Base URL")
+        layout.addWidget(self.steam_base)
+
+        self.iconfinder_enabled = QCheckBox("Enable Iconfinder")
+        self.iconfinder_enabled.setChecked(initial.iconfinder_enabled)
+        layout.addWidget(self.iconfinder_enabled)
+        self.iconfinder_key = QLineEdit(initial.iconfinder_api_key)
+        self.iconfinder_key.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.iconfinder_key.setPlaceholderText("Iconfinder API Key")
+        layout.addWidget(self.iconfinder_key)
+        self.iconfinder_base = QLineEdit(initial.iconfinder_api_base)
+        self.iconfinder_base.setPlaceholderText("Iconfinder API Base URL")
+        layout.addWidget(self.iconfinder_base)
+
+        actions = QHBoxLayout()
+        self.test_btn = QPushButton("Test Credentials")
+        self.test_btn.clicked.connect(self._on_test)
+        actions.addWidget(self.test_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_test(self) -> None:
+        try:
+            msg = self._test_callback(self.result_payload())
+        except Exception as exc:
+            QMessageBox.warning(self, "Credentials Test", f"Test failed:\n{exc}")
+            return
+        QMessageBox.information(self, "Credentials Test", msg)
+
+    def result_payload(self) -> IconProviderSettingsResult:
+        return IconProviderSettingsResult(
+            steamgriddb_enabled=self.steam_enabled.isChecked(),
+            steamgriddb_api_key=self.steam_key.text().strip(),
+            steamgriddb_api_base=self.steam_base.text().strip(),
+            iconfinder_enabled=self.iconfinder_enabled.isChecked(),
+            iconfinder_api_key=self.iconfinder_key.text().strip(),
+            iconfinder_api_base=self.iconfinder_base.text().strip(),
+        )
 
 
 class DeleteGroupDialog(QDialog):

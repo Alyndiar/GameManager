@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from gamemanager.models import InventoryItem, RootDisplayInfo, RootFolder
+from gamemanager.services.folder_icons import detect_folder_icon_state
 from gamemanager.services.normalization import cleaned_name_from_full
 from gamemanager.services.sorting import sort_key_for_inventory
 from gamemanager.services.storage import get_root_display_info
@@ -60,6 +61,15 @@ def scan_roots(
                 is_file=not is_dir,
                 approved_tags=approved_tags,
             )
+            icon_status = "none"
+            folder_icon_path: str | None = None
+            desktop_ini_path: str | None = None
+            if is_dir:
+                (
+                    icon_status,
+                    folder_icon_path,
+                    desktop_ini_path,
+                ) = detect_folder_icon_state(child)
             items.append(
                 InventoryItem(
                     root_id=root.id,
@@ -74,6 +84,9 @@ def scan_roots(
                     modified_at=datetime.fromtimestamp(stat.st_mtime),
                     cleaned_name=cleaned_name,
                     scan_ts=scan_ts,
+                    icon_status=icon_status,
+                    folder_icon_path=folder_icon_path,
+                    desktop_ini_path=desktop_ini_path,
                 )
             )
     items.sort(
