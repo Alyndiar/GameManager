@@ -38,6 +38,9 @@ class InventoryItem:
     modified_at: datetime
     cleaned_name: str
     scan_ts: datetime
+    icon_status: str = "none"
+    folder_icon_path: str | None = None
+    desktop_ini_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -90,3 +93,25 @@ class OperationReport:
     conflicts: int = 0
     failed: int = 0
     details: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class IconCandidate:
+    provider: str
+    candidate_id: str
+    title: str
+    preview_url: str
+    image_url: str
+    width: int
+    height: int
+    has_alpha: bool
+    source_url: str
+
+
+@dataclass(slots=True)
+class IconApplyResult:
+    folder_path: str
+    status: str
+    message: str
+    ico_path: str | None = None
+    desktop_ini_path: str | None = None

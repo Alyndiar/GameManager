@@ -3,19 +3,22 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 
-from PySide6.QtCore import QEvent, QProcess, Qt, QTimer
-from PySide6.QtGui import QAction, QKeyEvent
+from PySide6.QtCore import QEvent, QPoint, QProcess, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QIcon, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
+    QLayout,
+    QLayoutItem,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -33,12 +36,17 @@ from PySide6.QtWidgets import (
 
 from gamemanager.app_state import AppState
 from gamemanager.models import InventoryItem, MovePlanItem, OperationReport, RootDisplayInfo
+from gamemanager.services.icon_cache import icon_cache_key
+from gamemanager.services.icon_sources import IconSearchSettings
 from gamemanager.services.sorting import natural_key
 from gamemanager.services.storage import mountpoint_sort_key
 from gamemanager.services.teracopy import DEFAULT_TERACOPY_PATH, resolve_teracopy_path
 from gamemanager.ui.dialogs import (
     CleanupPreviewDialog,
     DeleteGroupDialog,
+    IconPickerDialog,
+    IconProviderSettingsDialog,
+    IconProviderSettingsResult,
     MovePreviewDialog,
     TagReviewDialog,
 )
@@ -159,6 +167,78 @@ def _filter_by_cleaned_name_query(
     return [item for item in items if needle in item.cleaned_name.casefold()]
 
 
+class FlowLayout(QLayout):
+    def __init__(self, parent: QWidget | None = None, spacing: int = 4):
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self.setSpacing(spacing)
+
+    def __del__(self):
+        while self.count():
+            self.takeAt(0)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QLayoutItem | None:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> QLayoutItem | None:
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self) -> Qt.Orientations:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.sizeHint())
+        left, top, right, bottom = self.getContentsMargins()
+        size += QSize(left + right, top + bottom)
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(+left, +top, -right, -bottom)
+        x = effective.x()
+        y = effective.y()
+        line_height = 0
+
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self.spacing()
+            if next_x - self.spacing() > effective.right() and line_height > 0:
+                x = effective.x()
+                y += line_height + self.spacing()
+                next_x = x + hint.width() + self.spacing()
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + bottom
+
+
 class MainWindow(QMainWindow):
     def __init__(self, state: AppState):
         super().__init__()
@@ -188,37 +268,121 @@ class MainWindow(QMainWindow):
         self._teracopy_failed_items = 0
         self._teracopy_failure_details: list[str] = []
         self._teracopy_finish_callback: Callable[[int, int, list[str]], None] | None = None
+        self._folder_icon_cache: dict[str, QIcon] = {}
+        self._folder_icon_preview_cache: dict[str, QPixmap] = {}
+        self._right_hovered_icon_row: int | None = None
+        self._right_icon_hover_popup = QLabel(
+            None,
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint,
+        )
+        self._right_icon_hover_popup.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating, True
+        )
+        self._right_icon_hover_popup.setFrameStyle(
+            QFrame.Shape.Panel | QFrame.Shadow.Plain
+        )
+        self._right_icon_hover_popup.setLineWidth(1)
+        self._right_icon_hover_popup.setStyleSheet(
+            "background-color: #1c1c1c; padding: 4px;"
+        )
+        self._blank_icon = QIcon()
+        blank_pix = QPixmap(16, 16)
+        blank_pix.fill(Qt.GlobalColor.transparent)
+        self._blank_icon.addPixmap(blank_pix)
 
         root = QWidget(self)
         root_layout = QVBoxLayout(root)
 
-        top_controls = QHBoxLayout()
+        top_controls = FlowLayout(spacing=4)
+        top_controls.setContentsMargins(0, 0, 0, 0)
         self.add_root_btn = QPushButton("Add Root")
-        self.remove_root_btn = QPushButton("Remove Selected Root")
+        self.remove_root_btn = QPushButton("Remove Root")
         self.refresh_btn = QPushButton("Refresh")
-        self.reset_sort_btn = QPushButton("Reset Sort")
-        self.show_duplicates_btn = QPushButton("Show Only Duplicates")
+        self.reset_sort_btn = QPushButton("Reset")
+        self.show_duplicates_btn = QPushButton("Dupes")
         self.show_duplicates_btn.setCheckable(True)
-        self.delete_selected_btn = QPushButton("Delete Selected")
-        self.cleanup_btn = QPushButton("Cleanup Names (Disk)")
+        self.delete_selected_btn = QPushButton("Del Selected")
+        self.cleanup_btn = QPushButton("Cleanup")
         self.tags_btn = QPushButton("Find Tags")
-        self.move_btn = QPushButton("Move ISO/Archives")
+        self.move_btn = QPushButton("Move Arch")
+        self.assign_icon_btn = QPushButton("Set Icon")
+        self.icon_settings_btn = QPushButton("Icon Src")
         self.move_backend_combo = QComboBox(self)
+        self.move_backend_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
         self.move_backend_combo.addItems(MOVE_BACKEND_OPTIONS.keys())
-        self.locate_teracopy_btn = QPushButton("Locate TeraCopy")
-        top_controls.addWidget(self.add_root_btn)
-        top_controls.addWidget(self.remove_root_btn)
-        top_controls.addWidget(self.refresh_btn)
-        top_controls.addWidget(self.reset_sort_btn)
-        top_controls.addWidget(self.show_duplicates_btn)
-        top_controls.addWidget(self.delete_selected_btn)
-        top_controls.addWidget(self.cleanup_btn)
-        top_controls.addWidget(self.tags_btn)
-        top_controls.addWidget(self.move_btn)
-        top_controls.addWidget(QLabel("Move backend:"))
-        top_controls.addWidget(self.move_backend_combo)
-        top_controls.addWidget(self.locate_teracopy_btn)
-        top_controls.addStretch(1)
+        self.locate_teracopy_btn = QPushButton("Locate TC")
+        self.move_backend_label = QLabel("Move:")
+
+        self.remove_root_btn.setToolTip("Remove Selected Root")
+        self.reset_sort_btn.setToolTip("Reset Sort")
+        self.show_duplicates_btn.setToolTip("Show Only Duplicates")
+        self.delete_selected_btn.setToolTip("Delete Selected")
+        self.cleanup_btn.setToolTip("Cleanup Names (Disk)")
+        self.move_btn.setToolTip("Move ISO/Archives")
+        self.assign_icon_btn.setToolTip("Assign Folder Icon...")
+        self.icon_settings_btn.setToolTip("Icon Provider Settings...")
+        self.locate_teracopy_btn.setToolTip("Locate TeraCopy")
+
+        compact_controls = [
+            self.add_root_btn,
+            self.remove_root_btn,
+            self.refresh_btn,
+            self.reset_sort_btn,
+            self.show_duplicates_btn,
+            self.delete_selected_btn,
+            self.cleanup_btn,
+            self.tags_btn,
+            self.move_btn,
+            self.assign_icon_btn,
+            self.icon_settings_btn,
+            self.move_backend_label,
+            self.move_backend_combo,
+            self.locate_teracopy_btn,
+        ]
+        for control in compact_controls:
+            control.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            if isinstance(control, QPushButton):
+                control.setMinimumSize(control.sizeHint())
+
+        def _build_top_group(
+            widgets: list[QWidget], include_separator: bool = True
+        ) -> QWidget:
+            group = QWidget(root)
+            group.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            row = QHBoxLayout(group)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(2)
+            for widget in widgets:
+                row.addWidget(widget)
+            if include_separator:
+                separator = QFrame(group)
+                separator.setFrameShape(QFrame.Shape.VLine)
+                separator.setFrameShadow(QFrame.Shadow.Sunken)
+                separator.setSizePolicy(
+                    QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+                )
+                row.addWidget(separator)
+            group.setMinimumSize(group.sizeHint())
+            return group
+
+        top_groups = [
+            _build_top_group(
+                [self.add_root_btn, self.remove_root_btn, self.refresh_btn]
+            ),
+            _build_top_group([self.reset_sort_btn, self.show_duplicates_btn]),
+            _build_top_group(
+                [self.delete_selected_btn, self.cleanup_btn, self.tags_btn, self.move_btn]
+            ),
+            _build_top_group([self.assign_icon_btn, self.icon_settings_btn]),
+            _build_top_group(
+                [self.move_backend_label, self.move_backend_combo, self.locate_teracopy_btn],
+                include_separator=False,
+            ),
+        ]
+        for group in top_groups:
+            top_controls.addWidget(group)
         root_layout.addLayout(top_controls)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, root)
@@ -285,6 +449,8 @@ class MainWindow(QMainWindow):
         self.right_table.setDragEnabled(True)
         self.right_table.setDragDropMode(QTableWidget.DragDropMode.DragOnly)
         self.right_table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.right_table.setMouseTracking(True)
+        self.right_table.viewport().setMouseTracking(True)
         right_layout.addWidget(self.right_table, 1)
 
         self.splitter.addWidget(self.left_panel)
@@ -321,6 +487,8 @@ class MainWindow(QMainWindow):
         self.cleanup_btn.clicked.connect(self._on_cleanup)
         self.tags_btn.clicked.connect(self._on_find_tags)
         self.move_btn.clicked.connect(self._on_move_archives)
+        self.assign_icon_btn.clicked.connect(self._on_assign_folder_icon_selected)
+        self.icon_settings_btn.clicked.connect(self._on_icon_provider_settings)
         self.move_backend_combo.currentTextChanged.connect(self._on_move_backend_changed)
         self.locate_teracopy_btn.clicked.connect(self._on_locate_teracopy)
         self.left_sort_combo.currentTextChanged.connect(self._on_left_pref_changed)
@@ -328,6 +496,7 @@ class MainWindow(QMainWindow):
         self.left_filter_edit.textChanged.connect(self._on_left_filter_changed)
         self.left_table.itemSelectionChanged.connect(self._on_left_selection_changed)
         self.left_table.viewport().installEventFilter(self)
+        self.right_table.viewport().installEventFilter(self)
         self.right_table.horizontalHeader().sectionClicked.connect(
             self._on_right_header_clicked
         )
@@ -376,13 +545,13 @@ class MainWindow(QMainWindow):
             path = resolve_teracopy_path(self._teracopy_path_pref)
             self._teracopy_executable = path
             if path:
-                self.locate_teracopy_btn.setToolTip(path)
+                self.locate_teracopy_btn.setToolTip(f"Locate TeraCopy\n{path}")
             else:
                 self.locate_teracopy_btn.setToolTip(
-                    "TeraCopy not found. Click to auto-locate or choose manually."
+                    "Locate TeraCopy\nTeraCopy not found. Click to auto-locate or choose manually."
                 )
         else:
-            self.locate_teracopy_btn.setToolTip("")
+            self.locate_teracopy_btn.setToolTip("Locate TeraCopy")
 
     def _on_move_backend_changed(self, _text: str) -> None:
         backend = self._current_move_backend()
@@ -511,6 +680,27 @@ class MainWindow(QMainWindow):
                 self._move_selected_entries_to_root(int(root_id))
                 event.acceptProposedAction()
                 return True
+        if watched is self.right_table.viewport():
+            if event.type() == QEvent.Type.MouseMove:
+                index = self.right_table.indexAt(event.pos())
+                if index.isValid() and index.column() == 0:
+                    cell_rect = self.right_table.visualRect(index)
+                    icon_hit = cell_rect.adjusted(
+                        0, 0, -(cell_rect.width() - 26), 0
+                    )
+                    if icon_hit.contains(event.pos()):
+                        self._show_right_icon_hover_preview(
+                            index.row(),
+                            self.right_table.viewport().mapToGlobal(event.pos()),
+                        )
+                        return False
+                self._hide_right_icon_hover_preview()
+            elif event.type() in (
+                QEvent.Type.Leave,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.Wheel,
+            ):
+                self._hide_right_icon_hover_preview()
         return super().eventFilter(watched, event)
 
     def _on_toggle_show_duplicates(self, checked: bool) -> None:
@@ -570,6 +760,9 @@ class MainWindow(QMainWindow):
             self.right_table.selectRow(index.row())
 
         menu = QMenu(self.right_table)
+        assign_icon_action = QAction("Assign Folder Icon...", menu)
+        assign_icon_action.triggered.connect(self._on_assign_folder_icon_selected)
+        menu.addAction(assign_icon_action)
         rename_action = QAction("Edit Name...", menu)
         rename_action.triggered.connect(self._on_manual_rename_selected_entry)
         menu.addAction(rename_action)
@@ -977,6 +1170,183 @@ class MainWindow(QMainWindow):
             return
         self.refresh_all()
 
+    def _on_icon_provider_settings(self) -> None:
+        current = self.state.icon_search_settings()
+        initial = IconProviderSettingsResult(
+            steamgriddb_enabled=current.steamgriddb_enabled,
+            steamgriddb_api_key=current.steamgriddb_api_key,
+            steamgriddb_api_base=current.steamgriddb_api_base,
+            iconfinder_enabled=current.iconfinder_enabled,
+            iconfinder_api_key=current.iconfinder_api_key,
+            iconfinder_api_base=current.iconfinder_api_base,
+        )
+        dialog = IconProviderSettingsDialog(
+            initial=initial,
+            test_callback=self._test_icon_provider_settings,
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        payload = dialog.result_payload()
+        settings = IconSearchSettings(
+            steamgriddb_enabled=payload.steamgriddb_enabled,
+            steamgriddb_api_key=payload.steamgriddb_api_key,
+            steamgriddb_api_base=payload.steamgriddb_api_base,
+            iconfinder_enabled=payload.iconfinder_enabled,
+            iconfinder_api_key=payload.iconfinder_api_key,
+            iconfinder_api_base=payload.iconfinder_api_base,
+        )
+        try:
+            self.state.save_icon_search_settings(settings)
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Icon Provider Settings", str(exc))
+            return
+
+    def _test_icon_provider_settings(self, payload: IconProviderSettingsResult) -> str:
+        settings = IconSearchSettings(
+            steamgriddb_enabled=payload.steamgriddb_enabled,
+            steamgriddb_api_key=payload.steamgriddb_api_key,
+            steamgriddb_api_base=payload.steamgriddb_api_base,
+            iconfinder_enabled=payload.iconfinder_enabled,
+            iconfinder_api_key=payload.iconfinder_api_key,
+            iconfinder_api_base=payload.iconfinder_api_base,
+        )
+        return self.state.test_icon_search_settings(settings)
+
+    def _icon_for_entry(self, entry: InventoryItem) -> QIcon:
+        if entry.is_dir and entry.icon_status == "valid" and entry.folder_icon_path:
+            icon_path = os.path.normpath(entry.folder_icon_path)
+            cache_key = icon_cache_key(icon_path, 16)
+            cached = self._folder_icon_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            icon = QIcon(icon_path)
+            if icon.isNull():
+                return self._blank_icon
+            self._folder_icon_cache[cache_key] = icon
+            return icon
+        return self._blank_icon
+
+    def _icon_preview_pixmap_for_entry(self, entry: InventoryItem) -> QPixmap | None:
+        if not (entry.is_dir and entry.icon_status == "valid" and entry.folder_icon_path):
+            return None
+        icon_path = os.path.normpath(entry.folder_icon_path)
+        cache_key = icon_cache_key(icon_path, 256)
+        cached = self._folder_icon_preview_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        icon = QIcon(icon_path)
+        if icon.isNull():
+            return None
+        pix = icon.pixmap(256, 256)
+        if pix.isNull():
+            return None
+        self._folder_icon_preview_cache[cache_key] = pix
+        return pix
+
+    def _show_right_icon_hover_preview(self, row: int, global_pos: QPoint) -> None:
+        if row < 0 or row >= len(self._visible_right_items):
+            self._hide_right_icon_hover_preview()
+            return
+        entry = self._visible_right_items[row]
+        pix = self._icon_preview_pixmap_for_entry(entry)
+        if pix is None or pix.isNull():
+            self._hide_right_icon_hover_preview()
+            return
+        if self._right_hovered_icon_row != row:
+            self._right_icon_hover_popup.setPixmap(pix)
+            self._right_icon_hover_popup.adjustSize()
+            self._right_hovered_icon_row = row
+        self._position_right_icon_hover_popup(global_pos)
+        self._right_icon_hover_popup.show()
+
+    def _position_right_icon_hover_popup(self, global_pos: QPoint) -> None:
+        popup_size = self._right_icon_hover_popup.sizeHint()
+        x = global_pos.x() + 20
+        y = global_pos.y() + 20
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            rect = screen.availableGeometry()
+            x = min(max(rect.left(), x), max(rect.left(), rect.right() - popup_size.width()))
+            y = min(max(rect.top(), y), max(rect.top(), rect.bottom() - popup_size.height()))
+        self._right_icon_hover_popup.move(x, y)
+
+    def _hide_right_icon_hover_preview(self) -> None:
+        self._right_icon_hover_popup.hide()
+        self._right_hovered_icon_row = None
+
+    def _on_assign_folder_icon_selected(self) -> None:
+        selected = [item for item in self._selected_right_entries() if item.is_dir]
+        if not selected:
+            QMessageBox.information(
+                self,
+                "No Folder Selected",
+                "Select one or more folder rows to assign an icon.",
+            )
+            return
+
+        skipped = 0
+        applied = 0
+        failed: list[str] = []
+        for entry in selected:
+            if entry.icon_status == "valid":
+                skipped += 1
+                continue
+
+            try:
+                candidates = self.state.search_icon_candidates(
+                    entry.full_name, entry.cleaned_name
+                )
+            except Exception as exc:
+                candidates = []
+                failed.append(f"{entry.full_name}: search failed ({exc})")
+
+            dialog = IconPickerDialog(
+                folder_name=entry.full_name,
+                candidates=candidates,
+                preview_loader=self.state.candidate_preview,
+                parent=self,
+            )
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                continue
+            payload = dialog.result_payload()
+            image_bytes: bytes
+            if payload.local_image_path:
+                try:
+                    image_bytes = Path(payload.local_image_path).read_bytes()
+                except OSError as exc:
+                    failed.append(f"{entry.full_name}: cannot read local image ({exc})")
+                    continue
+            elif payload.candidate is not None:
+                try:
+                    image_bytes = self.state.download_candidate(payload.candidate)
+                except Exception as exc:
+                    failed.append(f"{entry.full_name}: download failed ({exc})")
+                    continue
+            else:
+                failed.append(f"{entry.full_name}: no candidate selected")
+                continue
+
+            result = self.state.apply_folder_icon(
+                folder_path=entry.full_path,
+                source_image=image_bytes,
+                icon_name_hint=entry.cleaned_name or entry.full_name,
+                info_tip=payload.info_tip,
+                circular_ring=payload.circular_ring,
+            )
+            if result.status != "applied":
+                failed.append(f"{entry.full_name}: {result.message}")
+                continue
+            applied += 1
+
+        self.refresh_all()
+        lines = [f"Applied: {applied}", f"Skipped existing: {skipped}"]
+        if failed:
+            lines.append(f"Failed: {len(failed)}")
+            lines.append("")
+            lines.extend(failed[:8])
+        QMessageBox.information(self, "Assign Folder Icon", "\n".join(lines))
+
     def _delete_path_with_elevation(self, full_path: str) -> tuple[bool, str]:
         path = os.path.normpath(full_path)
         if not os.path.exists(path):
@@ -1152,6 +1522,9 @@ class MainWindow(QMainWindow):
 
     def refresh_all(self) -> None:
         self.root_infos, self.inventory = self.state.refresh()
+        self._folder_icon_cache.clear()
+        self._folder_icon_preview_cache.clear()
+        self._hide_right_icon_hover_preview()
         self._loaded_roots_count = len(self.root_infos)
         self._loaded_entries_count = len(self.inventory)
         self._populate_left(self.root_infos)
@@ -1306,7 +1679,9 @@ class MainWindow(QMainWindow):
         self._visible_right_items = sorted_items
         self.right_table.setRowCount(len(sorted_items))
         for row, entry in enumerate(sorted_items):
-            self.right_table.setItem(row, 0, QTableWidgetItem(entry.full_name))
+            name_item = QTableWidgetItem(entry.full_name)
+            name_item.setIcon(self._icon_for_entry(entry))
+            self.right_table.setItem(row, 0, name_item)
             self.right_table.setItem(row, 1, QTableWidgetItem(entry.cleaned_name))
             self.right_table.setItem(
                 row, 2, QTableWidgetItem(entry.modified_at.strftime("%Y-%m-%d %H:%M:%S"))
