@@ -1,0 +1,15 @@
+{
+  "template_file": "Rounded Square Plastic Medium.png",
+  "template_mtime_ns": 1774027944674222600,
+  "shape": "square",
+  "alpha_threshold": 8,
+  "interior_pixels": 218956,
+  "outside_pixels": 6755,
+  "transparent_pixels": 225711,
+  "interior_bbox": [
+    21,
+    20,
+    491,
+    492
+  ]
+}

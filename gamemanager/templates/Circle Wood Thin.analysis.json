@@ -1,0 +1,15 @@
+{
+  "template_file": "Circle Wood Thin.png",
+  "template_mtime_ns": 1774027916140527000,
+  "shape": "round",
+  "alpha_threshold": 8,
+  "interior_pixels": 165759,
+  "outside_pixels": 58197,
+  "transparent_pixels": 223956,
+  "interior_bbox": [
+    25,
+    26,
+    486,
+    484
+  ]
+}

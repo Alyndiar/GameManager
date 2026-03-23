@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -11,6 +13,10 @@ from gamemanager.models import IconCandidate
 
 DEFAULT_STEAMGRIDDB_API_BASE = "https://www.steamgriddb.com/api/v2"
 DEFAULT_ICONFINDER_API_BASE = "https://api.iconfinder.com/v4"
+SUPPORTED_SGDB_RESOURCES: tuple[str, ...] = ("icons", "logos", "grids", "heroes")
+DEFAULT_SGDB_RESOURCE_ORDER: tuple[str, ...] = ("icons", "logos", "grids", "heroes")
+DEFAULT_SGDB_ENABLED_RESOURCES: tuple[str, ...] = ("icons", "logos")
+_DIMENSIONS_RE = re.compile(r"(?<!\d)(\d{2,5})\s*[xX]\s*(\d{2,5})(?!\d)")
 
 
 @dataclass(slots=True)
@@ -44,6 +50,18 @@ def _score_candidate(candidate: IconCandidate) -> float:
     score -= _aspect_penalty(candidate.width, candidate.height)
     if "logo" in candidate.title.casefold() or "icon" in candidate.title.casefold():
         score += 0.3
+    candidate_id = candidate.candidate_id.casefold()
+    if candidate.provider == "SteamGridDB":
+        if candidate_id.startswith("icons:"):
+            score += 0.75
+        elif candidate_id.startswith("logos:"):
+            score += 0.2
+    if candidate.provider == "Steam":
+        if any(
+            token in candidate_id
+            for token in ("library_", "capsule_", "header_image", "background")
+        ):
+            score -= 0.9
     return score
 
 
@@ -51,6 +69,30 @@ def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "GameBackupManager/1.0"})
     return s
+
+
+def normalize_sgdb_resources(
+    resources: Iterable[str] | None,
+    *,
+    default_enabled_only: bool = True,
+) -> list[str]:
+    if resources is None:
+        if default_enabled_only:
+            return list(DEFAULT_SGDB_ENABLED_RESOURCES)
+        return list(DEFAULT_SGDB_RESOURCE_ORDER)
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for value in resources:
+        key = str(value).strip().casefold()
+        if not key or key in seen or key not in SUPPORTED_SGDB_RESOURCES:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    if normalized:
+        return normalized
+    if default_enabled_only:
+        return list(DEFAULT_SGDB_ENABLED_RESOURCES)
+    return list(DEFAULT_SGDB_RESOURCE_ORDER)
 
 
 def _safe_get_json(
@@ -66,6 +108,94 @@ def _safe_get_json(
         return resp.json()
     except (requests.RequestException, ValueError):
         return None
+
+
+def _coerce_positive_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, float):
+        value_int = int(value)
+        return value_int if value_int > 0 else 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            parsed = int(stripped)
+            return parsed if parsed > 0 else 0
+    return 0
+
+
+def _extract_url_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in (
+            "url",
+            "thumb",
+            "thumbnail",
+            "large",
+            "medium",
+            "small",
+            "600",
+            "512",
+            "256",
+            "128",
+        ):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+    return ""
+
+
+def _extract_dimensions_from_text(value: Any) -> tuple[int, int]:
+    text = str(value or "").strip()
+    if not text:
+        return 0, 0
+    match = _DIMENSIONS_RE.search(text)
+    if not match:
+        return 0, 0
+    return int(match.group(1)), int(match.group(2))
+
+
+def _extract_item_dimensions(
+    item: dict[str, Any],
+    image_url: str,
+    preview_url: str,
+) -> tuple[int, int]:
+    width = _coerce_positive_int(item.get("width"))
+    height = _coerce_positive_int(item.get("height"))
+    if width and height:
+        return width, height
+
+    thumb = item.get("thumb")
+    if isinstance(thumb, dict):
+        width = width or _coerce_positive_int(thumb.get("width"))
+        height = height or _coerce_positive_int(thumb.get("height"))
+        if width and height:
+            return width, height
+
+    for key in ("dimensions", "style", "size", "mime"):
+        w, h = _extract_dimensions_from_text(item.get(key))
+        if w and h:
+            width = width or w
+            height = height or h
+            if width and height:
+                return width, height
+
+    for source in (image_url, preview_url):
+        w, h = _extract_dimensions_from_text(source)
+        if w and h:
+            width = width or w
+            height = height or h
+            if width and height:
+                return width, height
+
+    if width and not height:
+        height = width
+    elif height and not width:
+        width = height
+    return width, height
 
 
 def _parse_positive_int_string(value: Any) -> str | None:
@@ -240,9 +370,13 @@ def _search_steamgriddb(
     settings: IconSearchSettings,
     game_name: str,
     cleaned_name: str,
+    sgdb_resources: Iterable[str] | None = None,
 ) -> list[IconCandidate]:
     if not settings.steamgriddb_enabled or not settings.steamgriddb_api_key.strip():
         return []
+    endpoint_order = normalize_sgdb_resources(
+        sgdb_resources, default_enabled_only=True
+    )
     session = _session()
     headers = {"Authorization": f"Bearer {settings.steamgriddb_api_key.strip()}"}
     query = quote(cleaned_name or game_name)
@@ -258,22 +392,34 @@ def _search_steamgriddb(
         if not game_id:
             continue
         game_candidates: list[IconCandidate] = []
-        for endpoint in ("logos", "icons"):
+        for endpoint in endpoint_order:
             url = f"{settings.steamgriddb_api_base.rstrip('/')}/{endpoint}/game/{game_id}"
             payload = _safe_get_json(session, url, headers, settings.timeout_seconds)
             if not payload:
                 continue
             for item in payload.get("data") or []:
-                image_url = str(item.get("url") or item.get("thumb") or "")
+                if not isinstance(item, dict):
+                    continue
+                raw_url = item.get("url")
+                raw_thumb = item.get("thumb")
+                image_url = _extract_url_text(raw_url)
+                preview_url = _extract_url_text(raw_thumb)
+                if not image_url:
+                    image_url = preview_url
                 if not image_url:
                     continue
-                width = int(item.get("width") or 0)
-                height = int(item.get("height") or 0)
+                if not preview_url:
+                    preview_url = image_url
+                width, height = _extract_item_dimensions(
+                    item,
+                    image_url=image_url,
+                    preview_url=preview_url,
+                )
                 candidate = IconCandidate(
                     provider="SteamGridDB",
                     candidate_id=f"{endpoint}:{item.get('id')}",
                     title=title,
-                    preview_url=str(item.get("thumb") or image_url),
+                    preview_url=preview_url,
                     image_url=image_url,
                     width=width,
                     height=height,
@@ -281,8 +427,6 @@ def _search_steamgriddb(
                     source_url=str(item.get("url") or image_url),
                 )
                 game_candidates.append(candidate)
-            if game_candidates:
-                break
         if not game_candidates:
             parsed_game_id = _parse_positive_int_string(game_id)
             if not parsed_game_id:
@@ -305,7 +449,6 @@ def _search_steamgriddb(
                 )
         if game_candidates:
             candidates.extend(game_candidates)
-            break
     return candidates
 
 
@@ -372,9 +515,17 @@ def search_icon_candidates(
     game_name: str,
     cleaned_name: str,
     settings: IconSearchSettings,
+    sgdb_resources: Iterable[str] | None = None,
 ) -> list[IconCandidate]:
     candidates: list[IconCandidate] = []
-    candidates.extend(_search_steamgriddb(settings, game_name, cleaned_name))
+    candidates.extend(
+        _search_steamgriddb(
+            settings,
+            game_name,
+            cleaned_name,
+            sgdb_resources=sgdb_resources,
+        )
+    )
     if not candidates:
         candidates.extend(_search_iconfinder(settings, game_name, cleaned_name))
     # If SteamGridDB returns some but few/weak entries, augment with Iconfinder too.

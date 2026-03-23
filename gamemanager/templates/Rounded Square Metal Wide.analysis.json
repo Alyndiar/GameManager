@@ -1,0 +1,15 @@
+{
+  "template_file": "Rounded Square Metal Wide.png",
+  "template_mtime_ns": 1774027973839351000,
+  "shape": "square",
+  "alpha_threshold": 8,
+  "interior_pixels": 184852,
+  "outside_pixels": 12094,
+  "transparent_pixels": 196946,
+  "interior_bbox": [
+    39,
+    37,
+    474,
+    474
+  ]
+}

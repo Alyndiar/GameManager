@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Callable
 
 from gamemanager.models import MovePlanItem, OperationReport, RenamePlanItem, RootFolder
+from gamemanager.services.cancellation import OperationCancelled
 from gamemanager.services.normalization import normalize_separators
 
 
@@ -55,28 +57,45 @@ def build_rename_plan(roots: list[RootFolder]) -> list[RenamePlanItem]:
     return plan
 
 
-def execute_rename_plan(plan_items: list[RenamePlanItem]) -> OperationReport:
+def execute_rename_plan(
+    plan_items: list[RenamePlanItem],
+    progress_cb: Callable[[str, int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> OperationReport:
+    def _emit(current: int, total: int) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb("Cleanup names", current, total)
+        except Exception:
+            return
+
     report = OperationReport(total=len(plan_items))
-    for item in plan_items:
+    total = len(plan_items)
+    _emit(0, total)
+    if should_cancel is not None and should_cancel():
+        raise OperationCancelled("Cleanup canceled")
+    for idx, item in enumerate(plan_items, start=1):
+        if should_cancel is not None and should_cancel():
+            raise OperationCancelled("Cleanup canceled")
         if item.status == "unchanged":
             report.skipped += 1
-            continue
-        if item.status == "conflict":
+        elif item.status == "conflict":
             report.conflicts += 1
             report.details.append(f"Conflict: {item.src_path} -> {item.dst_path}")
-            continue
-        if item.status != "ready":
+        elif item.status != "ready":
             report.skipped += 1
-            continue
-        try:
-            item.src_path.rename(item.dst_path)
-            report.succeeded += 1
-        except FileExistsError:
-            report.conflicts += 1
-            report.details.append(f"Conflict: {item.src_path} -> {item.dst_path}")
-        except OSError as exc:
-            report.failed += 1
-            report.details.append(f"Failed rename {item.src_path}: {exc}")
+        else:
+            try:
+                item.src_path.rename(item.dst_path)
+                report.succeeded += 1
+            except FileExistsError:
+                report.conflicts += 1
+                report.details.append(f"Conflict: {item.src_path} -> {item.dst_path}")
+            except OSError as exc:
+                report.failed += 1
+                report.details.append(f"Failed rename {item.src_path}: {exc}")
+        _emit(idx, total)
     return report
 
 
@@ -130,35 +149,52 @@ def _remove_path(path: Path) -> None:
         path.unlink()
 
 
-def execute_move_plan(plan_items: list[MovePlanItem]) -> OperationReport:
+def execute_move_plan(
+    plan_items: list[MovePlanItem],
+    progress_cb: Callable[[str, int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> OperationReport:
+    def _emit(current: int, total: int) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb("Move archives", current, total)
+        except Exception:
+            return
+
     report = OperationReport(total=len(plan_items))
-    for item in plan_items:
+    total = len(plan_items)
+    _emit(0, total)
+    if should_cancel is not None and should_cancel():
+        raise OperationCancelled("Move canceled")
+    for idx, item in enumerate(plan_items, start=1):
+        if should_cancel is not None and should_cancel():
+            raise OperationCancelled("Move canceled")
         action = item.selected_action
         if item.status == "conflict" and action == "skip":
             report.conflicts += 1
             report.details.append(f"Conflict skipped: {item.src_path} -> {item.dst_path}")
-            continue
-        if action == "skip":
+        elif action == "skip":
             report.skipped += 1
-            continue
-        try:
-            item.dst_folder.mkdir(parents=True, exist_ok=True)
-            destination = item.dst_path
-            if action == "rename":
-                if not item.manual_name:
-                    raise OSError("Manual rename selected without manual name")
-                destination = item.dst_folder / item.manual_name
-            if action in {"overwrite", "delete_destination"}:
-                _remove_path(destination)
-            if destination.exists():
-                raise FileExistsError(f"Destination exists: {destination}")
-            shutil.move(str(item.src_path), str(destination))
-            report.succeeded += 1
-        except FileExistsError as exc:
-            report.conflicts += 1
-            report.details.append(f"Conflict: {exc}")
-        except OSError as exc:
-            report.failed += 1
-            report.details.append(f"Failed move {item.src_path}: {exc}")
+        else:
+            try:
+                item.dst_folder.mkdir(parents=True, exist_ok=True)
+                destination = item.dst_path
+                if action == "rename":
+                    if not item.manual_name:
+                        raise OSError("Manual rename selected without manual name")
+                    destination = item.dst_folder / item.manual_name
+                if action in {"overwrite", "delete_destination"}:
+                    _remove_path(destination)
+                if destination.exists():
+                    raise FileExistsError(f"Destination exists: {destination}")
+                shutil.move(str(item.src_path), str(destination))
+                report.succeeded += 1
+            except FileExistsError as exc:
+                report.conflicts += 1
+                report.details.append(f"Conflict: {exc}")
+            except OSError as exc:
+                report.failed += 1
+                report.details.append(f"Failed move {item.src_path}: {exc}")
+        _emit(idx, total)
     return report
-
