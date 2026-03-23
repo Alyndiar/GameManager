@@ -63,3 +63,34 @@ def test_apply_folder_icon_writes_ini_and_icon(tmp_path: Path, monkeypatch) -> N
     assert "[.ShellClassInfo]" in desktop
     assert "IconResource=.\\Test Game.ico,0" in desktop
     assert "InfoTip=My tip" in desktop
+
+
+def test_apply_folder_icon_clears_attrs_before_overwrite(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "Game"
+    folder.mkdir()
+    existing_icon = folder / "Game.ico"
+    existing_ini = folder / "desktop.ini"
+    existing_icon.write_bytes(b"OLD")
+    existing_ini.write_text(
+        "[.ShellClassInfo]\nIconResource=.\\Game.ico,0\nFlags=0\n",
+        encoding="utf-8-sig",
+    )
+
+    attrib_calls: list[list[str]] = []
+
+    def _capture_attrib(args: list[str]) -> None:
+        attrib_calls.append(args)
+
+    monkeypatch.setattr(folder_icons, "_run_attrib", _capture_attrib)
+    monkeypatch.setattr(folder_icons, "_shell_refresh", lambda path: None)
+
+    result = folder_icons.apply_folder_icon(
+        folder_path=folder,
+        icon_bytes=b"NEW",
+        icon_name_hint="Game",
+    )
+    assert result.status == "applied"
+    clear_icon = ["-r", "-s", "-h", str(existing_icon)]
+    clear_ini = ["-r", "-s", "-h", str(existing_ini)]
+    assert clear_icon in attrib_calls
+    assert clear_ini in attrib_calls

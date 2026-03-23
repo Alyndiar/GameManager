@@ -1,15 +1,32 @@
 from __future__ import annotations
 
+from datetime import datetime
+import faulthandler
 import filecmp
 import os
 import shutil
 import sys
+import traceback
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
 from gamemanager.app_state import AppState
 from gamemanager.ui.main_window import MainWindow
+
+_CRASH_LOG_HANDLE = None
+
+
+def _configure_runtime_noise_controls() -> None:
+    # Hide low-value PNG metadata duplicate warnings (eXIf duplicate).
+    existing_rules = os.environ.get("QT_LOGGING_RULES", "").strip()
+    rule = "qt.gui.imageio.warning=false"
+    if not existing_rules:
+        os.environ["QT_LOGGING_RULES"] = rule
+    elif rule not in existing_rules:
+        os.environ["QT_LOGGING_RULES"] = f"{existing_rules};{rule}"
+    # Keep icon text/cutout workflows fully local and skip Paddle model host checks.
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 
 def _legacy_appdata_data_dir() -> Path | None:
@@ -105,9 +122,44 @@ def _default_db_path() -> Path:
     return data_dir / "manager.db"
 
 
+def _enable_crash_logging(data_dir: Path) -> None:
+    global _CRASH_LOG_HANDLE
+    logs_dir = data_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "crash.log"
+    try:
+        _CRASH_LOG_HANDLE = open(log_path, "a", encoding="utf-8")
+    except OSError:
+        _CRASH_LOG_HANDLE = None
+        return
+
+    _CRASH_LOG_HANDLE.write(
+        f"\n[{datetime.now().isoformat(timespec='seconds')}] GameManager session start\n"
+    )
+    _CRASH_LOG_HANDLE.flush()
+    try:
+        faulthandler.enable(_CRASH_LOG_HANDLE, all_threads=True)
+    except Exception:
+        pass
+
+    def _log_excepthook(exc_type, exc_value, exc_tb):
+        if _CRASH_LOG_HANDLE is not None:
+            _CRASH_LOG_HANDLE.write(
+                f"[{datetime.now().isoformat(timespec='seconds')}] Unhandled exception:\n"
+            )
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=_CRASH_LOG_HANDLE)
+            _CRASH_LOG_HANDLE.flush()
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _log_excepthook
+
+
 def run() -> int:
+    _configure_runtime_noise_controls()
+    db_path = _default_db_path()
+    _enable_crash_logging(db_path.parent)
     app = QApplication(sys.argv)
-    state = AppState(_default_db_path())
+    state = AppState(db_path)
     window = MainWindow(state)
     screen = app.primaryScreen()
     if screen is not None:

@@ -1,0 +1,15 @@
+{
+  "template_file": "Circle Glass Thin.png",
+  "template_mtime_ns": 1774027817209076400,
+  "shape": "round",
+  "alpha_threshold": 8,
+  "interior_pixels": 172007,
+  "outside_pixels": 59582,
+  "transparent_pixels": 231589,
+  "interior_bbox": [
+    20,
+    23,
+    492,
+    486
+  ]
+}

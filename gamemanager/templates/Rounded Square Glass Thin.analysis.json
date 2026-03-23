@@ -1,0 +1,15 @@
+{
+  "template_file": "Rounded Square Glass Thin.png",
+  "template_mtime_ns": 1774027930676318000,
+  "shape": "square",
+  "alpha_threshold": 8,
+  "interior_pixels": 224758,
+  "outside_pixels": 7802,
+  "transparent_pixels": 232560,
+  "interior_bbox": [
+    18,
+    16,
+    493,
+    496
+  ]
+}

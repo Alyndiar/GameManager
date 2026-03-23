@@ -1,0 +1,15 @@
+{
+  "template_file": "Rounded Square Wood Medium.png",
+  "template_mtime_ns": 1774027938976210400,
+  "shape": "square",
+  "alpha_threshold": 8,
+  "interior_pixels": 217274,
+  "outside_pixels": 6332,
+  "transparent_pixels": 223606,
+  "interior_bbox": [
+    22,
+    20,
+    490,
+    491
+  ]
+}

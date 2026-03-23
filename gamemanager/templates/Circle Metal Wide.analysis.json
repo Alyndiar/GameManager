@@ -1,0 +1,15 @@
+{
+  "template_file": "Circle Metal Wide.png",
+  "template_mtime_ns": 1774027978588270100,
+  "shape": "round",
+  "alpha_threshold": 8,
+  "interior_pixels": 141433,
+  "outside_pixels": 57297,
+  "transparent_pixels": 198730,
+  "interior_bbox": [
+    43,
+    40,
+    469,
+    463
+  ]
+}

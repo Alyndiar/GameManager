@@ -80,6 +80,20 @@ def _shell_refresh(path: Path) -> None:
         return
 
 
+def _prepare_file_for_overwrite(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        _run_attrib(["-r", "-s", "-h", str(path)])
+    except OSError:
+        # Continue and attempt write; attrib can fail on some FS setups.
+        pass
+    try:
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+
+
 def apply_folder_icon(
     folder_path: Path,
     icon_bytes: bytes,
@@ -96,6 +110,8 @@ def apply_folder_icon(
     icon_path = folder_path / f"{safe_name}.ico"
     desktop_ini = folder_path / "desktop.ini"
     try:
+        _prepare_file_for_overwrite(icon_path)
+        _prepare_file_for_overwrite(desktop_ini)
         icon_path.write_bytes(icon_bytes)
         lines = [
             "[.ShellClassInfo]",

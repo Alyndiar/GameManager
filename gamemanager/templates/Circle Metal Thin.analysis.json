@@ -1,0 +1,15 @@
+{
+  "template_file": "Circle Metal Thin.png",
+  "template_mtime_ns": 1774027843417232300,
+  "shape": "round",
+  "alpha_threshold": 8,
+  "interior_pixels": 172014,
+  "outside_pixels": 57786,
+  "transparent_pixels": 229800,
+  "interior_bbox": [
+    22,
+    20,
+    490,
+    489
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "template_file": "Rounded Square Metal Thin.png",
+  "template_mtime_ns": 1774027950201265300,
+  "shape": "square",
+  "alpha_threshold": 8,
+  "interior_pixels": 223066,
+  "outside_pixels": 6877,
+  "transparent_pixels": 229943,
+  "interior_bbox": [
+    17,
+    18,
+    494,
+    494
+  ]
+}
