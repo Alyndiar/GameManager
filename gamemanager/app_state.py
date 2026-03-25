@@ -21,6 +21,8 @@ from gamemanager.services.icon_repair import repair_absolute_icon_paths
 from gamemanager.services.icon_cache import DiskImageCache
 from gamemanager.services.icon_pipeline import build_preview_png
 from gamemanager.services.icon_apply_subprocess import apply_folder_icon_in_subprocess
+from gamemanager.services.game_infotips import fetch_game_infotip
+from gamemanager.services.folder_icons import read_folder_info_tip, set_folder_info_tip
 from gamemanager.services.icon_sources import (
     DEFAULT_ICONFINDER_API_BASE,
     DEFAULT_SGDB_ENABLED_RESOURCES,
@@ -425,6 +427,92 @@ class AppState:
             border_shader=border_shader,
             temp_dir=self.db.db_path.parent / "tmp",
         )
+
+    def get_or_fetch_game_infotip(self, cleaned_name: str) -> str | None:
+        name = cleaned_name.strip()
+        if not name:
+            return None
+        cached = self.db.get_game_infotip(name)
+        if cached is not None:
+            tip, _source = cached
+            tip = tip.strip()
+            return tip or None
+        fetched = fetch_game_infotip(name)
+        if fetched is None:
+            self.db.upsert_game_infotip(name, "", "miss")
+            return None
+        tip, source = fetched
+        tip = tip.strip()
+        if not tip:
+            self.db.upsert_game_infotip(name, "", "miss")
+            return None
+        self.db.upsert_game_infotip(name, tip, source)
+        return tip
+
+    def refresh_game_infotip(self, cleaned_name: str) -> str | None:
+        name = cleaned_name.strip()
+        if not name:
+            return None
+        fetched = fetch_game_infotip(name)
+        if fetched is None:
+            cached = self.db.get_game_infotip(name)
+            if cached is not None:
+                cached_tip, _cached_source = cached
+                cached_tip = cached_tip.strip()
+                return cached_tip or None
+            return None
+        tip, source = fetched
+        tip = tip.strip()
+        if not tip:
+            return None
+        self.db.upsert_game_infotip(name, tip, source)
+        return tip
+
+    def ensure_folder_info_tip(
+        self,
+        folder_path: str,
+        cleaned_name: str,
+        *,
+        overwrite_existing: bool = False,
+        force_refresh: bool = False,
+    ) -> tuple[bool, str | None]:
+        path = Path(folder_path)
+        existing = read_folder_info_tip(path).strip()
+        if existing and not overwrite_existing:
+            return False, existing
+        tip = (
+            self.refresh_game_infotip(cleaned_name)
+            if force_refresh
+            else self.get_or_fetch_game_infotip(cleaned_name)
+        )
+        if not tip:
+            return False, existing or None
+        updated = set_folder_info_tip(path, tip)
+        if updated:
+            return True, tip
+        if existing:
+            return False, existing
+        return False, None
+
+    def set_manual_folder_info_tip(
+        self,
+        folder_path: str,
+        cleaned_name: str,
+        info_tip: str,
+    ) -> bool:
+        path = Path(folder_path)
+        tip = info_tip.strip()
+        if not tip:
+            return False
+        existing = read_folder_info_tip(path).strip()
+        if existing == tip:
+            self.db.upsert_game_infotip(cleaned_name, tip, "manual")
+            return True
+        updated = set_folder_info_tip(path, tip)
+        if not updated:
+            return False
+        self.db.upsert_game_infotip(cleaned_name, tip, "manual")
+        return True
 
     def repair_absolute_icon_paths(self) -> OperationReport:
         return repair_absolute_icon_paths(self.list_roots())

@@ -13,10 +13,11 @@ def test_detect_folder_icon_state_valid(tmp_path: Path) -> None:
         encoding="utf-8-sig",
     )
 
-    status, icon_file, desktop_ini = folder_icons.detect_folder_icon_state(folder)
+    status, icon_file, desktop_ini, info_tip = folder_icons.detect_folder_icon_state(folder)
     assert status == "valid"
     assert icon_file is not None and icon_file.endswith("Game.ico")
     assert desktop_ini is not None and desktop_ini.endswith("desktop.ini")
+    assert info_tip == ""
 
 
 def test_detect_folder_icon_state_broken_when_missing_target(tmp_path: Path) -> None:
@@ -26,9 +27,10 @@ def test_detect_folder_icon_state_broken_when_missing_target(tmp_path: Path) -> 
         "[.ShellClassInfo]\nIconResource=.\\Missing.ico,0\nFlags=0\n",
         encoding="utf-8-sig",
     )
-    status, icon_file, _ = folder_icons.detect_folder_icon_state(folder)
+    status, icon_file, _, info_tip = folder_icons.detect_folder_icon_state(folder)
     assert status == "broken"
     assert icon_file is not None and icon_file.endswith("Missing.ico")
+    assert info_tip == ""
 
 
 def test_detect_folder_icon_state_accepts_dot_zero_suffix(tmp_path: Path) -> None:
@@ -39,9 +41,10 @@ def test_detect_folder_icon_state_accepts_dot_zero_suffix(tmp_path: Path) -> Non
         "[.ShellClassInfo]\nIconResource=.\\Game.ico.0\nFlags=0\n",
         encoding="utf-8-sig",
     )
-    status, icon_file, _ = folder_icons.detect_folder_icon_state(folder)
+    status, icon_file, _, info_tip = folder_icons.detect_folder_icon_state(folder)
     assert status == "valid"
     assert icon_file is not None and icon_file.endswith("Game.ico")
+    assert info_tip == ""
 
 
 def test_apply_folder_icon_writes_ini_and_icon(tmp_path: Path, monkeypatch) -> None:
@@ -63,6 +66,22 @@ def test_apply_folder_icon_writes_ini_and_icon(tmp_path: Path, monkeypatch) -> N
     assert "[.ShellClassInfo]" in desktop
     assert "IconResource=.\\Test Game.ico,0" in desktop
     assert "InfoTip=My tip" in desktop
+
+
+def test_set_folder_info_tip_updates_existing_desktop_ini(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "Game"
+    folder.mkdir()
+    (folder / "Game.ico").write_bytes(b"ICO")
+    (folder / "desktop.ini").write_text(
+        "[.ShellClassInfo]\nIconResource=.\\Game.ico,0\nFlags=0\n",
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setattr(folder_icons, "_run_attrib", lambda args: None)
+    monkeypatch.setattr(folder_icons, "_shell_refresh", lambda path: None)
+
+    changed = folder_icons.set_folder_info_tip(folder, "Description line.")
+    assert changed is True
+    assert folder_icons.read_folder_info_tip(folder) == "Description line."
 
 
 def test_apply_folder_icon_clears_attrs_before_overwrite(tmp_path: Path, monkeypatch) -> None:

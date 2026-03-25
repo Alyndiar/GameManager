@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 import re
@@ -37,6 +38,10 @@ class ImagePrepOptions:
     min_padding_pixels: int = 1
     alpha_threshold: int = 8
     border_threshold: int = 16
+    background_remove_mode: str = "black"  # black | white | custom
+    background_color_rgb: tuple[int, int, int] = (0, 0, 0)
+    background_tolerance: int | None = None  # 0..30; None falls back to min_black_level
+    background_use_hsv: bool = True
     min_black_level: int = 0
     overwrite: bool = False
     recursive: bool = False
@@ -203,24 +208,156 @@ def normalize_to_square_png(
     return out.getvalue()
 
 
-def apply_min_black_transparency(
+def _normalize_rgb_triplet(color: tuple[int, int, int] | list[int] | None) -> tuple[int, int, int]:
+    if color is None or len(color) < 3:  # type: ignore[arg-type]
+        return (0, 0, 0)
+    return (
+        max(0, min(255, int(color[0]))),  # type: ignore[index]
+        max(0, min(255, int(color[1]))),  # type: ignore[index]
+        max(0, min(255, int(color[2]))),  # type: ignore[index]
+    )
+
+
+def resolve_background_removal_config(
+    *,
+    mode: str,
+    tolerance: int,
+    custom_color_rgb: tuple[int, int, int] | list[int] | None,
+    use_hsv_for_custom: bool = True,
+) -> tuple[tuple[int, int, int], int, str]:
+    normalized_mode = str(mode or "black").strip().casefold()
+    if normalized_mode not in {"black", "white", "custom"}:
+        normalized_mode = "black"
+    level = max(0, min(MIN_BLACK_LEVEL_MAX, int(tolerance)))
+    if normalized_mode == "white":
+        base = (255, 255, 255)
+    elif normalized_mode == "custom":
+        base = _normalize_rgb_triplet(custom_color_rgb)
+    else:
+        base = (0, 0, 0)
+    is_non_bw_custom = normalized_mode == "custom" and base not in {(0, 0, 0), (255, 255, 255)}
+    effective_level = max(0, min(255, int(round(level / 2.0)))) if is_non_bw_custom else level
+    color_space = "hsv" if (normalized_mode == "custom" and bool(use_hsv_for_custom)) else "rgb"
+    return base, effective_level, color_space
+
+
+def apply_background_color_transparency(
     image_bytes: bytes,
     *,
-    min_black_level: int = 0,
+    mode: str = "black",
+    tolerance: int = 0,
+    custom_color_rgb: tuple[int, int, int] | list[int] | None = None,
+    use_hsv_for_custom: bool = True,
 ) -> bytes:
-    level = max(0, min(MIN_BLACK_LEVEL_MAX, int(min_black_level)))
+    base_color, level, color_space = resolve_background_removal_config(
+        mode=mode,
+        tolerance=tolerance,
+        custom_color_rgb=custom_color_rgb,
+        use_hsv_for_custom=use_hsv_for_custom,
+    )
     if level <= 0:
+        return image_bytes
+    if _already_transparent_exterior_and_center(image_bytes):
+        # Input already has transparent outside and center hole; keep existing alpha/background.
         return image_bytes
     return make_background_transparent(
         image_bytes,
         options=TemplateTransparencyOptions(
             threshold=level,
             color_tolerance_mode="max",
+            compare_color_space=color_space,
             use_edge_flood_fill=True,
             preserve_existing_alpha=True,
         ),
-        background_color=(0, 0, 0),
+        background_color=base_color,
     )
+
+
+def apply_min_black_transparency(
+    image_bytes: bytes,
+    *,
+    min_black_level: int = 0,
+) -> bytes:
+    return apply_background_color_transparency(
+        image_bytes,
+        mode="black",
+        tolerance=min_black_level,
+        custom_color_rgb=(0, 0, 0),
+        use_hsv_for_custom=False,
+    )
+
+
+def _already_transparent_exterior_and_center(
+    image_bytes: bytes,
+    *,
+    alpha_threshold: int = 8,
+) -> bool:
+    image = Image.open(BytesIO(image_bytes))
+    image.load()
+    rgba = ImageOps.exif_transpose(image).convert("RGBA")
+    width, height = rgba.size
+    if width < 3 or height < 3:
+        return False
+    alpha_bytes = rgba.getchannel("A").tobytes()
+    total = width * height
+    transparent = bytearray(total)
+    transparent_count = 0
+    for idx, value in enumerate(alpha_bytes):
+        if int(value) <= int(alpha_threshold):
+            transparent[idx] = 1
+            transparent_count += 1
+    if transparent_count <= 0 or transparent_count >= total:
+        return False
+
+    outside = bytearray(total)
+    queue: deque[int] = deque()
+
+    def _seed_if_transparent(x: int, y: int) -> None:
+        idx = y * width + x
+        if transparent[idx] and not outside[idx]:
+            outside[idx] = 1
+            queue.append(idx)
+
+    for x in range(width):
+        _seed_if_transparent(x, 0)
+        _seed_if_transparent(x, height - 1)
+    for y in range(height):
+        _seed_if_transparent(0, y)
+        _seed_if_transparent(width - 1, y)
+    if not queue:
+        return False
+
+    while queue:
+        idx = queue.popleft()
+        x = idx % width
+        y = idx // width
+        if x > 0:
+            left = idx - 1
+            if transparent[left] and not outside[left]:
+                outside[left] = 1
+                queue.append(left)
+        if x + 1 < width:
+            right = idx + 1
+            if transparent[right] and not outside[right]:
+                outside[right] = 1
+                queue.append(right)
+        if y > 0:
+            up = idx - width
+            if transparent[up] and not outside[up]:
+                outside[up] = 1
+                queue.append(up)
+        if y + 1 < height:
+            down = idx + width
+            if transparent[down] and not outside[down]:
+                outside[down] = 1
+                queue.append(down)
+
+    outside_count = int(sum(outside))
+    interior_transparent_count = transparent_count - outside_count
+    min_hole_pixels = max(8, total // 800)
+    if interior_transparent_count < min_hole_pixels:
+        return False
+    return True
 
 
 def _destination_path(output_dir: Path, source: Path, overwrite: bool) -> Path:
@@ -304,9 +441,17 @@ def prepare_images_to_512_png(
             continue
         try:
             image_bytes = source.read_bytes()
-            image_bytes = apply_min_black_transparency(
+            tolerance = (
+                int(opts.min_black_level)
+                if opts.background_tolerance is None
+                else int(opts.background_tolerance)
+            )
+            image_bytes = apply_background_color_transparency(
                 image_bytes,
-                min_black_level=opts.min_black_level,
+                mode=str(opts.background_remove_mode),
+                tolerance=tolerance,
+                custom_color_rgb=opts.background_color_rgb,
+                use_hsv_for_custom=bool(opts.background_use_hsv),
             )
             normalized = normalize_to_square_png(
                 image_bytes,
@@ -375,9 +520,17 @@ def prepare_images_to_template_folder(
         destination, next_idx = _next_template_path(template_dir, next_idx, width)
         try:
             image_bytes = source.read_bytes()
-            image_bytes = apply_min_black_transparency(
+            tolerance = (
+                int(opts.min_black_level)
+                if opts.background_tolerance is None
+                else int(opts.background_tolerance)
+            )
+            image_bytes = apply_background_color_transparency(
                 image_bytes,
-                min_black_level=opts.min_black_level,
+                mode=str(opts.background_remove_mode),
+                tolerance=tolerance,
+                custom_color_rgb=opts.background_color_rgb,
+                use_hsv_for_custom=bool(opts.background_use_hsv),
             )
             normalized = normalize_to_square_png(
                 image_bytes,

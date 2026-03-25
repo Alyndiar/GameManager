@@ -52,6 +52,14 @@ class Database:
                     example_name TEXT NOT NULL,
                     last_seen TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS game_infotips (
+                    cleaned_name_key TEXT PRIMARY KEY,
+                    cleaned_name TEXT NOT NULL,
+                    info_tip TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -152,4 +160,47 @@ class Database:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 [(c, o, n, e, now) for c, o, n, e in rows],
+            )
+
+    def get_game_infotip(self, cleaned_name: str) -> tuple[str, str] | None:
+        key = cleaned_name.strip().casefold()
+        if not key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT info_tip, source
+                FROM game_infotips
+                WHERE cleaned_name_key = ?
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["info_tip"] or ""), str(row["source"] or "")
+
+    def upsert_game_infotip(self, cleaned_name: str, info_tip: str, source: str) -> None:
+        key = cleaned_name.strip().casefold()
+        if not key:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO game_infotips(
+                    cleaned_name_key, cleaned_name, info_tip, source, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(cleaned_name_key) DO UPDATE SET
+                  cleaned_name=excluded.cleaned_name,
+                  info_tip=excluded.info_tip,
+                  source=excluded.source,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    key,
+                    cleaned_name.strip(),
+                    info_tip.strip(),
+                    source.strip() or "unknown",
+                    utc_now_iso(),
+                ),
             )

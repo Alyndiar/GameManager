@@ -42,4 +42,5 @@ def test_scan_roots_detects_valid_folder_icon_metadata(tmp_path: Path) -> None:
     assert item.icon_status == "valid"
     assert item.folder_icon_path is not None and item.folder_icon_path.endswith("GameFolder.ico")
     assert item.desktop_ini_path is not None and item.desktop_ini_path.endswith("desktop.ini")
+    assert item.info_tip == ""
 

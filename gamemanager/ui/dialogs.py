@@ -28,9 +28,11 @@ from PySide6.QtCore import (
     Slot,
 )
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QIcon,
     QImage,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -63,6 +65,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSlider,
     QScrollArea,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -103,7 +106,7 @@ from gamemanager.services.icon_pipeline import (
 from gamemanager.services.image_prep import (
     ImagePrepOptions,
     SUPPORTED_IMAGE_EXTENSIONS,
-    apply_min_black_transparency,
+    apply_background_color_transparency,
     icon_templates_dir,
     normalize_to_square_png,
     prepare_images_to_template_folder,
@@ -169,6 +172,182 @@ SGDB_RESOURCE_OPTIONS: list[tuple[str, str]] = [
     ("Hero", "heroes"),
 ]
 
+_TEMPLATE_GALLERY_SIZE_PREF_KEY = "template_gallery_preview_size"
+_TEMPLATE_GALLERY_SIZE_MIN = 48
+_TEMPLATE_GALLERY_SIZE_MAX = 256
+_TEMPLATE_GALLERY_SIZE_DEFAULT = 128
+_template_gallery_size_runtime = _TEMPLATE_GALLERY_SIZE_DEFAULT
+
+
+def _template_gallery_clamp_size(value: int) -> int:
+    return max(_TEMPLATE_GALLERY_SIZE_MIN, min(_TEMPLATE_GALLERY_SIZE_MAX, int(value)))
+
+
+def _resolve_ui_state(widget: QWidget | None):
+    current = widget
+    while current is not None:
+        state = getattr(current, "state", None)
+        if state is not None and hasattr(state, "get_ui_pref") and hasattr(state, "set_ui_pref"):
+            return state
+        current = current.parentWidget()
+    return None
+
+
+def _load_template_gallery_size(parent: QWidget | None) -> int:
+    global _template_gallery_size_runtime
+    state = _resolve_ui_state(parent)
+    if state is not None:
+        raw = str(state.get_ui_pref(_TEMPLATE_GALLERY_SIZE_PREF_KEY, str(_template_gallery_size_runtime))).strip()
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = _template_gallery_size_runtime
+        _template_gallery_size_runtime = _template_gallery_clamp_size(parsed)
+    return _template_gallery_size_runtime
+
+
+def _save_template_gallery_size(parent: QWidget | None, size: int) -> None:
+    global _template_gallery_size_runtime
+    normalized = _template_gallery_clamp_size(size)
+    _template_gallery_size_runtime = normalized
+    state = _resolve_ui_state(parent)
+    if state is not None:
+        try:
+            state.set_ui_pref(_TEMPLATE_GALLERY_SIZE_PREF_KEY, str(normalized))
+        except Exception:
+            pass
+
+
+def _template_gallery_placeholder(size: int = 128) -> QPixmap:
+    out = QPixmap(max(1, int(size)), max(1, int(size)))
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    draw_checkerboard(painter, QRectF(0.0, 0.0, float(out.width()), float(out.height())))
+    pen = QPen(QColor(220, 220, 220, 190))
+    pen.setWidth(2)
+    pen.setStyle(Qt.PenStyle.DashLine)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawRect(4, 4, out.width() - 8, out.height() - 8)
+    painter.setPen(QColor(235, 235, 235, 230))
+    painter.drawText(out.rect(), Qt.AlignmentFlag.AlignCenter, "No\nTemplate")
+    painter.end()
+    return out
+
+
+def _template_gallery_pixmap(path: Path | None, *, size: int = 128) -> QPixmap:
+    if path is None:
+        return _template_gallery_placeholder(size)
+    pix = QPixmap(str(path))
+    if pix.isNull():
+        return _template_gallery_placeholder(size)
+    return composite_on_checkerboard(pix, width=size, height=size, keep_aspect=True)
+
+
+class TemplateGalleryDialog(QDialog):
+    def __init__(
+        self,
+        entries: list[tuple[str, str, Path | None]],
+        *,
+        current_key: str = "none",
+        title: str = "Select Template",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._entries = list(entries)
+        self._selected_key = str(current_key or "none")
+        self._preview_size = _load_template_gallery_size(parent)
+        layout = QVBoxLayout(self)
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Display Size:", self))
+        self.size_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.size_slider.setRange(_TEMPLATE_GALLERY_SIZE_MIN, _TEMPLATE_GALLERY_SIZE_MAX)
+        self.size_slider.setValue(self._preview_size)
+        top_row.addWidget(self.size_slider, 1)
+        self.size_value = QLabel(f"{self._preview_size}px", self)
+        self.size_value.setMinimumWidth(44)
+        top_row.addWidget(self.size_value)
+        layout.addLayout(top_row)
+        self.list = QListWidget(self)
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setMovement(QListWidget.Movement.Static)
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setIconSize(QSize(self._preview_size, self._preview_size))
+        self.list.setGridSize(QSize(self._preview_size + 26, self._preview_size + 50))
+        self.list.setSpacing(8)
+        self.list.setWordWrap(True)
+        self._rebuild_items()
+        self.list.itemClicked.connect(self._on_item_selected)
+        self.list.itemActivated.connect(self._on_item_selected)
+        self.size_slider.valueChanged.connect(self._on_size_changed)
+        layout.addWidget(self.list, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel, self)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(900, 640)
+
+    def _on_item_selected(self, item: QListWidgetItem) -> None:
+        self._selected_key = str(item.data(Qt.ItemDataRole.UserRole) or "none")
+        self.accept()
+
+    def _rebuild_items(self) -> None:
+        self.list.clear()
+        self.list.setIconSize(QSize(self._preview_size, self._preview_size))
+        self.list.setGridSize(QSize(self._preview_size + 26, self._preview_size + 50))
+        current_item: QListWidgetItem | None = None
+        for key, label, path in self._entries:
+            item = QListWidgetItem(
+                QIcon(_template_gallery_pixmap(path, size=self._preview_size)),
+                label,
+            )
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            self.list.addItem(item)
+            if str(key) == self._selected_key:
+                current_item = item
+        if current_item is None and self.list.count() > 0:
+            current_item = self.list.item(0)
+        if current_item is not None:
+            self.list.setCurrentItem(current_item)
+            self.list.scrollToItem(
+                current_item,
+                QListWidget.ScrollHint.PositionAtCenter,
+            )
+
+    def _on_size_changed(self, value: int) -> None:
+        self._preview_size = _template_gallery_clamp_size(value)
+        self.size_value.setText(f"{self._preview_size}px")
+        self._rebuild_items()
+        _save_template_gallery_size(self, self._preview_size)
+
+    def selected_key(self) -> str:
+        return str(self._selected_key or "none")
+
+
+def _icon_style_gallery_entries() -> list[tuple[str, str, Path | None]]:
+    entries: list[tuple[str, str, Path | None]] = [("none", "No Template", None)]
+    for label, value in icon_style_options():
+        key = str(value or "").strip()
+        if not key or key == "none":
+            continue
+        spec = resolve_icon_template(key, circular_ring=False)
+        entries.append((key, str(label), spec.path))
+    return entries
+
+
+def _bind_dialog_shortcut(
+    dialog: QDialog,
+    sequence: str,
+    callback: Callable[[], None],
+) -> QAction:
+    action = QAction(dialog)
+    action.setShortcut(QKeySequence(sequence))
+    action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+    action.triggered.connect(callback)
+    dialog.addAction(action)
+    return action
+
 
 class _DropPathListWidget(QListWidget):
     paths_dropped = Signal(list)
@@ -229,6 +408,15 @@ class _DropPathListWidget(QListWidget):
         )
 
 
+class _LivePreviewLabel(QLabel):
+    pixel_clicked = Signal(QPoint)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.pixel_clicked.emit(event.position().toPoint())
+        super().mousePressEvent(event)
+
+
 class TemplatePrepDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -237,6 +425,9 @@ class TemplatePrepDialog(QDialog):
         self._output_dir = icon_templates_dir()
         self._run_in_progress = False
         self._last_processed_background: str | None = None
+        self._custom_bg_color: tuple[int, int, int] = (0, 0, 0)
+        self._eyedropper_active = False
+        self._preview_source_pixmap = QPixmap()
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(120)
@@ -257,18 +448,21 @@ class TemplatePrepDialog(QDialog):
         self.drop_list.setToolTip("Drop image files or folders here.")
         layout.addWidget(self.drop_list)
 
-        self.live_preview_label = QLabel("Live preview", self)
+        self.live_preview_label = _LivePreviewLabel("Live preview", self)
         self.live_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.live_preview_label.setMinimumSize(260, 260)
         self.live_preview_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.live_preview_label.pixel_clicked.connect(self._on_live_preview_pixel_clicked)
         layout.addWidget(self.live_preview_label)
 
         source_buttons = QHBoxLayout()
         self.add_files_btn = QPushButton("Add Files...", self)
         self.add_files_btn.clicked.connect(self._on_add_files)
+        self.add_files_btn.setToolTip("Add image files\nShortcut: Ctrl+O")
         source_buttons.addWidget(self.add_files_btn)
         self.add_folder_btn = QPushButton("Add Folder...", self)
         self.add_folder_btn.clicked.connect(self._on_add_folder)
+        self.add_folder_btn.setToolTip("Add folder\nShortcut: Ctrl+Shift+O")
         source_buttons.addWidget(self.add_folder_btn)
         self.remove_selected_btn = QPushButton("Remove Selected", self)
         self.remove_selected_btn.clicked.connect(self._on_remove_selected)
@@ -286,6 +480,7 @@ class TemplatePrepDialog(QDialog):
         output_row.addWidget(self.output_edit, 1)
         self.open_output_btn = QPushButton("Open Folder", self)
         self.open_output_btn.clicked.connect(self._on_open_output_folder)
+        self.open_output_btn.setToolTip("Open output folder\nShortcut: Alt+O")
         output_row.addWidget(self.open_output_btn)
         layout.addLayout(output_row)
 
@@ -349,17 +544,41 @@ class TemplatePrepDialog(QDialog):
         recursive_row.addStretch(1)
         right_col.addLayout(recursive_row)
 
-        black_row = QHBoxLayout()
-        black_row.addWidget(QLabel("Min Black Level:", self))
-        self.min_black_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.min_black_slider.setRange(0, 30)
-        self.min_black_slider.setValue(10)
-        self.min_black_slider.setToolTip("Pixels near pure black are made transparent.")
-        black_row.addWidget(self.min_black_slider, 1)
-        self.min_black_value = QLabel("10", self)
-        self.min_black_value.setMinimumWidth(28)
-        black_row.addWidget(self.min_black_value)
-        right_col.addLayout(black_row)
+        bg_mode_row = QHBoxLayout()
+        bg_mode_row.addWidget(QLabel("BG Removal:", self))
+        self.bg_remove_mode_combo = QComboBox(self)
+        self.bg_remove_mode_combo.addItem("Black", "black")
+        self.bg_remove_mode_combo.addItem("White", "white")
+        self.bg_remove_mode_combo.addItem("Custom", "custom")
+        bg_mode_row.addWidget(self.bg_remove_mode_combo)
+        bg_mode_row.addStretch(1)
+        right_col.addLayout(bg_mode_row)
+
+        tol_row = QHBoxLayout()
+        tol_row.addWidget(QLabel("Tolerance:", self))
+        self.bg_tolerance_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.bg_tolerance_slider.setRange(0, 30)
+        self.bg_tolerance_slider.setValue(10)
+        self.bg_tolerance_slider.setToolTip(
+            "0-30. For custom non-black/white, effective tolerance is half and uses HSV(0-255)."
+        )
+        tol_row.addWidget(self.bg_tolerance_slider, 1)
+        self.bg_tolerance_value = QLabel("10", self)
+        self.bg_tolerance_value.setMinimumWidth(28)
+        tol_row.addWidget(self.bg_tolerance_value)
+        right_col.addLayout(tol_row)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:", self))
+        self.bg_color_btn = QPushButton("#000000", self)
+        self.bg_color_btn.clicked.connect(self._on_pick_custom_bg_color)
+        color_row.addWidget(self.bg_color_btn)
+        self.bg_eyedropper_btn = QPushButton("Eye-dropper", self)
+        self.bg_eyedropper_btn.setCheckable(True)
+        self.bg_eyedropper_btn.toggled.connect(self._on_toggle_eyedropper)
+        color_row.addWidget(self.bg_eyedropper_btn)
+        color_row.addStretch(1)
+        right_col.addLayout(color_row)
 
         params.addLayout(left_col, 1)
         params.addLayout(right_col, 1)
@@ -368,6 +587,7 @@ class TemplatePrepDialog(QDialog):
         action_row = QHBoxLayout()
         self.run_btn = QPushButton("Generate Templates", self)
         self.run_btn.clicked.connect(self._on_generate)
+        self.run_btn.setToolTip("Generate templates\nShortcut: Ctrl+Enter")
         action_row.addWidget(self.run_btn)
         self.progress_label = QLabel("Progress: idle", self)
         action_row.addWidget(self.progress_label)
@@ -383,6 +603,9 @@ class TemplatePrepDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
+        self.close_btn = buttons.button(QDialogButtonBox.StandardButton.Close)
+        if self.close_btn is not None:
+            self.close_btn.setToolTip("Close\nShortcut: Esc")
         self.resize(950, 650)
 
         for widget in (
@@ -392,16 +615,24 @@ class TemplatePrepDialog(QDialog):
             self.alpha_threshold_spin,
             self.border_threshold_spin,
             self.recursive_check,
-            self.min_black_slider,
+            self.bg_tolerance_slider,
         ):
             if isinstance(widget, QCheckBox):
                 widget.toggled.connect(self._schedule_live_preview)
             else:
                 widget.valueChanged.connect(self._schedule_live_preview)
-        self.min_black_slider.valueChanged.connect(
-            lambda v: self.min_black_value.setText(str(int(v)))
+        self.bg_tolerance_slider.valueChanged.connect(
+            lambda v: self.bg_tolerance_value.setText(str(int(v)))
         )
+        self.bg_remove_mode_combo.currentIndexChanged.connect(self._on_bg_mode_changed)
+        self._sync_bg_color_controls()
         self._schedule_live_preview()
+        _bind_dialog_shortcut(self, "Ctrl+O", self._on_add_files)
+        _bind_dialog_shortcut(self, "Ctrl+Shift+O", self._on_add_folder)
+        _bind_dialog_shortcut(self, "Alt+O", self._on_open_output_folder)
+        _bind_dialog_shortcut(self, "Ctrl+Return", self._on_generate)
+        _bind_dialog_shortcut(self, "Ctrl+Enter", self._on_generate)
+        _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
 
     def _append_result(self, text: str) -> None:
         existing = self.result_box.toPlainText().strip()
@@ -409,6 +640,22 @@ class TemplatePrepDialog(QDialog):
         self.result_box.setPlainText(merged)
         self.result_box.verticalScrollBar().setValue(
             self.result_box.verticalScrollBar().maximum()
+        )
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(
+            self,
+            "Template Prep Shortcuts",
+            "\n".join(
+                [
+                    "Ctrl+O - Add Files",
+                    "Ctrl+Shift+O - Add Folder",
+                    "Alt+O - Open Output Folder",
+                    "Ctrl+Enter - Generate Templates",
+                    "Esc - Close",
+                    "F1 - Show Shortcuts",
+                ]
+            ),
         )
 
     def _refresh_list(self) -> None:
@@ -480,6 +727,111 @@ class TemplatePrepDialog(QDialog):
     def _schedule_live_preview(self) -> None:
         self._preview_timer.start()
 
+    def _current_bg_remove_mode(self) -> str:
+        mode = str(self.bg_remove_mode_combo.currentData() or "black").strip().casefold()
+        if mode not in {"black", "white", "custom"}:
+            return "black"
+        return mode
+
+    def _current_bg_tolerance(self) -> int:
+        return max(0, min(30, int(self.bg_tolerance_slider.value())))
+
+    def _current_bg_color(self) -> tuple[int, int, int]:
+        mode = self._current_bg_remove_mode()
+        if mode == "white":
+            return (255, 255, 255)
+        if mode == "custom":
+            return self._custom_bg_color
+        return (0, 0, 0)
+
+    def _sync_bg_color_controls(self) -> None:
+        custom_mode = self._current_bg_remove_mode() == "custom"
+        self.bg_color_btn.setEnabled(custom_mode)
+        self.bg_eyedropper_btn.setEnabled(custom_mode)
+        if not custom_mode and self.bg_eyedropper_btn.isChecked():
+            self.bg_eyedropper_btn.setChecked(False)
+        self._update_bg_color_button()
+
+    def _update_bg_color_button(self) -> None:
+        r, g, b = self._custom_bg_color
+        text = f"#{r:02X}{g:02X}{b:02X}"
+        self.bg_color_btn.setText(text)
+        text_color = "#111111" if (0.299 * r + 0.587 * g + 0.114 * b) > 160 else "#f0f0f0"
+        self.bg_color_btn.setStyleSheet(
+            f"QPushButton {{ background-color: rgb({r},{g},{b}); color: {text_color}; }}"
+        )
+
+    def _on_bg_mode_changed(self, _index: int) -> None:
+        self._sync_bg_color_controls()
+        self._schedule_live_preview()
+
+    def _on_pick_custom_bg_color(self) -> None:
+        r, g, b = self._custom_bg_color
+        selected = QColorDialog.getColor(QColor(r, g, b), self, "Pick Background Color")
+        if not selected.isValid():
+            return
+        self._custom_bg_color = (int(selected.red()), int(selected.green()), int(selected.blue()))
+        self._update_bg_color_button()
+        self._schedule_live_preview()
+
+    def _on_toggle_eyedropper(self, checked: bool) -> None:
+        self._eyedropper_active = bool(checked)
+        if checked:
+            self.progress_label.setText("Progress: click a pixel in Live preview to pick color")
+
+    def _on_live_preview_pixel_clicked(self, position: QPoint) -> None:
+        if not self._eyedropper_active:
+            return
+        if self._preview_source_pixmap.isNull():
+            return
+        label_w = max(1, self.live_preview_label.width())
+        label_h = max(1, self.live_preview_label.height())
+        scaled = self._preview_source_pixmap.scaled(
+            QSize(label_w, label_h),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x_off = (label_w - scaled.width()) // 2
+        y_off = (label_h - scaled.height()) // 2
+        if (
+            position.x() < x_off
+            or position.y() < y_off
+            or position.x() >= x_off + scaled.width()
+            or position.y() >= y_off + scaled.height()
+        ):
+            return
+        rel_x = position.x() - x_off
+        rel_y = position.y() - y_off
+        src_x = max(
+            0,
+            min(
+                self._preview_source_pixmap.width() - 1,
+                int(rel_x * self._preview_source_pixmap.width() / max(1, scaled.width())),
+            ),
+        )
+        src_y = max(
+            0,
+            min(
+                self._preview_source_pixmap.height() - 1,
+                int(rel_y * self._preview_source_pixmap.height() / max(1, scaled.height())),
+            ),
+        )
+        sampled = self._preview_source_pixmap.toImage().pixelColor(src_x, src_y)
+        self._custom_bg_color = (
+            int(sampled.red()),
+            int(sampled.green()),
+            int(sampled.blue()),
+        )
+        custom_idx = self.bg_remove_mode_combo.findData("custom")
+        if custom_idx >= 0:
+            self.bg_remove_mode_combo.setCurrentIndex(custom_idx)
+        self._update_bg_color_button()
+        self.progress_label.setText(
+            f"Progress: picked color #{self._custom_bg_color[0]:02X}{self._custom_bg_color[1]:02X}{self._custom_bg_color[2]:02X}"
+        )
+        self.bg_eyedropper_btn.setChecked(False)
+        self._schedule_live_preview()
+
     def _resolve_preview_source(self) -> Path | None:
         selected_items = self.drop_list.selectedItems()
         candidate_path = selected_items[0].text() if selected_items else (
@@ -501,14 +853,18 @@ class TemplatePrepDialog(QDialog):
     def _update_live_preview(self) -> None:
         source = self._resolve_preview_source()
         if source is None:
+            self._preview_source_pixmap = QPixmap()
             self.live_preview_label.setText("Live preview\n(no image selected)")
             self.live_preview_label.setPixmap(QPixmap())
             return
         try:
             payload = source.read_bytes()
-            payload = apply_min_black_transparency(
+            payload = apply_background_color_transparency(
                 payload,
-                min_black_level=int(self.min_black_slider.value()),
+                mode=self._current_bg_remove_mode(),
+                tolerance=self._current_bg_tolerance(),
+                custom_color_rgb=self._current_bg_color(),
+                use_hsv_for_custom=True,
             )
             payload = normalize_to_square_png(
                 payload,
@@ -521,6 +877,7 @@ class TemplatePrepDialog(QDialog):
             pix = QPixmap()
             if not pix.loadFromData(payload):
                 raise ValueError("Could not decode preview image.")
+            self._preview_source_pixmap = pix
             composed = composite_on_checkerboard(
                 pix,
                 width=self.live_preview_label.width(),
@@ -531,6 +888,7 @@ class TemplatePrepDialog(QDialog):
             self.live_preview_label.setPixmap(composed)
             self.live_preview_label.setToolTip(str(source))
         except Exception as exc:
+            self._preview_source_pixmap = QPixmap()
             self.live_preview_label.setPixmap(QPixmap())
             self.live_preview_label.setText(f"Preview error:\n{exc}")
 
@@ -547,6 +905,10 @@ class TemplatePrepDialog(QDialog):
             self.alpha_threshold_spin,
             self.border_threshold_spin,
             self.recursive_check,
+            self.bg_remove_mode_combo,
+            self.bg_tolerance_slider,
+            self.bg_color_btn,
+            self.bg_eyedropper_btn,
             self.run_btn,
         ):
             widget.setEnabled(enabled)
@@ -571,7 +933,11 @@ class TemplatePrepDialog(QDialog):
             min_padding_pixels=int(self.min_padding_spin.value()),
             alpha_threshold=int(self.alpha_threshold_spin.value()),
             border_threshold=int(self.border_threshold_spin.value()),
-            min_black_level=int(self.min_black_slider.value()),
+            background_remove_mode=self._current_bg_remove_mode(),
+            background_color_rgb=self._current_bg_color(),
+            background_tolerance=self._current_bg_tolerance(),
+            background_use_hsv=True,
+            min_black_level=0,
             recursive=self.recursive_check.isChecked(),
         )
         self._last_processed_background = None
@@ -676,7 +1042,15 @@ class TemplateTransparencyDialog(QDialog):
             QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
         )
         top_row.addWidget(self.template_combo, 1)
+        self.template_gallery_btn = QPushButton("", self)
+        self.template_gallery_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)
+        )
+        self.template_gallery_btn.setToolTip("Pick Template from Gallery\nShortcut: Alt+G")
+        self.template_gallery_btn.clicked.connect(self._on_pick_template_from_gallery)
+        top_row.addWidget(self.template_gallery_btn)
         self.reload_btn = QPushButton("Reload", self)
+        self.reload_btn.setToolTip("Reload templates\nShortcut: Ctrl+R")
         self.reload_btn.clicked.connect(self._reload_templates)
         top_row.addWidget(self.reload_btn)
         layout.addLayout(top_row)
@@ -700,9 +1074,11 @@ class TemplateTransparencyDialog(QDialog):
 
         actions = QHBoxLayout()
         self.cancel_btn = QPushButton("Cancel", self)
+        self.cancel_btn.setToolTip("Discard preview changes\nShortcut: Alt+C")
         self.cancel_btn.clicked.connect(self._on_cancel_changes)
         actions.addWidget(self.cancel_btn)
         self.apply_btn = QPushButton("Apply", self)
+        self.apply_btn.setToolTip("Apply current changes\nShortcut: Ctrl+S")
         self.apply_btn.clicked.connect(self._on_apply_changes)
         actions.addWidget(self.apply_btn)
         actions.addStretch(1)
@@ -715,9 +1091,30 @@ class TemplateTransparencyDialog(QDialog):
         self.template_combo.currentIndexChanged.connect(self._on_template_changed)
         self.black_slider.valueChanged.connect(self._on_black_level_changed)
         self._reload_templates()
+        _bind_dialog_shortcut(self, "Ctrl+R", self._reload_templates)
+        _bind_dialog_shortcut(self, "Ctrl+S", self._on_apply_changes)
+        _bind_dialog_shortcut(self, "Alt+C", self._on_cancel_changes)
+        _bind_dialog_shortcut(self, "Alt+G", self._on_pick_template_from_gallery)
+        _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(
+            self,
+            "Template Transparency Shortcuts",
+            "\n".join(
+                [
+                    "Ctrl+R - Reload templates",
+                    "Alt+G - Open template gallery",
+                    "Ctrl+S - Apply changes",
+                    "Alt+C - Cancel changes",
+                    "Esc - Close",
+                    "F1 - Show Shortcuts",
+                ]
+            ),
+        )
 
     def _reload_templates(self) -> None:
         self._template_dir.mkdir(parents=True, exist_ok=True)
@@ -726,29 +1123,37 @@ class TemplateTransparencyDialog(QDialog):
         current = str(self._current_path) if self._current_path else ""
         self._loading = True
         self.template_combo.clear()
+        self.template_combo.addItem("No Template", "")
         for path in files:
             self.template_combo.addItem(path.name, str(path))
         self._loading = False
         if not files:
-            self._current_path = None
-            self._original_bytes = None
-            self._preview_bytes = None
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("No templates found in IconTemplates.")
-            self._set_status("")
+            self.template_combo.setCurrentIndex(0)
+            self._select_no_template()
             self._update_action_buttons()
             return
         target_idx = 0
         if current:
             for idx, path in enumerate(files):
                 if str(path) == current:
-                    target_idx = idx
+                    target_idx = idx + 1
                     break
         was_blocked = self.template_combo.blockSignals(True)
         self.template_combo.setCurrentIndex(target_idx)
         self.template_combo.blockSignals(was_blocked)
         self._last_combo_index = target_idx
-        self._load_template(files[target_idx])
+        if target_idx <= 0:
+            self._select_no_template()
+        else:
+            self._load_template(files[target_idx - 1])
+
+    def _select_no_template(self) -> None:
+        self._current_path = None
+        self._original_bytes = None
+        self._preview_bytes = None
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText("No template selected.")
+        self._set_status("")
 
     def _on_black_level_changed(self, value: int) -> None:
         self.black_value.setText(str(int(value)))
@@ -876,9 +1281,17 @@ class TemplateTransparencyDialog(QDialog):
         if index < 0 or index >= self.template_combo.count():
             return
         selected_data = self.template_combo.itemData(index)
-        selected_path = Path(str(selected_data)) if selected_data else None
-        if selected_path is None:
+        if not selected_data:
+            if not self._confirm_switch_if_dirty():
+                if 0 <= self._last_combo_index < self.template_combo.count():
+                    self._loading = True
+                    self.template_combo.setCurrentIndex(self._last_combo_index)
+                    self._loading = False
+                return
+            self._last_combo_index = index
+            self._select_no_template()
             return
+        selected_path = Path(str(selected_data))
         if self._current_path is not None and selected_path == self._current_path:
             self._last_combo_index = index
             return
@@ -890,6 +1303,29 @@ class TemplateTransparencyDialog(QDialog):
             return
         self._last_combo_index = index
         self._load_template(selected_path)
+
+    def _on_pick_template_from_gallery(self) -> None:
+        entries: list[tuple[str, str, Path | None]] = [("none", "No Template", None)]
+        for path in self._template_files:
+            entries.append((str(path), path.name, path))
+        current_key = str(self._current_path) if self._current_path is not None else "none"
+        dialog = TemplateGalleryDialog(
+            entries,
+            current_key=current_key,
+            title="Select Template",
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_key()
+        if selected == "none":
+            idx = self.template_combo.findData("")
+            if idx >= 0:
+                self.template_combo.setCurrentIndex(idx)
+            return
+        idx = self.template_combo.findData(selected)
+        if idx >= 0:
+            self.template_combo.setCurrentIndex(idx)
 
 
 class TagReviewDialog(QDialog):
@@ -2067,6 +2503,8 @@ class BorderShaderDialog(QDialog):
 class IconFrameCanvas(QWidget):
     roiChanged = Signal(object)
     seedColorPicked = Signal(object)
+    cutoutColorPicked = Signal(object)
+    cutoutMaskMarkPoint = Signal(object)
     manualTextMarkPoint = Signal(object)
 
     def __init__(
@@ -2088,6 +2526,8 @@ class IconFrameCanvas(QWidget):
         self._roi_drag_current_image = QPointF()
         self._text_roi: tuple[float, float, float, float] | None = None
         self._seed_pick_mode = False
+        self._cutout_color_pick_mode = False
+        self._cutout_mark_mode = "none"
         self._text_mark_mode = "none"
         self._manual_add_points: list[tuple[float, float]] = []
         self._manual_remove_points: list[tuple[float, float]] = []
@@ -2134,27 +2574,49 @@ class IconFrameCanvas(QWidget):
 
     def set_seed_pick_mode(self, enabled: bool) -> None:
         self._seed_pick_mode = bool(enabled)
-        if self._seed_pick_mode or self._text_mark_mode != "none":
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.unsetCursor()
+        self._sync_pick_cursor()
 
     def seed_pick_mode(self) -> bool:
         return self._seed_pick_mode
+
+    def set_cutout_color_pick_mode(self, enabled: bool) -> None:
+        self._cutout_color_pick_mode = bool(enabled)
+        self._sync_pick_cursor()
+
+    def cutout_color_pick_mode(self) -> bool:
+        return self._cutout_color_pick_mode
+
+    def set_cutout_mark_mode(self, mode: str | None) -> None:
+        normalized = str(mode or "none").strip().casefold()
+        if normalized not in {"none", "add", "remove"}:
+            normalized = "none"
+        self._cutout_mark_mode = normalized
+        self._sync_pick_cursor()
+
+    def cutout_mark_mode(self) -> str:
+        return self._cutout_mark_mode
 
     def set_text_mark_mode(self, mode: str | None) -> None:
         normalized = str(mode or "none").strip().casefold()
         if normalized not in {"none", "add", "remove"}:
             normalized = "none"
         self._text_mark_mode = normalized
-        if self._seed_pick_mode or self._text_mark_mode != "none":
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.unsetCursor()
+        self._sync_pick_cursor()
         self.update()
 
     def text_mark_mode(self) -> str:
         return self._text_mark_mode
+
+    def _sync_pick_cursor(self) -> None:
+        if (
+            self._seed_pick_mode
+            or self._cutout_color_pick_mode
+            or self._cutout_mark_mode != "none"
+            or self._text_mark_mode != "none"
+        ):
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        self.unsetCursor()
 
     def set_manual_text_points(
         self,
@@ -2712,6 +3174,17 @@ class IconFrameCanvas(QWidget):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._cutout_color_pick_mode and event.button() == Qt.MouseButton.LeftButton:
+            source_point = self._canvas_point_to_source_image_point(event.position())
+            image = self._pixmap.toImage()
+            if not image.isNull():
+                px = max(0, min(image.width() - 1, int(round(source_point.x()))))
+                py = max(0, min(image.height() - 1, int(round(source_point.y()))))
+                color = image.pixelColor(px, py)
+                self.cutoutColorPicked.emit((color.red(), color.green(), color.blue()))
+            self.set_cutout_color_pick_mode(False)
+            event.accept()
+            return
         if self._seed_pick_mode and event.button() == Qt.MouseButton.LeftButton:
             source_point = self._canvas_point_to_source_image_point(event.position())
             image = self._pixmap.toImage()
@@ -2721,6 +3194,13 @@ class IconFrameCanvas(QWidget):
                 color = image.pixelColor(px, py)
                 self.seedColorPicked.emit((color.red(), color.green(), color.blue()))
             self.set_seed_pick_mode(False)
+            event.accept()
+            return
+        if self._cutout_mark_mode != "none" and event.button() == Qt.MouseButton.LeftButton:
+            source_point = self._canvas_point_to_source_image_point(event.position())
+            nx = max(0.0, min(1.0, source_point.x() / max(1.0, float(self._pixmap.width()))))
+            ny = max(0.0, min(1.0, source_point.y() / max(1.0, float(self._pixmap.height()))))
+            self.cutoutMaskMarkPoint.emit((nx, ny))
             event.accept()
             return
         if self._text_mark_mode != "none" and event.button() == Qt.MouseButton.LeftButton:
@@ -3479,6 +3959,18 @@ class IconFramingDialog(QDialog):
         for idx, color in enumerate(initial_text_cfg.seed_colors[:initial_group_count]):
             self._seed_colors[idx] = (int(color[0]), int(color[1]), int(color[2]))
         self._active_seed_pick_index: int | None = None
+        self._cutout_picked_colors: list[dict[str, object]] = []
+        self._cutout_pick_mode_active = False
+        self._cutout_row_uid_counter = 1
+        self._active_cutout_mark_row_id: int | None = None
+        self._cutout_mark_mode = "none"
+        self._cutout_mark_history: dict[
+            int,
+            dict[
+                str,
+                list[tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]]],
+            ],
+        ] = {}
         self._manual_text_mark_mode = "none"
         self._manual_add_points: list[tuple[float, float]] = list(initial_text_cfg.manual_add_seeds)
         self._manual_remove_points: list[tuple[float, float]] = list(
@@ -3502,6 +3994,8 @@ class IconFramingDialog(QDialog):
         self._canvas.set_upscale_method("lanczos_unsharp")
         self._canvas.roiChanged.connect(self._on_canvas_roi_changed)
         self._canvas.seedColorPicked.connect(self._on_canvas_seed_color_picked)
+        self._canvas.cutoutColorPicked.connect(self._on_canvas_cutout_color_picked)
+        self._canvas.cutoutMaskMarkPoint.connect(self._on_canvas_cutout_mark_point)
         self._canvas.manualTextMarkPoint.connect(self._on_canvas_manual_text_mark_point)
         self._canvas.set_text_roi(
             tuple(self._text_roi) if self._text_roi is not None else None
@@ -3529,6 +4023,13 @@ class IconFramingDialog(QDialog):
             self.border_combo.setCurrentIndex(current_idx)
         self.border_combo.currentIndexChanged.connect(self._on_border_changed)
         template_row.addWidget(self.border_combo, 1)
+        self.border_gallery_btn = QPushButton("", self)
+        self.border_gallery_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)
+        )
+        self.border_gallery_btn.setToolTip("Pick Template from Gallery")
+        self.border_gallery_btn.clicked.connect(self._on_pick_border_template_from_gallery)
+        template_row.addWidget(self.border_gallery_btn)
         side.addLayout(template_row)
 
         zoom_row = QHBoxLayout()
@@ -3655,6 +4156,67 @@ class IconFramingDialog(QDialog):
         self.post_process_check.toggled.connect(self._on_cutout_params_changed)
         cutout_grid.addWidget(self.post_process_check, 2, 2, 1, 2)
         side.addWidget(self.cutout_advanced_container)
+
+        self.cutout_pick_colors_container = QWidget(self)
+        pick_colors_layout = QVBoxLayout(self.cutout_pick_colors_container)
+        pick_colors_layout.setContentsMargins(0, 0, 0, 0)
+        pick_colors_layout.setSpacing(4)
+        pick_header = QHBoxLayout()
+        pick_header.setContentsMargins(0, 0, 0, 0)
+        pick_header.setSpacing(6)
+        self.cutout_pick_add_btn = QPushButton("Add (eye-dropper)", self)
+        self.cutout_pick_add_btn.clicked.connect(self._on_cutout_pick_add_clicked)
+        pick_header.addWidget(self.cutout_pick_add_btn)
+        self.cutout_pick_clear_btn = QPushButton("Clear", self)
+        self.cutout_pick_clear_btn.clicked.connect(self._on_cutout_pick_clear_clicked)
+        pick_header.addWidget(self.cutout_pick_clear_btn)
+        pick_header.addStretch(1)
+        pick_colors_layout.addLayout(pick_header)
+        falloff_row = QHBoxLayout()
+        falloff_row.setContentsMargins(0, 0, 0, 0)
+        falloff_row.setSpacing(6)
+        self.cutout_falloff_advanced_check = QCheckBox("Adv", self)
+        self.cutout_falloff_advanced_check.toggled.connect(self._on_cutout_falloff_advanced_toggled)
+        falloff_row.addWidget(self.cutout_falloff_advanced_check)
+        self.cutout_curve_strength_label = QLabel("Curve:", self)
+        falloff_row.addWidget(self.cutout_curve_strength_label)
+        self.cutout_curve_strength_spin = QSpinBox(self)
+        self.cutout_curve_strength_spin.setRange(0, 100)
+        self.cutout_curve_strength_spin.setKeyboardTracking(False)
+        self.cutout_curve_strength_spin.setValue(50)
+        self.cutout_curve_strength_spin.valueChanged.connect(self._on_spinner_param_changed)
+        self.cutout_curve_strength_spin.editingFinished.connect(self._on_cutout_params_changed)
+        falloff_row.addWidget(self.cutout_curve_strength_spin)
+        falloff_row.addStretch(1)
+        pick_colors_layout.addLayout(falloff_row)
+        self.cutout_pick_rows_widget = QWidget(self.cutout_pick_colors_container)
+        self.cutout_pick_rows_layout = QVBoxLayout(self.cutout_pick_rows_widget)
+        self.cutout_pick_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.cutout_pick_rows_layout.setSpacing(4)
+        pick_colors_layout.addWidget(self.cutout_pick_rows_widget)
+        self.cutout_mark_controls_container = QWidget(self.cutout_pick_colors_container)
+        cutout_mark_row = QHBoxLayout(self.cutout_mark_controls_container)
+        cutout_mark_row.setContentsMargins(0, 0, 0, 0)
+        cutout_mark_row.setSpacing(5)
+        self.cutout_mark_undo_btn = QPushButton("↺", self.cutout_mark_controls_container)
+        self.cutout_mark_redo_btn = QPushButton("↻", self.cutout_mark_controls_container)
+        self.cutout_mark_add_btn = QPushButton("Add", self.cutout_mark_controls_container)
+        self.cutout_mark_remove_btn = QPushButton("Remove", self.cutout_mark_controls_container)
+        self.cutout_mark_stop_btn = QPushButton("Stop", self.cutout_mark_controls_container)
+        self.cutout_mark_undo_btn.clicked.connect(self._on_cutout_mark_undo)
+        self.cutout_mark_redo_btn.clicked.connect(self._on_cutout_mark_redo)
+        self.cutout_mark_add_btn.clicked.connect(self._on_cutout_mark_add_mode)
+        self.cutout_mark_remove_btn.clicked.connect(self._on_cutout_mark_remove_mode)
+        self.cutout_mark_stop_btn.clicked.connect(self._on_cutout_mark_stop_mode)
+        cutout_mark_row.addWidget(self.cutout_mark_undo_btn)
+        cutout_mark_row.addWidget(self.cutout_mark_redo_btn)
+        cutout_mark_row.addWidget(self.cutout_mark_add_btn)
+        cutout_mark_row.addWidget(self.cutout_mark_remove_btn)
+        cutout_mark_row.addWidget(self.cutout_mark_stop_btn)
+        self.cutout_mark_count_label = QLabel("", self.cutout_mark_controls_container)
+        cutout_mark_row.addWidget(self.cutout_mark_count_label, 1)
+        pick_colors_layout.addWidget(self.cutout_mark_controls_container)
+        side.addWidget(self.cutout_pick_colors_container)
 
         self.text_label = QLabel("Text Extraction", self)
         text_row = QHBoxLayout()
@@ -3879,6 +4441,9 @@ class IconFramingDialog(QDialog):
         status_row.addWidget(self.processing_status_label, 1)
         status_row.addStretch(0)
 
+        self._set_cutout_picked_colors_from_params(initial_bg_removal_params or {})
+        self._set_cutout_falloff_settings_from_params(initial_bg_removal_params or {})
+        self._rebuild_cutout_pick_color_rows()
         self._sync_template_dependents()
         self._set_manual_mark_mode("none")
         self._refresh_manual_mark_count_label()
@@ -3943,6 +4508,20 @@ class IconFramingDialog(QDialog):
         self._canvas.set_border_style(style)
         self._sync_template_dependents()
         self._apply_processing_settings()
+
+    def _on_pick_border_template_from_gallery(self) -> None:
+        dialog = TemplateGalleryDialog(
+            _icon_style_gallery_entries(),
+            current_key=str(self.border_combo.currentData() or "none"),
+            title="Select Template",
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_key()
+        idx = self.border_combo.findData(selected)
+        if idx >= 0:
+            self.border_combo.setCurrentIndex(idx)
 
     def _on_border_shader_changed(self, config: dict[str, object]) -> None:
         self._canvas.set_border_shader(config)
@@ -4034,6 +4613,10 @@ class IconFramingDialog(QDialog):
     def _on_seed_swatch_clicked(self, index: int) -> None:
         if index < 0 or index >= len(self._seed_colors):
             return
+        if self._canvas.cutout_color_pick_mode():
+            self._set_cutout_color_pick_mode(False)
+        if self._cutout_mark_mode != "none":
+            self._set_cutout_mark_mode("none")
         if self._active_seed_pick_index == index and self._canvas.seed_pick_mode():
             self._active_seed_pick_index = None
             self._canvas.set_seed_pick_mode(False)
@@ -4080,10 +4663,556 @@ class IconFramingDialog(QDialog):
         self._refresh_seed_color_controls()
         self._apply_processing_settings()
 
+    def _set_cutout_picked_colors_from_params(self, params: dict[str, object]) -> None:
+        normalized = normalize_background_removal_params(params)
+        entries = normalized.get("picked_colors", [])
+        items: list[dict[str, object]] = []
+        self._cutout_mark_history = {}
+        self._active_cutout_mark_row_id = None
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                color = entry.get("color")
+                if not isinstance(color, (list, tuple)) or len(color) < 3:
+                    continue
+                try:
+                    red = max(0, min(255, int(color[0])))
+                    green = max(0, min(255, int(color[1])))
+                    blue = max(0, min(255, int(color[2])))
+                    tolerance = max(0, min(30, int(entry.get("tolerance", 10) or 10)))
+                except (TypeError, ValueError):
+                    continue
+                scope = str(entry.get("scope", "global") or "global").strip().casefold()
+                if scope not in {"global", "contig"}:
+                    scope = "global"
+                falloff = str(entry.get("falloff", "flat") or "flat").strip().casefold()
+                if falloff not in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}:
+                    falloff = "flat"
+                include_seeds_raw = entry.get("include_seeds")
+                exclude_seeds_raw = entry.get("exclude_seeds")
+                include_seeds: list[list[float]] = []
+                exclude_seeds: list[list[float]] = []
+                if isinstance(include_seeds_raw, list):
+                    for seed in include_seeds_raw:
+                        if not isinstance(seed, (list, tuple)) or len(seed) < 2:
+                            continue
+                        try:
+                            sx = max(0.0, min(1.0, float(seed[0])))
+                            sy = max(0.0, min(1.0, float(seed[1])))
+                        except (TypeError, ValueError):
+                            continue
+                        packed = [sx, sy]
+                        if packed not in include_seeds:
+                            include_seeds.append(packed)
+                if isinstance(exclude_seeds_raw, list):
+                    for seed in exclude_seeds_raw:
+                        if not isinstance(seed, (list, tuple)) or len(seed) < 2:
+                            continue
+                        try:
+                            sx = max(0.0, min(1.0, float(seed[0])))
+                            sy = max(0.0, min(1.0, float(seed[1])))
+                        except (TypeError, ValueError):
+                            continue
+                        packed = [sx, sy]
+                        if packed not in exclude_seeds:
+                            exclude_seeds.append(packed)
+                row_id = self._cutout_row_uid_counter
+                self._cutout_row_uid_counter += 1
+                item = {
+                    "id": row_id,
+                    "color": [red, green, blue],
+                    "tolerance": tolerance,
+                    "scope": scope,
+                    "falloff": falloff,
+                    "include_seeds": include_seeds,
+                    "exclude_seeds": exclude_seeds,
+                }
+                if item not in items:
+                    items.append(item)
+                self._cutout_mark_history[row_id] = {"undo": [], "redo": []}
+        self._cutout_picked_colors = items
+
+    @staticmethod
+    def _default_curve_strength_for_mode(mode: str) -> int:
+        token = str(mode or "").strip().casefold()
+        if token == "exp":
+            return 35
+        if token == "log":
+            return 65
+        if token == "gauss":
+            return 45
+        return 50
+
+    @staticmethod
+    def _cutout_mode_uses_curve_strength(mode: str) -> bool:
+        return str(mode or "").strip().casefold() in {"exp", "log", "gauss"}
+
+    def _set_cutout_falloff_settings_from_params(self, params: dict[str, object]) -> None:
+        normalized = normalize_background_removal_params(params)
+        blocked_adv = self.cutout_falloff_advanced_check.blockSignals(True)
+        self.cutout_falloff_advanced_check.setChecked(
+            bool(normalized.get("pick_colors_advanced", False))
+        )
+        self.cutout_falloff_advanced_check.blockSignals(blocked_adv)
+        blocked_curve = self.cutout_curve_strength_spin.blockSignals(True)
+        strength = int(normalized.get("pick_colors_curve_strength", 50) or 50)
+        self.cutout_curve_strength_spin.setValue(max(0, min(100, strength)))
+        self.cutout_curve_strength_spin.blockSignals(blocked_curve)
+        self._sync_cutout_falloff_controls()
+
+    def _cutout_any_curve_mode_entries(self) -> bool:
+        for entry in self._cutout_picked_colors:
+            mode = str(entry.get("falloff", "flat") or "flat")
+            if self._cutout_mode_uses_curve_strength(mode):
+                return True
+        return False
+
+    def _sync_cutout_falloff_controls(self) -> None:
+        show_curve = (
+            self.cutout_falloff_advanced_check.isChecked()
+            and self._cutout_any_curve_mode_entries()
+        )
+        self.cutout_curve_strength_label.setVisible(show_curve)
+        self.cutout_curve_strength_spin.setVisible(show_curve)
+        self.cutout_curve_strength_spin.setEnabled(
+            show_curve and not self._processing_in_progress
+        )
+
+    def _on_cutout_falloff_advanced_toggled(self, _checked: bool) -> None:
+        if not self.cutout_falloff_advanced_check.isChecked():
+            blocked = self.cutout_curve_strength_spin.blockSignals(True)
+            self.cutout_curve_strength_spin.setValue(50)
+            self.cutout_curve_strength_spin.blockSignals(blocked)
+        self._sync_cutout_falloff_controls()
+        self._on_cutout_params_changed()
+
+    def _active_cutout_mark_entry(self) -> dict[str, object] | None:
+        row_id = self._active_cutout_mark_row_id
+        if row_id is None:
+            return None
+        for entry in self._cutout_picked_colors:
+            if int(entry.get("id", -1)) == int(row_id):
+                return entry
+        return None
+
+    def _cutout_mark_snapshot(
+        self,
+        entry: dict[str, object],
+    ) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]]:
+        include_raw = entry.get("include_seeds", [])
+        exclude_raw = entry.get("exclude_seeds", [])
+        include = tuple(
+            (float(seed[0]), float(seed[1]))
+            for seed in include_raw
+            if isinstance(seed, (list, tuple)) and len(seed) >= 2
+        )
+        exclude = tuple(
+            (float(seed[0]), float(seed[1]))
+            for seed in exclude_raw
+            if isinstance(seed, (list, tuple)) and len(seed) >= 2
+        )
+        return (include, exclude)
+
+    def _restore_cutout_mark_snapshot(
+        self,
+        entry: dict[str, object],
+        snapshot: tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]],
+    ) -> None:
+        include, exclude = snapshot
+        entry["include_seeds"] = [[float(x), float(y)] for x, y in include]
+        entry["exclude_seeds"] = [[float(x), float(y)] for x, y in exclude]
+
+    def _push_cutout_mark_undo_snapshot(
+        self,
+        row_id: int,
+        snapshot: tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]],
+    ) -> None:
+        history = self._cutout_mark_history.setdefault(row_id, {"undo": [], "redo": []})
+        history["undo"].append(snapshot)
+        if len(history["undo"]) > 256:
+            del history["undo"][0]
+        history["redo"].clear()
+
+    def _set_cutout_mark_mode(self, mode: str) -> None:
+        normalized = str(mode or "none").strip().casefold()
+        if normalized not in {"none", "add", "remove"}:
+            normalized = "none"
+        self._cutout_mark_mode = normalized
+        self._canvas.set_cutout_mark_mode(normalized)
+        self.cutout_mark_add_btn.setText("Adding..." if normalized == "add" else "Add")
+        self.cutout_mark_remove_btn.setText("Removing..." if normalized == "remove" else "Remove")
+        self._update_cutout_mark_controls()
+        self._refresh_cutout_status()
+
+    def _update_cutout_mark_controls(self) -> None:
+        entry = self._active_cutout_mark_entry()
+        row_active = entry is not None and str(entry.get("scope", "global")) == "contig"
+        self.cutout_mark_controls_container.setVisible(bool(row_active))
+        if not row_active:
+            self.cutout_mark_count_label.setText("")
+            self.cutout_mark_undo_btn.setEnabled(False)
+            self.cutout_mark_redo_btn.setEnabled(False)
+            self.cutout_mark_add_btn.setEnabled(False)
+            self.cutout_mark_remove_btn.setEnabled(False)
+            self.cutout_mark_stop_btn.setEnabled(False)
+            if self._cutout_mark_mode != "none":
+                self._cutout_mark_mode = "none"
+                self._canvas.set_cutout_mark_mode("none")
+            return
+        row_id = int(entry.get("id", -1))
+        history = self._cutout_mark_history.setdefault(row_id, {"undo": [], "redo": []})
+        include_count = len(entry.get("include_seeds", [])) if isinstance(entry.get("include_seeds"), list) else 0
+        exclude_count = len(entry.get("exclude_seeds", [])) if isinstance(entry.get("exclude_seeds"), list) else 0
+        self.cutout_mark_count_label.setText(f"Row {row_id}: Add {include_count} / Remove {exclude_count}")
+        can_edit = not self._processing_in_progress
+        self.cutout_mark_add_btn.setEnabled(can_edit)
+        self.cutout_mark_remove_btn.setEnabled(can_edit)
+        self.cutout_mark_stop_btn.setEnabled(can_edit)
+        self.cutout_mark_undo_btn.setEnabled(can_edit and bool(history.get("undo")))
+        self.cutout_mark_redo_btn.setEnabled(can_edit and bool(history.get("redo")))
+
+    def _on_cutout_mark_select_row(self, row_id: int) -> None:
+        self._active_cutout_mark_row_id = int(row_id)
+        self._set_cutout_mark_mode("none")
+        self._rebuild_cutout_pick_color_rows()
+        self._update_cutout_mark_controls()
+
+    def _on_cutout_mark_add_mode(self) -> None:
+        self._set_cutout_mark_mode("none" if self._cutout_mark_mode == "add" else "add")
+
+    def _on_cutout_mark_remove_mode(self) -> None:
+        self._set_cutout_mark_mode("none" if self._cutout_mark_mode == "remove" else "remove")
+
+    def _on_cutout_mark_stop_mode(self) -> None:
+        self._set_cutout_mark_mode("none")
+
+    def _on_cutout_mark_undo(self) -> None:
+        entry = self._active_cutout_mark_entry()
+        if entry is None:
+            return
+        row_id = int(entry.get("id", -1))
+        history = self._cutout_mark_history.setdefault(row_id, {"undo": [], "redo": []})
+        if not history["undo"]:
+            return
+        current = self._cutout_mark_snapshot(entry)
+        snapshot = history["undo"].pop()
+        history["redo"].append(current)
+        if len(history["redo"]) > 256:
+            del history["redo"][0]
+        self._restore_cutout_mark_snapshot(entry, snapshot)
+        self._rebuild_cutout_pick_color_rows()
+        self._update_cutout_mark_controls()
+        self._apply_processing_settings()
+
+    def _on_cutout_mark_redo(self) -> None:
+        entry = self._active_cutout_mark_entry()
+        if entry is None:
+            return
+        row_id = int(entry.get("id", -1))
+        history = self._cutout_mark_history.setdefault(row_id, {"undo": [], "redo": []})
+        if not history["redo"]:
+            return
+        current = self._cutout_mark_snapshot(entry)
+        snapshot = history["redo"].pop()
+        history["undo"].append(current)
+        if len(history["undo"]) > 256:
+            del history["undo"][0]
+        self._restore_cutout_mark_snapshot(entry, snapshot)
+        self._rebuild_cutout_pick_color_rows()
+        self._update_cutout_mark_controls()
+        self._apply_processing_settings()
+
+    def _upsert_cutout_mark_point(
+        self,
+        points: list[list[float]],
+        point: tuple[float, float],
+    ) -> None:
+        x_new, y_new = point
+        for idx, existing in enumerate(points):
+            if not isinstance(existing, (list, tuple)) or len(existing) < 2:
+                continue
+            if abs(float(existing[0]) - x_new) <= 0.002 and abs(float(existing[1]) - y_new) <= 0.002:
+                points[idx] = [x_new, y_new]
+                return
+        points.append([x_new, y_new])
+        if len(points) > 512:
+            del points[0]
+
+    def _on_canvas_cutout_mark_point(self, value: object) -> None:
+        if self._cutout_mark_mode not in {"add", "remove"}:
+            return
+        entry = self._active_cutout_mark_entry()
+        if entry is None or str(entry.get("scope", "global")) != "contig":
+            return
+        try:
+            x_val = float(value[0])  # type: ignore[index]
+            y_val = float(value[1])  # type: ignore[index]
+        except Exception:
+            return
+        point = (max(0.0, min(1.0, x_val)), max(0.0, min(1.0, y_val)))
+        row_id = int(entry.get("id", -1))
+        before = self._cutout_mark_snapshot(entry)
+        if self._cutout_mark_mode == "add":
+            include_points = entry.setdefault("include_seeds", [])
+            if isinstance(include_points, list):
+                self._upsert_cutout_mark_point(include_points, point)
+        else:
+            exclude_points = entry.setdefault("exclude_seeds", [])
+            if isinstance(exclude_points, list):
+                self._upsert_cutout_mark_point(exclude_points, point)
+        after = self._cutout_mark_snapshot(entry)
+        if after != before:
+            self._push_cutout_mark_undo_snapshot(row_id, before)
+        self._rebuild_cutout_pick_color_rows()
+        self._update_cutout_mark_controls()
+        self._apply_processing_settings()
+
+    def _set_cutout_color_pick_mode(self, enabled: bool) -> None:
+        self._cutout_pick_mode_active = bool(enabled)
+        self._canvas.set_cutout_color_pick_mode(bool(enabled))
+        self.cutout_pick_add_btn.setText("Picking..." if enabled else "Add (eye-dropper)")
+        self._refresh_cutout_status()
+
+    def _on_cutout_pick_add_clicked(self) -> None:
+        if self._processing_in_progress or not self._cutout_method_enabled():
+            return
+        if self.selected_bg_removal_engine() != "pick_colors":
+            idx = self.bg_removal_combo.findData("pick_colors")
+            if idx >= 0:
+                self.bg_removal_combo.setCurrentIndex(idx)
+        if self._active_seed_pick_index is not None:
+            self._active_seed_pick_index = None
+            self._canvas.set_seed_pick_mode(False)
+            self._refresh_seed_color_controls()
+        if self._manual_text_mark_mode != "none":
+            self._set_manual_mark_mode("none")
+        if self._cutout_mark_mode != "none":
+            self._set_cutout_mark_mode("none")
+        self._set_cutout_color_pick_mode(not self._canvas.cutout_color_pick_mode())
+
+    def _on_cutout_pick_clear_clicked(self) -> None:
+        if not self._cutout_picked_colors:
+            return
+        self._set_cutout_color_pick_mode(False)
+        self._cutout_picked_colors = []
+        self._cutout_mark_history.clear()
+        self._active_cutout_mark_row_id = None
+        self._set_cutout_mark_mode("none")
+        self._rebuild_cutout_pick_color_rows()
+        self._apply_processing_settings()
+
+    def _on_canvas_cutout_color_picked(self, value: object) -> None:
+        try:
+            red = max(0, min(255, int(value[0])))  # type: ignore[index]
+            green = max(0, min(255, int(value[1])))  # type: ignore[index]
+            blue = max(0, min(255, int(value[2])))  # type: ignore[index]
+        except Exception:
+            self._set_cutout_color_pick_mode(False)
+            return
+        self._set_cutout_color_pick_mode(False)
+        row_id = self._cutout_row_uid_counter
+        self._cutout_row_uid_counter += 1
+        entry = {
+            "id": row_id,
+            "color": [red, green, blue],
+            "tolerance": 10,
+            "scope": "global",
+            "falloff": "flat",
+            "include_seeds": [],
+            "exclude_seeds": [],
+        }
+        if entry not in self._cutout_picked_colors:
+            self._cutout_picked_colors.append(entry)
+            self._cutout_mark_history[row_id] = {"undo": [], "redo": []}
+        self._sync_cutout_falloff_controls()
+        self._rebuild_cutout_pick_color_rows()
+        self._apply_processing_settings()
+
+    def _rebuild_cutout_pick_color_rows(self) -> None:
+        while self.cutout_pick_rows_layout.count() > 0:
+            item = self.cutout_pick_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for idx, entry in enumerate(self._cutout_picked_colors):
+            row_widget = QWidget(self.cutout_pick_rows_widget)
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            color = entry.get("color", [0, 0, 0])
+            red = int(color[0]) if isinstance(color, (list, tuple)) and len(color) > 0 else 0
+            green = int(color[1]) if isinstance(color, (list, tuple)) and len(color) > 1 else 0
+            blue = int(color[2]) if isinstance(color, (list, tuple)) and len(color) > 2 else 0
+            swatch_btn = QPushButton(f"#{red:02X}{green:02X}{blue:02X}", row_widget)
+            swatch_btn.setMinimumWidth(98)
+            swatch_btn.setStyleSheet(
+                "QPushButton { "
+                f"background: rgb({red}, {green}, {blue}); "
+                f"color: {'#000000' if ((red * 0.299) + (green * 0.587) + (blue * 0.114)) >= 140.0 else '#ffffff'}; "
+                "border: 1px solid #5b5b5b; }"
+            )
+            swatch_btn.clicked.connect(lambda _checked=False, row_idx=idx: self._on_cutout_pick_color_button_clicked(row_idx))
+            row_layout.addWidget(swatch_btn)
+            row_layout.addWidget(QLabel("Tol:", row_widget))
+            tol_spin = QSpinBox(row_widget)
+            tol_spin.setRange(0, 30)
+            tol_spin.setValue(max(0, min(30, int(entry.get("tolerance", 10) or 10))))
+            tol_spin.setKeyboardTracking(False)
+            tol_spin.valueChanged.connect(
+                lambda value, row_idx=idx: self._on_cutout_pick_tolerance_changed(row_idx, value)
+            )
+            tol_spin.editingFinished.connect(self._on_cutout_params_changed)
+            row_layout.addWidget(tol_spin)
+            scope_combo = QComboBox(row_widget)
+            scope_combo.addItem("G", "global")
+            scope_combo.addItem("C", "contig")
+            scope_value = str(entry.get("scope", "global") or "global").strip().casefold()
+            scope_idx = scope_combo.findData(scope_value if scope_value in {"global", "contig"} else "global")
+            if scope_idx >= 0:
+                scope_combo.setCurrentIndex(scope_idx)
+            scope_combo.currentIndexChanged.connect(
+                lambda _value, row_idx=idx, combo=scope_combo: self._on_cutout_pick_scope_changed(
+                    row_idx,
+                    str(combo.currentData() or "global"),
+                )
+            )
+            row_layout.addWidget(scope_combo)
+            badge = QLabel("", row_widget)
+            include_n = len(entry.get("include_seeds", [])) if isinstance(entry.get("include_seeds"), list) else 0
+            exclude_n = len(entry.get("exclude_seeds", [])) if isinstance(entry.get("exclude_seeds"), list) else 0
+            if scope_value == "contig" and (include_n > 0 or exclude_n > 0):
+                badge.setText("C*")
+                badge.setToolTip(f"Contig marks: Add {include_n} / Remove {exclude_n}")
+                badge.setStyleSheet(
+                    "QLabel { color: #f0c14b; font-weight: 700; min-width: 18px; }"
+                )
+            else:
+                badge.setText("")
+                badge.setMinimumWidth(18)
+            row_layout.addWidget(badge)
+            falloff_combo = QComboBox(row_widget)
+            falloff_combo.addItem("Flat", "flat")
+            falloff_combo.addItem("Lin", "lin")
+            falloff_combo.addItem("Smooth", "smooth")
+            falloff_combo.addItem("Cos", "cos")
+            falloff_combo.addItem("Exp", "exp")
+            falloff_combo.addItem("Log", "log")
+            falloff_combo.addItem("Gauss", "gauss")
+            falloff_value = str(entry.get("falloff", "flat") or "flat").strip().casefold()
+            falloff_idx = falloff_combo.findData(
+                falloff_value if falloff_value in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"} else "flat"
+            )
+            if falloff_idx >= 0:
+                falloff_combo.setCurrentIndex(falloff_idx)
+            falloff_combo.currentIndexChanged.connect(
+                lambda _value, row_idx=idx, combo=falloff_combo: self._on_cutout_pick_falloff_changed(
+                    row_idx,
+                    str(combo.currentData() or "flat"),
+                )
+            )
+            row_layout.addWidget(falloff_combo)
+            edit_btn = QPushButton("Edit", row_widget)
+            row_id = int(entry.get("id", -1))
+            is_contig = str(entry.get("scope", "global") or "global").strip().casefold() == "contig"
+            edit_btn.setEnabled(is_contig)
+            if is_contig:
+                edit_btn.setToolTip(f"Edit contiguous marks (Add {include_n} / Remove {exclude_n})")
+            if is_contig and self._active_cutout_mark_row_id == row_id:
+                edit_btn.setText("Editing...")
+            edit_btn.clicked.connect(
+                lambda _checked=False, rid=row_id: self._on_cutout_mark_select_row(rid)
+            )
+            row_layout.addWidget(edit_btn)
+            remove_btn = QPushButton("X", row_widget)
+            remove_btn.setToolTip("Remove picked color")
+            remove_btn.setFixedWidth(28)
+            remove_btn.setStyleSheet(
+                "QPushButton { background: #8b1c1c; color: #ffffff; border: 1px solid #5b5b5b; font-weight: 700; }"
+            )
+            remove_btn.clicked.connect(lambda _checked=False, row_idx=idx: self._on_cutout_pick_remove_row(row_idx))
+            row_layout.addWidget(remove_btn)
+            row_layout.addStretch(1)
+            self.cutout_pick_rows_layout.addWidget(row_widget)
+        self.cutout_pick_clear_btn.setEnabled(bool(self._cutout_picked_colors))
+        self.cutout_pick_rows_layout.addStretch(1)
+        self._sync_cutout_falloff_controls()
+        self._update_cutout_mark_controls()
+
+    def _on_cutout_pick_color_button_clicked(self, index: int) -> None:
+        if index < 0 or index >= len(self._cutout_picked_colors):
+            return
+        color = self._cutout_picked_colors[index].get("color", [0, 0, 0])
+        red = int(color[0]) if isinstance(color, (list, tuple)) and len(color) > 0 else 0
+        green = int(color[1]) if isinstance(color, (list, tuple)) and len(color) > 1 else 0
+        blue = int(color[2]) if isinstance(color, (list, tuple)) and len(color) > 2 else 0
+        selected = QColorDialog.getColor(QColor(red, green, blue), self, "Pick Cutout Color")
+        if not selected.isValid():
+            return
+        self._cutout_picked_colors[index]["color"] = [
+            int(selected.red()),
+            int(selected.green()),
+            int(selected.blue()),
+        ]
+        self._rebuild_cutout_pick_color_rows()
+        self._apply_processing_settings()
+
+    def _on_cutout_pick_tolerance_changed(self, index: int, value: int) -> None:
+        if index < 0 or index >= len(self._cutout_picked_colors):
+            return
+        self._cutout_picked_colors[index]["tolerance"] = max(0, min(30, int(value)))
+        self._on_spinner_param_changed()
+
+    def _on_cutout_pick_scope_changed(self, index: int, scope_value: str) -> None:
+        if index < 0 or index >= len(self._cutout_picked_colors):
+            return
+        normalized = str(scope_value or "global").strip().casefold()
+        if normalized not in {"global", "contig"}:
+            normalized = "global"
+        self._cutout_picked_colors[index]["scope"] = normalized
+        row_id = int(self._cutout_picked_colors[index].get("id", -1))
+        if normalized != "contig" and self._active_cutout_mark_row_id == row_id:
+            self._active_cutout_mark_row_id = None
+            self._set_cutout_mark_mode("none")
+        self._rebuild_cutout_pick_color_rows()
+        self._on_cutout_params_changed()
+
+    def _on_cutout_pick_falloff_changed(self, index: int, falloff_value: str) -> None:
+        if index < 0 or index >= len(self._cutout_picked_colors):
+            return
+        falloff = str(falloff_value or "flat").strip().casefold()
+        if falloff not in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}:
+            falloff = "flat"
+        self._cutout_picked_colors[index]["falloff"] = falloff
+        if (
+            self._cutout_mode_uses_curve_strength(falloff)
+            and not self.cutout_falloff_advanced_check.isChecked()
+        ):
+            self.cutout_curve_strength_spin.setValue(self._default_curve_strength_for_mode(falloff))
+        self._sync_cutout_falloff_controls()
+        self._on_cutout_params_changed()
+
+    def _on_cutout_pick_remove_row(self, index: int) -> None:
+        if index < 0 or index >= len(self._cutout_picked_colors):
+            return
+        row_id = int(self._cutout_picked_colors[index].get("id", -1))
+        if self._active_cutout_mark_row_id == row_id:
+            self._active_cutout_mark_row_id = None
+            self._set_cutout_mark_mode("none")
+        if row_id in self._cutout_mark_history:
+            del self._cutout_mark_history[row_id]
+        del self._cutout_picked_colors[index]
+        self._rebuild_cutout_pick_color_rows()
+        self._apply_processing_settings()
+
     def _set_manual_mark_mode(self, mode: str) -> None:
         normalized = str(mode or "none").strip().casefold()
         if normalized not in {"none", "add", "remove"}:
             normalized = "none"
+        if normalized != "none" and self._canvas.cutout_color_pick_mode():
+            self._set_cutout_color_pick_mode(False)
+        if normalized != "none" and self._cutout_mark_mode != "none":
+            self._set_cutout_mark_mode("none")
         self._manual_text_mark_mode = normalized
         self._canvas.set_text_mark_mode(normalized)
         self.manual_mark_add_btn.setText("Adding..." if normalized == "add" else "Add")
@@ -4264,13 +5393,32 @@ class IconFramingDialog(QDialog):
         self.layer_none_btn.setEnabled(not busy)
         self.roi_draw_btn.setEnabled(not busy and self._roi_method_enabled())
         self.roi_clear_btn.setEnabled(not busy and self._roi_method_enabled())
+        pick_colors_enabled = (
+            not busy
+            and self._cutout_method_enabled()
+            and self.selected_bg_removal_engine() == "pick_colors"
+        )
+        self.cutout_pick_add_btn.setEnabled(pick_colors_enabled)
+        self.cutout_pick_clear_btn.setEnabled(pick_colors_enabled and bool(self._cutout_picked_colors))
+        self.cutout_falloff_advanced_check.setEnabled(pick_colors_enabled)
         for button in self._seed_swatch_buttons:
             button.setEnabled(not busy and self._text_method_enabled())
+        for idx in range(self.cutout_pick_rows_layout.count()):
+            item = self.cutout_pick_rows_layout.itemAt(idx)
+            widget = item.widget()
+            if widget is not None:
+                widget.setEnabled(pick_colors_enabled)
         self.manual_mark_undo_btn.setEnabled(False)
         self.manual_mark_redo_btn.setEnabled(False)
         self.manual_mark_add_btn.setEnabled(not busy and self._text_method_enabled())
         self.manual_mark_remove_btn.setEnabled(not busy and self._text_method_enabled())
         self.manual_mark_stop_btn.setEnabled(not busy and self._text_method_enabled())
+        if busy and self._canvas.cutout_color_pick_mode():
+            self._set_cutout_color_pick_mode(False)
+        if busy and self._cutout_mark_mode != "none":
+            self._set_cutout_mark_mode("none")
+        self._sync_cutout_falloff_controls()
+        self._update_cutout_mark_controls()
         if not busy:
             self._update_manual_history_buttons()
 
@@ -4447,6 +5595,15 @@ class IconFramingDialog(QDialog):
         if self._spinner_apply_timer.isActive():
             self.cutout_status_label.setText("Spinner changes pending (auto-apply in 1.5s).")
             return
+        if self._canvas.cutout_color_pick_mode():
+            self.cutout_status_label.setText("Click image to add a cutout color.")
+            return
+        if self._cutout_mark_mode == "add":
+            self.cutout_status_label.setText("Contig Add mode: click image to include matching regions.")
+            return
+        if self._cutout_mark_mode == "remove":
+            self.cutout_status_label.setText("Contig Remove mode: click image to exclude matching regions.")
+            return
         if self._canvas.seed_pick_mode():
             if self._active_seed_pick_index is not None:
                 self.cutout_status_label.setText(
@@ -4477,6 +5634,9 @@ class IconFramingDialog(QDialog):
             return
         if show_cutout and engine == "none":
             self.cutout_status_label.setText("Cutout layer visible but cutout method is Disabled.")
+            return
+        if show_cutout and engine == "pick_colors" and not self._cutout_picked_colors:
+            self.cutout_status_label.setText("Remove Colors mode active. Add at least one color.")
             return
         if show_text and text_method == "none":
             self.cutout_status_label.setText(
@@ -4552,7 +5712,10 @@ class IconFramingDialog(QDialog):
         template_enabled = self._template_enabled()
         text_method = self.selected_text_extraction_method() if template_enabled else "none"
         text_enabled = template_enabled and text_method != "none"
-        cutout_enabled = template_enabled and self.selected_bg_removal_engine() != "none"
+        cutout_engine = self.selected_bg_removal_engine() if template_enabled else "none"
+        cutout_enabled = template_enabled and cutout_engine != "none"
+        cutout_advanced_enabled = cutout_enabled and cutout_engine in {"rembg", "bria_rmbg"}
+        cutout_pick_colors_enabled = cutout_enabled and cutout_engine == "pick_colors"
         roi_enabled = text_enabled and text_method == "roi_guided"
 
         # Keep layer visibility synchronized with mode selectors.
@@ -4576,12 +5739,21 @@ class IconFramingDialog(QDialog):
                 self.text_method_combo.blockSignals(blocked)
 
         self.bg_removal_combo.setEnabled(template_enabled)
-        self.alpha_matting_check.setEnabled(cutout_enabled)
-        self.fg_threshold_spin.setEnabled(cutout_enabled)
-        self.bg_threshold_spin.setEnabled(cutout_enabled)
-        self.erode_spin.setEnabled(cutout_enabled)
-        self.edge_feather_spin.setEnabled(cutout_enabled)
-        self.post_process_check.setEnabled(cutout_enabled)
+        self.alpha_matting_check.setEnabled(cutout_advanced_enabled)
+        self.fg_threshold_spin.setEnabled(cutout_advanced_enabled)
+        self.bg_threshold_spin.setEnabled(cutout_advanced_enabled)
+        self.erode_spin.setEnabled(cutout_advanced_enabled)
+        self.edge_feather_spin.setEnabled(cutout_advanced_enabled)
+        self.post_process_check.setEnabled(cutout_advanced_enabled)
+        self.cutout_pick_add_btn.setEnabled(cutout_pick_colors_enabled and not self._processing_in_progress)
+        self.cutout_pick_clear_btn.setEnabled(
+            cutout_pick_colors_enabled
+            and not self._processing_in_progress
+            and bool(self._cutout_picked_colors)
+        )
+        self.cutout_falloff_advanced_check.setEnabled(
+            cutout_pick_colors_enabled and not self._processing_in_progress
+        )
 
         self.text_method_combo.setEnabled(template_enabled)
         self.preserve_text_strength.setEnabled(text_enabled)
@@ -4602,11 +5774,16 @@ class IconFramingDialog(QDialog):
             self._active_seed_pick_index = None
             self._canvas.set_seed_pick_mode(False)
             self._set_manual_mark_mode("none")
+        if not cutout_pick_colors_enabled and self._canvas.cutout_color_pick_mode():
+            self._set_cutout_color_pick_mode(False)
+        if not cutout_pick_colors_enabled and self._cutout_mark_mode != "none":
+            self._set_cutout_mark_mode("none")
 
         self.shader_controls.setVisible(template_enabled)
         self.cutout_label.setVisible(template_enabled)
         self.bg_removal_combo.setVisible(template_enabled)
-        self.cutout_advanced_container.setVisible(cutout_enabled)
+        self.cutout_advanced_container.setVisible(cutout_advanced_enabled)
+        self.cutout_pick_colors_container.setVisible(cutout_pick_colors_enabled)
         self.text_label.setVisible(template_enabled)
         self.text_method_combo.setVisible(template_enabled)
         self.text_advanced_container.setVisible(text_enabled)
@@ -4623,6 +5800,8 @@ class IconFramingDialog(QDialog):
         self.shader_controls.setEnabled(template_enabled)
         self.layer_cutout_check.setVisible(template_enabled)
         self.layer_text_check.setVisible(template_enabled)
+        self._sync_cutout_falloff_controls()
+        self._update_cutout_mark_controls()
         self._refresh_seed_color_controls()
         self._refresh_manual_mark_count_label()
         self._update_roi_label()
@@ -4631,19 +5810,57 @@ class IconFramingDialog(QDialog):
     def selected_bg_removal_engine(self) -> str:
         if not self._template_enabled():
             return "none"
-        return str(self.bg_removal_combo.currentData() or "none")
+        return normalize_background_removal_engine(
+            str(self.bg_removal_combo.currentData() or "none")
+        )
 
     def selected_bg_removal_params(self) -> dict[str, object]:
-        return normalize_background_removal_params(
-            {
-                "alpha_matting": self.alpha_matting_check.isChecked(),
-                "alpha_matting_foreground_threshold": int(self.fg_threshold_spin.value()),
-                "alpha_matting_background_threshold": int(self.bg_threshold_spin.value()),
-                "alpha_matting_erode_size": int(self.erode_spin.value()),
-                "alpha_edge_feather": int(self.edge_feather_spin.value()),
-                "post_process_mask": self.post_process_check.isChecked(),
-            }
-        )
+        advanced = bool(self.cutout_falloff_advanced_check.isChecked())
+        curve_strength = int(self.cutout_curve_strength_spin.value()) if advanced else 50
+        picked_rows: list[dict[str, object]] = []
+        for entry in self._cutout_picked_colors:
+            color = entry.get("color", [0, 0, 0])
+            scope = str(entry.get("scope", "global") or "global").strip().casefold()
+            if scope not in {"global", "contig"}:
+                scope = "global"
+            falloff = str(entry.get("falloff", "flat") or "flat").strip().casefold()
+            if falloff not in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}:
+                falloff = "flat"
+            include_seeds = (
+                list(entry.get("include_seeds", []))
+                if isinstance(entry.get("include_seeds"), list)
+                else []
+            )
+            exclude_seeds = (
+                list(entry.get("exclude_seeds", []))
+                if isinstance(entry.get("exclude_seeds"), list)
+                else []
+            )
+            picked_rows.append(
+                {
+                    "color": list(color) if isinstance(color, (list, tuple)) else [0, 0, 0],
+                    "tolerance": int(entry.get("tolerance", 10) or 10),
+                    "scope": scope,
+                    "falloff": falloff,
+                    "include_seeds": include_seeds,
+                    "exclude_seeds": exclude_seeds,
+                }
+            )
+        payload: dict[str, object] = {
+            "alpha_matting": self.alpha_matting_check.isChecked(),
+            "alpha_matting_foreground_threshold": int(self.fg_threshold_spin.value()),
+            "alpha_matting_background_threshold": int(self.bg_threshold_spin.value()),
+            "alpha_matting_erode_size": int(self.erode_spin.value()),
+            "alpha_edge_feather": int(self.edge_feather_spin.value()),
+            "post_process_mask": self.post_process_check.isChecked(),
+            "picked_colors": picked_rows,
+            "pick_colors_use_hsv": True,
+            "pick_colors_tolerance_mode": "max",
+            "pick_colors_falloff": "flat",
+            "pick_colors_curve_strength": curve_strength,
+            "pick_colors_advanced": advanced,
+        }
+        return normalize_background_removal_params(payload)
 
     def selected_text_preserve_config(self) -> dict[str, object]:
         method = self.selected_text_extraction_method()
@@ -4725,6 +5942,7 @@ class IconConverterDialog(QDialog):
         source_row.addWidget(self.source_edit, 1)
         self.source_browse_btn = QPushButton("Browse...", self)
         self.source_browse_btn.clicked.connect(self._on_browse_source)
+        self.source_browse_btn.setToolTip("Choose source image\nShortcut: Ctrl+O")
         source_row.addWidget(self.source_browse_btn)
         layout.addLayout(source_row)
 
@@ -4735,6 +5953,7 @@ class IconConverterDialog(QDialog):
         output_row.addWidget(self.output_edit, 1)
         self.output_browse_btn = QPushButton("Save As...", self)
         self.output_browse_btn.clicked.connect(self._on_browse_output)
+        self.output_browse_btn.setToolTip("Choose output .ico path\nShortcut: Ctrl+Shift+S")
         output_row.addWidget(self.output_browse_btn)
         layout.addLayout(output_row)
 
@@ -4749,6 +5968,13 @@ class IconConverterDialog(QDialog):
             self.icon_style_combo.setCurrentIndex(idx)
         self.icon_style_combo.currentIndexChanged.connect(self._on_icon_style_changed)
         style_row.addWidget(self.icon_style_combo)
+        self.icon_style_gallery_btn = QPushButton("", self)
+        self.icon_style_gallery_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)
+        )
+        self.icon_style_gallery_btn.setToolTip("Pick Template from Gallery\nShortcut: Alt+G")
+        self.icon_style_gallery_btn.clicked.connect(self._on_pick_icon_style_from_gallery)
+        style_row.addWidget(self.icon_style_gallery_btn)
         self.border_shader_btn = QPushButton("", self)
         self.border_shader_btn.setToolTip("Border Shader Controls")
         self.border_shader_btn.clicked.connect(self._on_open_border_shader)
@@ -4779,6 +6005,7 @@ class IconConverterDialog(QDialog):
         style_row.addWidget(self.text_extract_combo)
         style_row.addStretch(1)
         self.adjust_btn = QPushButton("Adjust Framing...", self)
+        self.adjust_btn.setToolTip("Open framing dialog\nShortcut: Alt+F")
         self.adjust_btn.clicked.connect(self._on_adjust_framing)
         style_row.addWidget(self.adjust_btn)
         layout.addLayout(style_row)
@@ -4791,6 +6018,8 @@ class IconConverterDialog(QDialog):
         buttons = QDialogButtonBox(self)
         self.convert_btn = QPushButton("Convert")
         self.close_btn = QPushButton("Close")
+        self.convert_btn.setToolTip("Convert to ICO\nShortcut: Ctrl+Enter")
+        self.close_btn.setToolTip("Close\nShortcut: Esc")
         buttons.addButton(self.convert_btn, QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.addButton(self.close_btn, QDialogButtonBox.ButtonRole.RejectRole)
         self.convert_btn.clicked.connect(self._on_convert)
@@ -4798,9 +6027,33 @@ class IconConverterDialog(QDialog):
         layout.addWidget(buttons)
         self.resize(900, 240)
         self._sync_template_dependents()
+        _bind_dialog_shortcut(self, "Ctrl+O", self._on_browse_source)
+        _bind_dialog_shortcut(self, "Ctrl+Shift+S", self._on_browse_output)
+        _bind_dialog_shortcut(self, "Alt+G", self._on_pick_icon_style_from_gallery)
+        _bind_dialog_shortcut(self, "Alt+F", self._on_adjust_framing)
+        _bind_dialog_shortcut(self, "Ctrl+Return", self._on_convert)
+        _bind_dialog_shortcut(self, "Ctrl+Enter", self._on_convert)
+        _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
 
     def _current_icon_style(self) -> str:
         return str(self.icon_style_combo.currentData() or "none")
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(
+            self,
+            "Icon Converter Shortcuts",
+            "\n".join(
+                [
+                    "Ctrl+O - Browse source image",
+                    "Ctrl+Shift+S - Pick output path",
+                    "Alt+G - Open template gallery",
+                    "Alt+F - Adjust framing",
+                    "Ctrl+Enter - Convert",
+                    "Esc - Close",
+                    "F1 - Show Shortcuts",
+                ]
+            ),
+        )
 
     def _template_enabled(self) -> bool:
         return self._current_icon_style() != "none"
@@ -4890,6 +6143,20 @@ class IconConverterDialog(QDialog):
                 self._icon_style_saver(self._current_icon_style())
             except Exception:
                 pass
+
+    def _on_pick_icon_style_from_gallery(self) -> None:
+        dialog = TemplateGalleryDialog(
+            _icon_style_gallery_entries(),
+            current_key=self._current_icon_style(),
+            title="Select Template",
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_key()
+        idx = self.icon_style_combo.findData(selected)
+        if idx >= 0:
+            self.icon_style_combo.setCurrentIndex(idx)
 
     def _on_bg_engine_changed(self, *_args) -> None:
         if self._prepared_is_final_composite:
@@ -5260,9 +6527,11 @@ class IconPickerDialog(QDialog):
         resources_row.addWidget(self.resource_summary, 1)
         self.resource_priority_btn = QPushButton("Priority...", self)
         self.resource_priority_btn.clicked.connect(self._on_manage_resource_priority)
+        self.resource_priority_btn.setToolTip("Manage resource order\nShortcut: Alt+P")
         resources_row.addWidget(self.resource_priority_btn)
         self.refresh_candidates_btn = QPushButton("Refresh Results", self)
         self.refresh_candidates_btn.clicked.connect(self._on_refresh_candidates)
+        self.refresh_candidates_btn.setToolTip("Refresh results\nShortcut: Ctrl+R")
         resources_row.addWidget(self.refresh_candidates_btn)
         layout.addLayout(resources_row)
 
@@ -5295,6 +6564,13 @@ class IconPickerDialog(QDialog):
             self.icon_style_combo.setCurrentIndex(default_idx)
         self.icon_style_combo.currentIndexChanged.connect(self._on_icon_style_changed)
         options_row.addWidget(self.icon_style_combo)
+        self.icon_style_gallery_btn = QPushButton("", self)
+        self.icon_style_gallery_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)
+        )
+        self.icon_style_gallery_btn.setToolTip("Pick Template from Gallery\nShortcut: Alt+G")
+        self.icon_style_gallery_btn.clicked.connect(self._on_pick_icon_style_from_gallery)
+        options_row.addWidget(self.icon_style_gallery_btn)
         self.border_shader_btn = QPushButton("", self)
         self.border_shader_btn.setToolTip("Border Shader Controls")
         self.border_shader_btn.clicked.connect(self._on_open_border_shader)
@@ -5325,12 +6601,15 @@ class IconPickerDialog(QDialog):
         options_row.addWidget(self.text_extract_combo)
         options_row.addStretch(1)
         self.local_btn = QPushButton("Use Local Image...")
+        self.local_btn.setToolTip("Choose local image\nShortcut: Ctrl+O")
         self.local_btn.clicked.connect(self._on_pick_local)
         options_row.addWidget(self.local_btn)
         self.web_btn = QPushButton("Web Capture...")
+        self.web_btn.setToolTip("Open web capture\nShortcut: Alt+W")
         self.web_btn.clicked.connect(self._on_pick_web_capture)
         options_row.addWidget(self.web_btn)
         self.frame_btn = QPushButton("Adjust Framing...")
+        self.frame_btn.setToolTip("Adjust framing and apply\nShortcut: Alt+F")
         self.frame_btn.clicked.connect(self._on_adjust_framing)
         options_row.addWidget(self.frame_btn)
         layout.addLayout(options_row)
@@ -5348,14 +6627,32 @@ class IconPickerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         if show_cancel_all:
             self.cancel_all_btn = QPushButton("Cancel All", self)
+            self.cancel_all_btn.setToolTip("Cancel all remaining entries\nShortcut: Alt+C")
             self.cancel_all_btn.clicked.connect(self._on_cancel_all)
             buttons.addButton(self.cancel_all_btn, QDialogButtonBox.ButtonRole.RejectRole)
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setToolTip("Accept selection\nShortcut: Ctrl+Enter")
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn is not None:
+            cancel_btn.setToolTip("Cancel\nShortcut: Esc")
         layout.addWidget(buttons)
         self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         self._refresh_border_shader_button()
         self._sync_template_dependents()
         self._update_resource_summary()
         self._update_refresh_candidates_button()
+        _bind_dialog_shortcut(self, "Ctrl+O", self._on_pick_local)
+        _bind_dialog_shortcut(self, "Alt+W", self._on_pick_web_capture)
+        _bind_dialog_shortcut(self, "Alt+F", self._on_adjust_framing)
+        _bind_dialog_shortcut(self, "Ctrl+R", self._on_refresh_candidates)
+        _bind_dialog_shortcut(self, "Alt+P", self._on_manage_resource_priority)
+        _bind_dialog_shortcut(self, "Alt+G", self._on_pick_icon_style_from_gallery)
+        _bind_dialog_shortcut(self, "Ctrl+Return", self._validate_then_accept)
+        _bind_dialog_shortcut(self, "Ctrl+Enter", self._validate_then_accept)
+        if show_cancel_all:
+            _bind_dialog_shortcut(self, "Alt+C", self._on_cancel_all)
+        _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
         if self._search_callback is None:
             self.resource_priority_btn.setEnabled(False)
             self.refresh_candidates_btn.setEnabled(False)
@@ -5364,6 +6661,22 @@ class IconPickerDialog(QDialog):
     def _on_cancel_all(self) -> None:
         self.cancel_all_requested = True
         self.reject()
+
+    def _show_shortcuts(self) -> None:
+        lines = [
+            "Ctrl+O - Use local image",
+            "Alt+W - Web capture",
+            "Alt+F - Adjust framing",
+            "Ctrl+R - Refresh results",
+            "Alt+P - Resource priority",
+            "Alt+G - Open template gallery",
+            "Ctrl+Enter - Accept selection",
+            "Esc - Cancel dialog",
+            "F1 - Show shortcuts",
+        ]
+        if hasattr(self, "cancel_all_btn"):
+            lines.insert(-2, "Alt+C - Cancel all")
+        QMessageBox.information(self, "Icon Picker Shortcuts", "\n".join(lines))
 
     def _rebuild_candidates_table(self, select_first_row: bool = False) -> None:
         selected_row = self.table.currentRow()
@@ -5602,6 +6915,20 @@ class IconPickerDialog(QDialog):
                 self._icon_style_saver(self._current_icon_style())
             except Exception:
                 pass
+
+    def _on_pick_icon_style_from_gallery(self) -> None:
+        dialog = TemplateGalleryDialog(
+            _icon_style_gallery_entries(),
+            current_key=self._current_icon_style(),
+            title="Select Template",
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_key()
+        idx = self.icon_style_combo.findData(selected)
+        if idx >= 0:
+            self.icon_style_combo.setCurrentIndex(idx)
 
     def _on_bg_engine_changed(self, *_args) -> None:
         if self._prepared_is_final_composite:
@@ -6103,7 +7430,16 @@ class PerformanceSettingsDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setToolTip("Save settings\nShortcut: Ctrl+Enter")
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn is not None:
+            cancel_btn.setToolTip("Cancel\nShortcut: Esc")
         layout.addWidget(buttons)
+        _bind_dialog_shortcut(self, "Ctrl+Return", self.accept)
+        _bind_dialog_shortcut(self, "Ctrl+Enter", self.accept)
+        _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
 
     def result_payload(self) -> PerformanceSettingsResult:
         return PerformanceSettingsResult(
@@ -6112,6 +7448,19 @@ class PerformanceSettingsDialog(QDialog):
             dir_cache_enabled=self.cache_enabled.isChecked(),
             dir_cache_max_entries=int(self.cache_max_spin.value()),
             startup_prewarm_mode=str(self.prewarm_mode_combo.currentData() or "minimal"),
+        )
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(
+            self,
+            "Performance Shortcuts",
+            "\n".join(
+                [
+                    "Ctrl+Enter - Save settings",
+                    "Esc - Cancel",
+                    "F1 - Show shortcuts",
+                ]
+            ),
         )
 
 
@@ -6153,6 +7502,7 @@ class IconProviderSettingsDialog(QDialog):
 
         actions = QHBoxLayout()
         self.test_btn = QPushButton("Test Credentials")
+        self.test_btn.setToolTip("Test provider credentials\nShortcut: Alt+T")
         self.test_btn.clicked.connect(self._on_test)
         actions.addWidget(self.test_btn)
         actions.addStretch(1)
@@ -6163,7 +7513,17 @@ class IconProviderSettingsDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setToolTip("Save provider settings\nShortcut: Ctrl+Enter")
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_btn is not None:
+            cancel_btn.setToolTip("Cancel\nShortcut: Esc")
         layout.addWidget(buttons)
+        _bind_dialog_shortcut(self, "Alt+T", self._on_test)
+        _bind_dialog_shortcut(self, "Ctrl+Return", self.accept)
+        _bind_dialog_shortcut(self, "Ctrl+Enter", self.accept)
+        _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
 
     def _on_test(self) -> None:
         try:
@@ -6172,6 +7532,20 @@ class IconProviderSettingsDialog(QDialog):
             QMessageBox.warning(self, "Credentials Test", f"Test failed:\n{exc}")
             return
         QMessageBox.information(self, "Credentials Test", msg)
+
+    def _show_shortcuts(self) -> None:
+        QMessageBox.information(
+            self,
+            "Icon Provider Shortcuts",
+            "\n".join(
+                [
+                    "Alt+T - Test credentials",
+                    "Ctrl+Enter - Save settings",
+                    "Esc - Cancel",
+                    "F1 - Show shortcuts",
+                ]
+            ),
+        )
 
     def result_payload(self) -> IconProviderSettingsResult:
         return IconProviderSettingsResult(

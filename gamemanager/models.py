@@ -41,6 +41,7 @@ class InventoryItem:
     icon_status: str = "none"
     folder_icon_path: str | None = None
     desktop_ini_path: str | None = None
+    info_tip: str = ""
 
 
 @dataclass(slots=True)

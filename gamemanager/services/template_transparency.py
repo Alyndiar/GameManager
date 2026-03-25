@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import colorsys
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -13,6 +14,7 @@ from PIL import Image, ImageOps
 class TemplateTransparencyOptions:
     threshold: int = 22
     color_tolerance_mode: str = "max"  # max | euclidean
+    compare_color_space: str = "rgb"  # rgb | hsv
     use_edge_flood_fill: bool = True
     use_center_flood_fill: bool = False
     preserve_existing_alpha: bool = True
@@ -27,6 +29,23 @@ def _distance_euclidean(rgb: tuple[int, int, int], ref: tuple[int, int, int]) ->
     dg = rgb[1] - ref[1]
     db = rgb[2] - ref[2]
     return (dr * dr + dg * dg + db * db) ** 0.5
+
+
+def _rgb_to_hsv255(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    r = max(0, min(255, int(rgb[0]))) / 255.0
+    g = max(0, min(255, int(rgb[1]))) / 255.0
+    b = max(0, min(255, int(rgb[2]))) / 255.0
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    return (
+        int(round(h * 255.0)) % 256,
+        int(round(s * 255.0)),
+        int(round(v * 255.0)),
+    )
+
+
+def _hue_diff(a: int, b: int) -> int:
+    delta = abs(int(a) - int(b)) % 256
+    return min(delta, 256 - delta)
 
 
 def _median_border_color(image: Image.Image) -> tuple[int, int, int]:
@@ -60,7 +79,17 @@ def _is_close_color(
     ref: tuple[int, int, int],
     threshold: int,
     mode: str,
+    space: str,
 ) -> bool:
+    if space == "hsv":
+        hsv = _rgb_to_hsv255(rgb)
+        hsv_ref = _rgb_to_hsv255(ref)
+        dh = _hue_diff(hsv[0], hsv_ref[0])
+        ds = abs(hsv[1] - hsv_ref[1])
+        dv = abs(hsv[2] - hsv_ref[2])
+        if mode == "euclidean":
+            return (dh * dh + ds * ds + dv * dv) ** 0.5 <= float(threshold)
+        return max(dh, ds, dv) <= threshold
     if mode == "euclidean":
         return _distance_euclidean(rgb, ref) <= float(threshold)
     return _distance_max(rgb, ref) <= threshold
@@ -72,6 +101,7 @@ def _flood_background_mask(
     background_color: tuple[int, int, int],
     threshold: int,
     mode: str,
+    space: str,
     seeds: list[tuple[int, int]],
 ) -> list[bool]:
     rgb = image.convert("RGB")
@@ -89,7 +119,7 @@ def _flood_background_mask(
         if mask[idx]:
             return
         color = px[x, y]
-        if _is_close_color(color, background_color, threshold, mode):
+        if _is_close_color(color, background_color, threshold, mode, space):
             mask[idx] = True
             queue.append(idx)
 
@@ -118,6 +148,7 @@ def _edge_background_mask(
     background_color: tuple[int, int, int],
     threshold: int,
     mode: str,
+    space: str,
 ) -> list[bool]:
     rgb = image.convert("RGB")
     width, height = rgb.size
@@ -133,6 +164,7 @@ def _edge_background_mask(
         background_color=background_color,
         threshold=threshold,
         mode=mode,
+        space=space,
         seeds=seeds,
     )
 
@@ -143,6 +175,7 @@ def _center_background_mask(
     background_color: tuple[int, int, int],
     threshold: int,
     mode: str,
+    space: str,
 ) -> list[bool]:
     rgb = image.convert("RGB")
     width, height = rgb.size
@@ -160,6 +193,7 @@ def _center_background_mask(
         background_color=background_color,
         threshold=threshold,
         mode=mode,
+        space=space,
         seeds=seeds,
     )
 
@@ -170,6 +204,7 @@ def _global_background_mask(
     background_color: tuple[int, int, int],
     threshold: int,
     mode: str,
+    space: str,
 ) -> list[bool]:
     rgb = image.convert("RGB")
     px = rgb.load()
@@ -179,7 +214,7 @@ def _global_background_mask(
     for y in range(height):
         for x in range(width):
             idx = y * width + x
-            if _is_close_color(px[x, y], background_color, threshold, mode):
+            if _is_close_color(px[x, y], background_color, threshold, mode, space):
                 mask[idx] = True
     return mask
 
@@ -203,6 +238,9 @@ def make_background_transparent(
     mode = opts.color_tolerance_mode.strip().casefold()
     if mode not in {"max", "euclidean"}:
         mode = "max"
+    space = opts.compare_color_space.strip().casefold()
+    if space not in {"rgb", "hsv"}:
+        space = "rgb"
 
     if opts.use_edge_flood_fill:
         bg_mask = _edge_background_mask(
@@ -210,6 +248,7 @@ def make_background_transparent(
             background_color=bg,
             threshold=threshold,
             mode=mode,
+            space=space,
         )
     elif opts.use_center_flood_fill:
         bg_mask = _center_background_mask(
@@ -217,6 +256,7 @@ def make_background_transparent(
             background_color=bg,
             threshold=threshold,
             mode=mode,
+            space=space,
         )
     else:
         bg_mask = _global_background_mask(
@@ -224,6 +264,7 @@ def make_background_transparent(
             background_color=bg,
             threshold=threshold,
             mode=mode,
+            space=space,
         )
     if opts.use_edge_flood_fill and opts.use_center_flood_fill:
         center_mask = _center_background_mask(
@@ -231,6 +272,7 @@ def make_background_transparent(
             background_color=bg,
             threshold=threshold,
             mode=mode,
+            space=space,
         )
         bg_mask = [a or b for a, b in zip(bg_mask, center_mask)]
 

@@ -11,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+from urllib.parse import quote_plus
+import webbrowser
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QProcess, QRect, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QIcon, QKeyEvent, QPixmap
+from PySide6.QtGui import QAction, QIcon, QKeyEvent, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -51,6 +53,7 @@ from gamemanager.services.icon_pipeline import (
 )
 from gamemanager.services.icon_sources import IconSearchSettings
 from gamemanager.services.background_removal import normalize_background_removal_engine
+from gamemanager.services.normalization import cleaned_name_from_full
 from gamemanager.services.sorting import natural_key
 from gamemanager.services.storage import mountpoint_sort_key
 from gamemanager.services.teracopy import DEFAULT_TERACOPY_PATH, resolve_teracopy_path
@@ -338,6 +341,59 @@ class ReportWorker(QObject):
             self.finished.emit()
 
 
+class InfoTipBackfillWorker(QObject):
+    progress = Signal(str, int, int)
+    completed = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, state: AppState, items: list[tuple[str, str]]):
+        super().__init__()
+        self._state = state
+        self._items = list(items)
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        updated = 0
+        failed = 0
+        tips_by_path: dict[str, str] = {}
+        total = len(self._items)
+        try:
+            for idx, (folder_path, cleaned_name) in enumerate(self._items, start=1):
+                if self._cancel_event.is_set():
+                    break
+                try:
+                    changed, tip = self._state.ensure_folder_info_tip(
+                        folder_path,
+                        cleaned_name,
+                    )
+                except Exception:
+                    failed += 1
+                    changed, tip = False, None
+                if changed:
+                    updated += 1
+                if tip:
+                    tips_by_path[os.path.normpath(folder_path)] = tip
+                if idx == total or idx % 10 == 0:
+                    self.progress.emit("InfoTip backfill", idx, total)
+            self.completed.emit(
+                {
+                    "updated": updated,
+                    "failed": failed,
+                    "tips_by_path": tips_by_path,
+                    "attempted": total,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, state: AppState):
         super().__init__()
@@ -372,6 +428,9 @@ class MainWindow(QMainWindow):
         self._refresh_worker: RefreshWorker | None = None
         self._refresh_in_progress = False
         self._refresh_queued = False
+        self._infotip_backfill_thread: QThread | None = None
+        self._infotip_backfill_worker: InfoTipBackfillWorker | None = None
+        self._infotip_backfill_in_progress = False
         self._operation_thread: QThread | None = None
         self._operation_worker: ReportWorker | None = None
         self._operation_in_progress = False
@@ -451,23 +510,27 @@ class MainWindow(QMainWindow):
         self.locate_teracopy_btn = QPushButton("Locate TC")
         self.move_backend_label = QLabel("Move:")
 
-        self.remove_root_btn.setToolTip("Remove Selected Root")
-        self.reset_sort_btn.setToolTip("Reset Sort")
-        self.cancel_op_btn.setToolTip("Cancel Running Operation")
-        self.show_duplicates_btn.setToolTip("Show Only Duplicates")
-        self.delete_selected_btn.setToolTip("Delete Selected")
-        self.cleanup_btn.setToolTip("Cleanup Names (Disk)")
-        self.move_btn.setToolTip("Move ISO/Archives")
-        self.assign_icon_btn.setToolTip("Assign Folder Icon...")
-        self.icon_convert_btn.setToolTip("Image to Icon Converter...")
-        self.template_prep_btn.setToolTip("Template Batch Prep...")
-        self.template_alpha_btn.setToolTip("Template Transparency...")
+        self.add_root_btn.setToolTip("Add Root\nShortcut: Ctrl+N")
+        self.remove_root_btn.setToolTip("Remove Selected Root\nShortcut: Ctrl+Shift+N")
+        self.refresh_btn.setToolTip("Refresh\nShortcut: Ctrl+R")
+        self.reset_sort_btn.setToolTip("Reset Sort\nShortcut: Alt+R")
+        self.cancel_op_btn.setToolTip("Cancel Running Operation\nShortcut: Ctrl+Shift+R")
+        self.show_duplicates_btn.setToolTip("Show Only Duplicates\nShortcut: Alt+D")
+        self.delete_selected_btn.setToolTip("Delete Selected\nShortcut: Ctrl+Delete")
+        self.cleanup_btn.setToolTip("Cleanup Names (Disk)\nShortcut: Ctrl+Shift+C")
+        self.tags_btn.setToolTip("Find Tags\nShortcut: Ctrl+Shift+G")
+        self.move_btn.setToolTip("Move ISO/Archives\nShortcut: Ctrl+Shift+M")
+        self.assign_icon_btn.setToolTip("Assign Folder Icon...\nShortcut: Ctrl+I")
+        self.icon_convert_btn.setToolTip("Image to Icon Converter...\nShortcut: Ctrl+Shift+I")
+        self.template_prep_btn.setToolTip("Template Batch Prep...\nShortcut: Ctrl+T")
+        self.template_alpha_btn.setToolTip("Template Transparency...\nShortcut: Ctrl+Shift+T")
         self.repair_icon_paths_btn.setToolTip(
-            "Repair absolute/external desktop.ini icon paths to local folder icons"
+            "Repair absolute/external desktop.ini icon paths to local folder icons\n"
+            "Shortcut: Alt+X"
         )
-        self.icon_settings_btn.setToolTip("Icon Provider Settings...")
-        self.perf_btn.setToolTip("Performance Settings...")
-        self.locate_teracopy_btn.setToolTip("Locate TeraCopy")
+        self.icon_settings_btn.setToolTip("Icon Provider Settings...\nShortcut: Alt+S")
+        self.perf_btn.setToolTip("Performance Settings...\nShortcut: Alt+P")
+        self.locate_teracopy_btn.setToolTip("Locate TeraCopy\nShortcut: Alt+L")
 
         compact_controls = [
             self.add_root_btn,
@@ -585,6 +648,29 @@ class MainWindow(QMainWindow):
         self.left_table.viewport().setAcceptDrops(True)
         left_layout.addWidget(self.left_table, 1)
 
+        self.selected_info_section = QFrame(self.left_panel)
+        self.selected_info_section.setFrameShape(QFrame.Shape.StyledPanel)
+        self.selected_info_section.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        selected_info_layout = QVBoxLayout(self.selected_info_section)
+        selected_info_layout.setContentsMargins(8, 6, 8, 6)
+        selected_info_layout.setSpacing(3)
+        selected_info_layout.addWidget(
+            QLabel("Selected Game Description:", self.selected_info_section)
+        )
+        self.selected_info_label = QLabel(
+            "Select a game to view its one-line description.",
+            self.selected_info_section,
+        )
+        self.selected_info_label.setWordWrap(True)
+        self.selected_info_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        selected_info_layout.addWidget(self.selected_info_label)
+        left_layout.addWidget(self.selected_info_section, 0)
+
         self.left_filter_section = QFrame(self.left_panel)
         self.left_filter_section.setFrameShape(QFrame.Shape.StyledPanel)
         self.left_filter_section.setSizePolicy(
@@ -689,17 +775,8 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self.statusBar().addPermanentWidget(self._status_selected_label, 0)
-        self.open_selected_explorer_action = QAction("Open Folder/Archive", self)
-        self.open_selected_explorer_action.setShortcut("Ctrl+O")
-        self.open_selected_explorer_action.setShortcutContext(
-            Qt.ShortcutContext.WidgetWithChildrenShortcut
-        )
-        self.open_selected_explorer_action.triggered.connect(
-            self._on_open_selected_in_explorer
-        )
-        self.addAction(self.open_selected_explorer_action)
-
         self._wire_events()
+        self._setup_shortcuts()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -886,6 +963,99 @@ class MainWindow(QMainWindow):
             self._on_right_icon_context_menu
         )
         self.right_icon_list.itemSelectionChanged.connect(self._on_right_selection_changed)
+
+    def _register_shortcut_action(
+        self,
+        name: str,
+        sequence: str,
+        callback: Callable[[], None],
+    ) -> QAction:
+        action = QAction(name, self)
+        action.setShortcut(QKeySequence(sequence))
+        action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        action.triggered.connect(callback)
+        self.addAction(action)
+        return action
+
+    def _setup_shortcuts(self) -> None:
+        self._shortcut_actions: dict[str, QAction] = {}
+        mappings: list[tuple[str, str, Callable[[], None]]] = [
+            ("Add Root", "Ctrl+N", self._on_add_root),
+            ("Remove Root", "Ctrl+Shift+N", self._on_remove_root),
+            ("Refresh", "Ctrl+R", self.refresh_all),
+            ("Cancel Operation", "Ctrl+Shift+R", self._on_cancel_operation),
+            ("Reset Sort", "Alt+R", self._on_reset_right_sort),
+            ("Toggle Duplicates", "Alt+D", self._toggle_duplicates_shortcut),
+            ("Delete Selected", "Ctrl+Delete", self._on_delete_selected_entries),
+            ("Cleanup Names", "Ctrl+Shift+C", self._on_cleanup),
+            ("Find Tags", "Ctrl+Shift+G", self._on_find_tags),
+            ("Move Archives", "Ctrl+Shift+M", self._on_move_archives),
+            ("Assign Folder Icon", "Ctrl+I", self._on_assign_folder_icon_selected),
+            ("Search on Google", "Alt+G", self._on_search_selected_on_google),
+            ("Icon Converter", "Ctrl+Shift+I", self._on_open_icon_converter),
+            ("Template Batch Prep", "Ctrl+T", self._on_open_template_prep),
+            ("Template Transparency", "Ctrl+Shift+T", self._on_open_template_transparency),
+            ("Icon Provider Settings", "Alt+S", self._on_icon_provider_settings),
+            ("Performance Settings", "Alt+P", self._on_open_performance_settings),
+            ("Locate TeraCopy", "Alt+L", self._on_locate_teracopy),
+            ("Refresh InfoTip", "Alt+I", self._on_refresh_selected_infotips),
+            ("Manual InfoTip Entry", "Alt+E", self._on_edit_selected_infotip),
+            ("Open Folder/Archive", "Ctrl+O", self._on_open_selected_in_explorer),
+            ("Edit Name", "F2", self._on_manual_rename_selected_entry),
+            ("Focus Filter", "Ctrl+F", self._focus_cleaned_name_filter),
+            ("Show Shortcuts", "F1", self._show_shortcuts_help),
+        ]
+        if ENABLE_ICON_PATH_REPAIR_ACTION:
+            mappings.insert(
+                16,
+                ("Repair Icon Paths", "Alt+X", self._on_repair_absolute_icon_paths),
+            )
+        for name, sequence, callback in mappings:
+            self._shortcut_actions[name] = self._register_shortcut_action(
+                name,
+                sequence,
+                callback,
+            )
+
+    def _toggle_duplicates_shortcut(self) -> None:
+        self.show_duplicates_btn.setChecked(not self.show_duplicates_btn.isChecked())
+
+    def _focus_cleaned_name_filter(self) -> None:
+        self.left_filter_edit.setFocus()
+        self.left_filter_edit.selectAll()
+
+    def _show_shortcuts_help(self) -> None:
+        lines = [
+            "Main Shortcuts",
+            "",
+            "Ctrl+N - Add Root",
+            "Ctrl+Shift+N - Remove Selected Root",
+            "Ctrl+R - Refresh",
+            "Ctrl+Shift+R - Cancel Operation",
+            "Alt+R - Reset Sort",
+            "Alt+D - Toggle Duplicates",
+            "Ctrl+Delete - Delete Selected",
+            "Ctrl+O - Open Folder/Archive",
+            "F2 - Edit Name",
+            "Ctrl+I - Assign Folder Icon",
+            "Alt+G - Search on Google",
+            "Ctrl+Shift+I - Icon Converter",
+            "Alt+I - Refresh InfoTip",
+            "Alt+E - Manual InfoTip Entry",
+            "Ctrl+T - Template Batch Prep",
+            "Ctrl+Shift+T - Template Transparency",
+            "Ctrl+Shift+C - Cleanup Names",
+            "Ctrl+Shift+M - Move Archives",
+            "Ctrl+Shift+G - Find Tags",
+            "Alt+S - Icon Provider Settings",
+            "Alt+P - Performance Settings",
+            "Alt+L - Locate TeraCopy",
+            "Ctrl+F - Focus Cleaned-Name Filter",
+            "F1 - Show Shortcuts",
+        ]
+        if ENABLE_ICON_PATH_REPAIR_ACTION:
+            lines.insert(-4, "Alt+X - Repair Icon Paths")
+        QMessageBox.information(self, "Shortcuts", "\n".join(lines))
 
     def _load_prefs(self) -> None:
         sort_pref = self.state.get_ui_pref("left_sort", "source_label")
@@ -1079,13 +1249,16 @@ class MainWindow(QMainWindow):
             path = resolve_teracopy_path(self._teracopy_path_pref)
             self._teracopy_executable = path
             if path:
-                self.locate_teracopy_btn.setToolTip(f"Locate TeraCopy\n{path}")
+                self.locate_teracopy_btn.setToolTip(
+                    f"Locate TeraCopy\nShortcut: Alt+L\n{path}"
+                )
             else:
                 self.locate_teracopy_btn.setToolTip(
-                    "Locate TeraCopy\nTeraCopy not found. Click to auto-locate or choose manually."
+                    "Locate TeraCopy\nShortcut: Alt+L\n"
+                    "TeraCopy not found. Click to auto-locate or choose manually."
                 )
         else:
-            self.locate_teracopy_btn.setToolTip("Locate TeraCopy")
+            self.locate_teracopy_btn.setToolTip("Locate TeraCopy\nShortcut: Alt+L")
 
     def _on_move_backend_changed(self, _text: str) -> None:
         backend = self._current_move_backend()
@@ -1260,6 +1433,8 @@ class MainWindow(QMainWindow):
             self._refresh_worker.request_cancel()
         if self._operation_worker is not None:
             self._operation_worker.request_cancel()
+        if self._infotip_backfill_worker is not None:
+            self._infotip_backfill_worker.request_cancel()
         if self._prewarm_delay_timer.isActive():
             self._prewarm_delay_timer.stop()
         if self._prewarm_process is not None:
@@ -1347,13 +1522,22 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._on_open_selected_in_explorer)
         menu.addAction(open_action)
         menu.addSeparator()
-        assign_icon_action = QAction("Assign Folder Icon...", menu)
+        assign_icon_action = QAction("Assign Folder Icon...\tCtrl+I", menu)
         assign_icon_action.triggered.connect(self._on_assign_folder_icon_selected)
         menu.addAction(assign_icon_action)
-        rename_action = QAction("Edit Name...", menu)
+        search_google_action = QAction("Search on Google\tAlt+G", menu)
+        search_google_action.triggered.connect(self._on_search_selected_on_google)
+        menu.addAction(search_google_action)
+        refresh_tip_action = QAction("Refresh InfoTip\tAlt+I", menu)
+        refresh_tip_action.triggered.connect(self._on_refresh_selected_infotips)
+        menu.addAction(refresh_tip_action)
+        edit_tip_action = QAction("Manual InfoTip Entry...\tAlt+E", menu)
+        edit_tip_action.triggered.connect(self._on_edit_selected_infotip)
+        menu.addAction(edit_tip_action)
+        rename_action = QAction("Edit Name...\tF2", menu)
         rename_action.triggered.connect(self._on_manual_rename_selected_entry)
         menu.addAction(rename_action)
-        delete_action = QAction("Delete Selected", menu)
+        delete_action = QAction("Delete Selected\tCtrl+Delete", menu)
         delete_action.triggered.connect(self._on_delete_selected_entries)
         menu.addAction(delete_action)
         menu.exec(self.right_table.viewport().mapToGlobal(pos))
@@ -1371,13 +1555,22 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._on_open_selected_in_explorer)
         menu.addAction(open_action)
         menu.addSeparator()
-        assign_icon_action = QAction("Assign Folder Icon...", menu)
+        assign_icon_action = QAction("Assign Folder Icon...\tCtrl+I", menu)
         assign_icon_action.triggered.connect(self._on_assign_folder_icon_selected)
         menu.addAction(assign_icon_action)
-        rename_action = QAction("Edit Name...", menu)
+        search_google_action = QAction("Search on Google\tAlt+G", menu)
+        search_google_action.triggered.connect(self._on_search_selected_on_google)
+        menu.addAction(search_google_action)
+        refresh_tip_action = QAction("Refresh InfoTip\tAlt+I", menu)
+        refresh_tip_action.triggered.connect(self._on_refresh_selected_infotips)
+        menu.addAction(refresh_tip_action)
+        edit_tip_action = QAction("Manual InfoTip Entry...\tAlt+E", menu)
+        edit_tip_action.triggered.connect(self._on_edit_selected_infotip)
+        menu.addAction(edit_tip_action)
+        rename_action = QAction("Edit Name...\tF2", menu)
         rename_action.triggered.connect(self._on_manual_rename_selected_entry)
         menu.addAction(rename_action)
-        delete_action = QAction("Delete Selected", menu)
+        delete_action = QAction("Delete Selected\tCtrl+Delete", menu)
         delete_action.triggered.connect(self._on_delete_selected_entries)
         menu.addAction(delete_action)
         menu.exec(self.right_icon_list.viewport().mapToGlobal(pos))
@@ -1414,6 +1607,27 @@ class MainWindow(QMainWindow):
         # Open only the first selected entry to avoid unintentionally spawning
         # many Explorer windows.
         self._open_in_explorer(selected[0].full_path)
+
+    def _on_search_selected_on_google(self) -> None:
+        selected = self._selected_right_entries()
+        if not selected:
+            QMessageBox.information(
+                self,
+                "Search on Google",
+                "Select at least one game entry in the right pane.",
+            )
+            return
+        entry = selected[0]
+        query = f"{(entry.cleaned_name.strip() or entry.full_name.strip() or 'game')} game"
+        url = f"https://www.google.com/search?q={quote_plus(query)}"
+        try:
+            webbrowser.open(url, new=2)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Search on Google",
+                f"Could not open browser for query:\n{query}\n\n{exc}",
+            )
 
     def _delete_path(self, full_path: str) -> None:
         if os.path.isdir(full_path):
@@ -1793,6 +2007,175 @@ class MainWindow(QMainWindow):
         self._update_cancel_button_state()
         self._finish_teracopy_session()
 
+    def _run_infotip_refresh_operation(
+        self,
+        targets: list[tuple[str, str]],
+        *,
+        title: str,
+        show_summary: bool = True,
+    ) -> bool:
+        normalized_targets = [
+            (os.path.normpath(path), (name or "").strip())
+            for path, name in targets
+            if str(path).strip() and str(name).strip()
+        ]
+        if not normalized_targets:
+            return False
+
+        def _run(progress_cb, should_cancel):
+            report = OperationReport(total=len(normalized_targets))
+            total = len(normalized_targets)
+            for idx, (folder_path, cleaned_name) in enumerate(normalized_targets, start=1):
+                if should_cancel():
+                    raise OperationCancelled("InfoTip refresh canceled.")
+                progress_cb("Refresh InfoTip", idx - 1, total)
+                try:
+                    updated, tip = self.state.ensure_folder_info_tip(
+                        folder_path,
+                        cleaned_name,
+                        overwrite_existing=True,
+                        force_refresh=True,
+                    )
+                except Exception as exc:
+                    report.failed += 1
+                    report.details.append(f"{cleaned_name}: {exc}")
+                    continue
+                if tip:
+                    if updated:
+                        report.succeeded += 1
+                    else:
+                        report.skipped += 1
+                    continue
+                report.failed += 1
+                report.details.append(f"{cleaned_name}: no description found")
+            progress_cb("Refresh InfoTip", total, total)
+            return report
+
+        def _done(report: OperationReport) -> None:
+            if show_summary:
+                lines = [
+                    f"Attempted: {report.total}",
+                    f"Updated: {report.succeeded}",
+                    f"Unchanged: {report.skipped}",
+                    f"Failed: {report.failed}",
+                ]
+                if report.details:
+                    lines.append("")
+                    lines.extend(report.details[:8])
+                QMessageBox.information(self, "InfoTip Refresh", "\n".join(lines))
+            self.refresh_all()
+
+        return self._start_report_operation(title, _run, _done)
+
+    def _on_refresh_selected_infotips(self) -> None:
+        selected = [item for item in self._selected_right_entries() if item.is_dir]
+        if not selected:
+            QMessageBox.information(
+                self,
+                "InfoTip Refresh",
+                "Select at least one game folder first.",
+            )
+            return
+        targets = [
+            (
+                entry.full_path,
+                (entry.cleaned_name or entry.full_name).strip(),
+            )
+            for entry in selected
+            if entry.icon_status == "valid"
+        ]
+        if not targets:
+            QMessageBox.information(
+                self,
+                "InfoTip Refresh",
+                "Selected entries do not have folder icons yet.",
+            )
+            return
+        self._run_infotip_refresh_operation(
+            targets,
+            title="Refresh InfoTips",
+            show_summary=True,
+        )
+
+    def _refresh_visible_entry_tooltip(self, full_path: str) -> None:
+        normalized = os.path.normpath(full_path)
+        root_info_by_id = {info.root_id: info for info in self.root_infos}
+        for row, entry in enumerate(self._visible_right_items):
+            if os.path.normpath(entry.full_path) != normalized:
+                continue
+            tooltip = self._entry_tooltip_text(
+                entry,
+                self._source_for_item(entry, root_info_by_id),
+            )
+            for col in range(len(RIGHT_COLUMNS)):
+                cell = self.right_table.item(row, col)
+                if cell is not None:
+                    cell.setToolTip(tooltip)
+            tile = self.right_icon_list.item(row)
+            if tile is not None:
+                tile.setToolTip(tooltip)
+            break
+
+    def _on_edit_selected_infotip(self) -> None:
+        selected = [item for item in self._selected_right_entries() if item.is_dir]
+        if len(selected) != 1:
+            QMessageBox.information(
+                self,
+                "Manual InfoTip Entry",
+                "Select exactly one game folder to edit its InfoTip.",
+            )
+            return
+        entry = selected[0]
+        if entry.icon_status != "valid":
+            QMessageBox.information(
+                self,
+                "Manual InfoTip Entry",
+                "The selected game does not have a folder icon yet.",
+            )
+            return
+        current_tip = (entry.info_tip or "").strip()
+        new_tip, ok = QInputDialog.getMultiLineText(
+            self,
+            "Manual InfoTip Entry",
+            "InfoTip:",
+            current_tip,
+        )
+        if not ok:
+            return
+        normalized_tip = new_tip.strip()
+        if not normalized_tip:
+            QMessageBox.warning(
+                self,
+                "Manual InfoTip Entry",
+                "InfoTip cannot be empty.",
+            )
+            return
+        cleaned = (entry.cleaned_name or entry.full_name).strip()
+        try:
+            changed = self.state.set_manual_folder_info_tip(
+                entry.full_path,
+                cleaned,
+                normalized_tip,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Manual InfoTip Entry",
+                f"Could not update InfoTip:\n{exc}",
+            )
+            return
+        if not changed:
+            QMessageBox.warning(
+                self,
+                "Manual InfoTip Entry",
+                "Could not update InfoTip on disk.",
+            )
+            return
+        target = self._find_inventory_item_by_path(entry.full_path) or entry
+        target.info_tip = normalized_tip
+        self._refresh_visible_entry_tooltip(entry.full_path)
+        self._update_counts_status()
+
     def _on_manual_rename_selected_entry(self) -> None:
         selected = self._selected_right_entries()
         if len(selected) != 1:
@@ -1854,6 +2237,20 @@ class MainWindow(QMainWindow):
                 "Rename Failed",
                 f"Could not rename:\n{old_path}\n\nto:\n{new_path}\n\n{exc}",
             )
+            return
+        if entry.is_dir and entry.icon_status == "valid":
+            renamed_cleaned = cleaned_name_from_full(
+                full_name=new_name,
+                is_file=False,
+                approved_tags=self.state.approved_tags(),
+            )
+            started = self._run_infotip_refresh_operation(
+                [(new_path, renamed_cleaned)],
+                title="Refresh renamed InfoTip",
+                show_summary=False,
+            )
+            if not started:
+                self.refresh_all()
             return
         self.refresh_all()
 
@@ -2031,11 +2428,14 @@ class MainWindow(QMainWindow):
         entry: InventoryItem,
         ico_path: str | None,
         desktop_ini_path: str | None,
+        info_tip: str | None = None,
     ) -> None:
         target = self._find_inventory_item_by_path(entry.full_path) or entry
         target.icon_status = "valid"
         target.folder_icon_path = os.path.normpath(ico_path) if ico_path else target.folder_icon_path
         target.desktop_ini_path = os.path.normpath(desktop_ini_path) if desktop_ini_path else target.desktop_ini_path
+        if info_tip is not None and info_tip.strip():
+            target.info_tip = info_tip.strip()
         try:
             stat = Path(target.full_path).stat()
             target.modified_at = datetime.fromtimestamp(stat.st_mtime)
@@ -2164,13 +2564,23 @@ class MainWindow(QMainWindow):
                 else:
                     failed.append(f"{entry.full_name}: no candidate selected")
                     continue
+                info_tip_value = (payload.info_tip or "").strip()
+                if not info_tip_value:
+                    try:
+                        auto_tip = self.state.get_or_fetch_game_infotip(
+                            entry.cleaned_name or entry.full_name
+                        )
+                    except Exception:
+                        auto_tip = None
+                    if auto_tip:
+                        info_tip_value = auto_tip
 
                 try:
                     result = self.state.apply_folder_icon(
                         folder_path=entry.full_path,
                         source_image=image_bytes,
                         icon_name_hint=entry.cleaned_name or entry.full_name,
-                        info_tip=payload.info_tip,
+                        info_tip=info_tip_value,
                         icon_style=icon_style,
                         bg_removal_engine=bg_removal_engine,
                         bg_removal_params=bg_removal_params,
@@ -2189,6 +2599,7 @@ class MainWindow(QMainWindow):
                         entry,
                         result.ico_path,
                         result.desktop_ini_path,
+                        info_tip_value,
                     )
                 except Exception as exc:
                     failed.append(f"{entry.full_name}: post-apply update failed ({exc})")
@@ -2478,6 +2889,32 @@ class MainWindow(QMainWindow):
             f"Games visible: {visible_games}/{self._loaded_entries_count}"
         )
 
+    def _entry_tooltip_text(self, entry: InventoryItem, row_source: str) -> str:
+        lines = [
+            f"Name: {entry.full_name}",
+            f"Cleaned: {entry.cleaned_name}",
+            f"Path: {entry.full_path}",
+            f"Source: {row_source}",
+        ]
+        tip = (entry.info_tip or "").strip()
+        if tip:
+            lines.append(f"InfoTip: {tip}")
+        return "\n".join(lines)
+
+    def _update_selected_info_box(self) -> None:
+        selected = self._selected_right_entries()
+        if not selected:
+            self.selected_info_label.setText(
+                "Select a game to view its one-line description."
+            )
+            return
+        entry = selected[0]
+        tip = (entry.info_tip or "").strip()
+        if tip:
+            self.selected_info_label.setText(tip)
+            return
+        self.selected_info_label.setText("No description available for this game yet.")
+
     def _update_counts_status(self) -> None:
         selected = self._selected_right_entries()
         selected_size = sum(item.size_bytes for item in selected)
@@ -2485,6 +2922,7 @@ class MainWindow(QMainWindow):
         self._status_selected_label.setText(
             f"| Selected: {len(selected)} games, {_format_bytes(selected_size)}"
         )
+        self._update_selected_info_box()
 
     def _on_add_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select Root Folder")
@@ -2613,6 +3051,7 @@ class MainWindow(QMainWindow):
         self._update_counts_status()
         self._set_operation_progress("Refresh complete", 1, 1)
         self._schedule_startup_prewarm_if_ready()
+        self._start_info_tip_backfill_if_needed()
 
     def _on_refresh_failed(self, message: str) -> None:
         err = message.strip() or "Unknown refresh error."
@@ -2638,6 +3077,86 @@ class MainWindow(QMainWindow):
             and not self._teracopy_processes
         ):
             self._clear_operation_progress()
+
+    def _start_info_tip_backfill_if_needed(self) -> None:
+        if self._infotip_backfill_in_progress:
+            return
+        if self.state.get_ui_pref("icon_infotip_backfill_done_v1", "0").strip() == "1":
+            return
+        candidates: list[tuple[str, str]] = []
+        for entry in self.inventory:
+            if not entry.is_dir:
+                continue
+            if entry.icon_status != "valid":
+                continue
+            if (entry.info_tip or "").strip():
+                continue
+            cleaned = (entry.cleaned_name or entry.full_name).strip()
+            if not cleaned:
+                continue
+            candidates.append((entry.full_path, cleaned))
+        if not candidates:
+            self.state.set_ui_pref("icon_infotip_backfill_done_v1", "1")
+            return
+        thread = QThread(self)
+        worker = InfoTipBackfillWorker(self.state, candidates)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_info_tip_backfill_progress)
+        worker.completed.connect(self._on_info_tip_backfill_completed)
+        worker.failed.connect(self._on_info_tip_backfill_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_info_tip_backfill_finished)
+        self._infotip_backfill_in_progress = True
+        self._infotip_backfill_thread = thread
+        self._infotip_backfill_worker = worker
+        thread.start()
+
+    def _on_info_tip_backfill_progress(self, stage: str, current: int, total: int) -> None:
+        self._set_background_progress(stage, current, total)
+
+    def _on_info_tip_backfill_completed(self, payload: object) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        tip_map_raw = data.get("tips_by_path", {}) if isinstance(data, dict) else {}
+        tip_map = (
+            {
+                os.path.normpath(str(path)): str(text).strip()
+                for path, text in tip_map_raw.items()
+                if str(text).strip()
+            }
+            if isinstance(tip_map_raw, dict)
+            else {}
+        )
+        if tip_map:
+            for entry in self.inventory:
+                key = os.path.normpath(entry.full_path)
+                tip = tip_map.get(key)
+                if tip:
+                    entry.info_tip = tip
+            self._populate_right(self.inventory)
+        updated = int(data.get("updated", 0)) if isinstance(data, dict) else 0
+        failed = int(data.get("failed", 0)) if isinstance(data, dict) else 0
+        attempted = int(data.get("attempted", 0)) if isinstance(data, dict) else 0
+        self._set_background_progress(
+            f"InfoTip backfill done (updated {updated}, failed {failed})",
+            attempted,
+            attempted,
+        )
+        self.state.set_ui_pref("icon_infotip_backfill_done_v1", "1")
+        QTimer.singleShot(2000, self._clear_background_progress)
+
+    def _on_info_tip_backfill_failed(self, message: str) -> None:
+        err = message.strip() or "InfoTip backfill failed"
+        self._set_background_progress(err, 1, 1)
+        self.state.set_ui_pref("icon_infotip_backfill_done_v1", "1")
+        QTimer.singleShot(2000, self._clear_background_progress)
+
+    def _on_info_tip_backfill_finished(self) -> None:
+        self._infotip_backfill_in_progress = False
+        self._infotip_backfill_thread = None
+        self._infotip_backfill_worker = None
 
     def _set_background_operation_busy(self, busy: bool) -> None:
         self.cleanup_btn.setEnabled(not busy)
@@ -2802,10 +3321,10 @@ class MainWindow(QMainWindow):
             self.refresh_btn.setStyleSheet(
                 "QPushButton { background-color: #6b1d1d; color: #ffffff; font-weight: 600; }"
             )
-            self.refresh_btn.setToolTip("Manual refresh required.")
+            self.refresh_btn.setToolTip("Manual refresh required.\nShortcut: Ctrl+R")
             return
         self.refresh_btn.setStyleSheet("")
-        self.refresh_btn.setToolTip("")
+        self.refresh_btn.setToolTip("Refresh\nShortcut: Ctrl+R")
 
     def _sorted_roots(self, roots: list[RootDisplayInfo]) -> list[RootDisplayInfo]:
         sort_key = LEFT_SORT_OPTIONS[self.left_sort_combo.currentText()]
@@ -2976,18 +3495,18 @@ class MainWindow(QMainWindow):
                 self.right_table.setItem(
                     row, 5, QTableWidgetItem(row_source)
                 )
-                self.right_table.item(row, 0).setToolTip(
-                    f"Path: {entry.full_path}\nCleaned: {entry.cleaned_name}"
-                )
+                tooltip = self._entry_tooltip_text(entry, row_source)
+                for col in range(len(RIGHT_COLUMNS)):
+                    cell = self.right_table.item(row, col)
+                    if cell is not None:
+                        cell.setToolTip(tooltip)
 
                 tile_text = entry.cleaned_name.strip() or entry.full_name
                 tile_icon = row_icon
                 if tile_icon.cacheKey() == self._blank_icon.cacheKey():
                     tile_icon = self._icon_placeholder(icon_px)
                 tile = QListWidgetItem(tile_icon, tile_text)
-                tile.setToolTip(
-                    f"Name: {entry.full_name}\nPath: {entry.full_path}\nSource: {row_source}"
-                )
+                tile.setToolTip(tooltip)
                 tile.setData(Qt.ItemDataRole.UserRole, row)
                 tile.setTextAlignment(
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)

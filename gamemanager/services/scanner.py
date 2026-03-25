@@ -128,11 +128,13 @@ def scan_roots(
             icon_status = "none"
             folder_icon_path: str | None = None
             desktop_ini_path: str | None = None
+            info_tip = ""
             if is_dir:
                 (
                     icon_status,
                     folder_icon_path,
                     desktop_ini_path,
+                    info_tip,
                 ) = detect_folder_icon_state(child)
                 cached_size = None
                 if dir_size_cache is not None:
@@ -153,6 +155,7 @@ def scan_roots(
                 icon_status=icon_status,
                 folder_icon_path=folder_icon_path,
                 desktop_ini_path=desktop_ini_path,
+                info_tip=info_tip,
             )
             items.append(item)
             if is_dir and cached_size is None:

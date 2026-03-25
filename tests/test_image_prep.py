@@ -6,12 +6,14 @@ from PIL import Image, ImageDraw
 from gamemanager.services.image_prep import (
     ImagePrepOptions,
     SUPPORTED_IMAGE_EXTENSIONS,
+    apply_background_color_transparency,
     apply_min_black_transparency,
     detect_content_bbox,
     icon_templates_dir,
     normalize_to_square_png,
     prepare_images_to_template_folder,
     prepare_images_to_512_png,
+    resolve_background_removal_config,
 )
 
 
@@ -135,6 +137,56 @@ def test_apply_min_black_transparency_clamps_to_30() -> None:
     out = Image.open(BytesIO(payload)).convert("RGBA")
     alpha = out.getchannel("A")
     assert alpha.getpixel((0, 0)) == 255
+
+
+def test_resolve_background_removal_config_custom_non_bw_halves_tolerance_hsv() -> None:
+    base, effective, space = resolve_background_removal_config(
+        mode="custom",
+        tolerance=20,
+        custom_color_rgb=(30, 90, 210),
+        use_hsv_for_custom=True,
+    )
+    assert base == (30, 90, 210)
+    assert effective == 10
+    assert space == "hsv"
+
+
+def test_apply_background_color_transparency_white_mode() -> None:
+    image = Image.new("RGBA", (16, 16), (255, 255, 255, 255))
+    ImageDraw.Draw(image).ellipse((4, 4, 11, 11), fill=(40, 110, 210, 255))
+    payload = apply_background_color_transparency(
+        _png_bytes(image),
+        mode="white",
+        tolerance=10,
+        custom_color_rgb=(255, 255, 255),
+    )
+    out = Image.open(BytesIO(payload)).convert("RGBA")
+    alpha = out.getchannel("A")
+    assert alpha.getpixel((0, 0)) == 0
+    assert alpha.getpixel((8, 8)) == 255
+
+
+def test_apply_min_black_transparency_skips_when_exterior_and_center_already_transparent() -> None:
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((8, 8, 55, 55), outline=(0, 0, 0, 255), width=8)
+    payload = apply_min_black_transparency(_png_bytes(image), min_black_level=20)
+    out = Image.open(BytesIO(payload)).convert("RGBA")
+    alpha = out.getchannel("A")
+    assert alpha.getpixel((0, 0)) == 0
+    assert alpha.getpixel((32, 32)) == 0
+    assert alpha.getpixel((32, 8)) == 255
+
+
+def test_apply_min_black_transparency_still_applies_for_opaque_black_background() -> None:
+    image = Image.new("RGBA", (24, 24), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((6, 6, 17, 17), fill=(220, 70, 40, 255))
+    payload = apply_min_black_transparency(_png_bytes(image), min_black_level=10)
+    out = Image.open(BytesIO(payload)).convert("RGBA")
+    alpha = out.getchannel("A")
+    assert alpha.getpixel((0, 0)) == 0
+    assert alpha.getpixel((10, 10)) == 255
 
 
 def test_supported_image_extensions_include_avif() -> None:
