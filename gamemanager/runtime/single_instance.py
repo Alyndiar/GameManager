@@ -4,6 +4,8 @@ import ctypes
 import os
 from pathlib import Path
 
+from gamemanager.services.paths import project_data_dir
+
 
 DEFAULT_ICONMAKER_GAMEMANAGER_MUTEX = r"Global\GameManager.IconMaker.MutualExclusive.v1"
 _ERROR_ALREADY_EXISTS = 183
@@ -33,7 +35,7 @@ class AppInstanceLock:
             self._handle = int(handle)
             return True
         lock_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in self._name)
-        lock_dir = Path.cwd() / ".gamemanager_data" / "locks"
+        lock_dir = project_data_dir() / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_path = lock_dir / f"{lock_name}.lock"
         try:

@@ -43,6 +43,8 @@ class PerformanceSettingsResult:
     dir_cache_enabled: bool
     dir_cache_max_entries: int
     startup_prewarm_mode: str
+    web_capture_download_mode: str = "auto"
+    web_capture_download_dir: str = ""
 
 
 __all__ = ["IconPickerResult", "IconProviderSettingsResult", "PerformanceSettingsResult", "TagReviewResult"]

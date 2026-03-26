@@ -25,6 +25,7 @@ from gamemanager.services.background_removal import (
     normalize_background_removal_params,
     remove_background_bytes,
 )
+from gamemanager.services.paths import project_data_dir, project_root
 
 # Keep PaddleX/PaddleOCR local-only by default, no startup host probing.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -34,7 +35,7 @@ os.environ.setdefault("PPOCR_LOG_LEVEL", "ERROR")
 
 ICO_SIZES: Final[list[int]] = [256, 128, 64, 48, 32, 24, 16]
 PACKAGE_DIR: Final[Path] = Path(__file__).resolve().parents[1]
-PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+PROJECT_ROOT: Final[Path] = project_root()
 BUILTIN_TEMPLATE_DIR: Final[Path] = PACKAGE_DIR / "templates"
 CUSTOM_TEMPLATE_DIR: Final[Path] = PROJECT_ROOT / "IconTemplates"
 ROUND_TEMPLATE_PATHS: Final[list[Path]] = [
@@ -45,13 +46,6 @@ SQUARE_TEMPLATE_PATHS: Final[list[Path]] = [
     PACKAGE_DIR / "SquareTemplate.png",
     PACKAGE_DIR / "SquareTemplace.png",
 ]
-
-
-def _project_data_dir() -> Path:
-    override = os.environ.get("GAMEMANAGER_DATA_DIR", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    return PROJECT_ROOT / ".gamemanager_data"
 
 
 def _remove_if_empty(path: Path) -> None:
@@ -88,7 +82,7 @@ def _merge_move_dir(src: Path, dst: Path) -> None:
 
 
 def _configure_local_ml_model_cache() -> None:
-    model_root = _project_data_dir() / "models"
+    model_root = project_data_dir() / "models"
     model_root.mkdir(parents=True, exist_ok=True)
     paddleocr_root = model_root / "paddleocr"
     paddle_root = model_root / "paddle"

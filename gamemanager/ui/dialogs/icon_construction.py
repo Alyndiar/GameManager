@@ -59,7 +59,11 @@ from gamemanager.services.icon_pipeline import (
     text_preserve_to_dict,
 )
 from gamemanager.ui.alpha_preview import composite_on_checkerboard, draw_checkerboard
-from .settings import _bind_dialog_shortcut
+from .shared import (
+    bind_dialog_shortcut as _bind_dialog_shortcut,
+    icon_style_gallery_entries as _icon_style_gallery_entries,
+    normalize_image_bytes_for_canvas as _normalize_image_bytes_for_canvas,
+)
 from .template_management import TemplateGalleryDialog
 
 try:
@@ -68,17 +72,6 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     ImageFilter = None  # type: ignore[assignment]
     ImageOps = None  # type: ignore[assignment]
-
-
-def _icon_style_gallery_entries() -> list[tuple[str, str, object | None]]:
-    entries: list[tuple[str, str, object | None]] = [("none", "No Template", None)]
-    for label, value in icon_style_options():
-        key = str(value or "").strip()
-        if not key or key == "none":
-            continue
-        spec = resolve_icon_template(key, circular_ring=False)
-        entries.append((key, str(label), spec.path))
-    return entries
 
 
 def _shader_tone_label(mode: str) -> str:
@@ -95,22 +88,6 @@ def _shader_swatch_css(rgb: tuple[int, int, int]) -> str:
         " min-height: 18px;"
         " }"
     )
-
-
-def _normalize_image_bytes_for_canvas(payload: bytes) -> bytes:
-    if not payload or Image is None or ImageOps is None:
-        return payload
-    try:
-        with Image.open(BytesIO(payload)) as img:
-            img.load()
-            img = ImageOps.exif_transpose(img)
-            if img.mode not in {"RGB", "RGBA"}:
-                img = img.convert("RGBA")
-            out = BytesIO()
-            img.save(out, format="PNG")
-            return out.getvalue()
-    except Exception:
-        return payload
 
 
 UPSCALE_METHOD_OPTIONS: tuple[tuple[str, str], ...] = (

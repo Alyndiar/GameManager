@@ -17,6 +17,7 @@ from gamemanager.runtime import (
     AppInstanceLock,
     show_already_running_message,
 )
+from gamemanager.services.paths import project_data_dir
 from gamemanager.services.persistent_workers import (
     ensure_persistent_icon_workers_async,
     shutdown_persistent_icon_workers,
@@ -113,17 +114,8 @@ def _migrate_legacy_data(target_dir: Path) -> None:
     _remove_if_empty(legacy_dir)
 
 
-def _project_data_dir() -> Path:
-    override = os.environ.get("GAMEMANAGER_DATA_DIR", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    # Keep all non-registry state inside the project workspace by default.
-    project_root = Path(__file__).resolve().parent.parent
-    return project_root / ".gamemanager_data"
-
-
 def _default_db_path() -> Path:
-    data_dir = _project_data_dir()
+    data_dir = project_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     _migrate_legacy_data(data_dir)
     return data_dir / "manager.db"

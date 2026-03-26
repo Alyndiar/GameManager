@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -43,6 +42,11 @@ from gamemanager.services.background_removal import (
     normalize_background_removal_engine,
     normalize_background_removal_params,
 )
+from gamemanager.services.browser_downloads import (
+    BrowserDownloadDetection,
+    default_downloads_dir,
+    detect_browser_download_dir,
+)
 from gamemanager.services.icon_pipeline import (
     TEXT_EXTRACTION_METHOD_OPTIONS,
     border_shader_to_dict,
@@ -54,10 +58,15 @@ from gamemanager.services.icon_pipeline import (
     text_preserve_to_dict,
 )
 from gamemanager.services.image_prep import SUPPORTED_IMAGE_EXTENSIONS
+from gamemanager.services.paths import project_data_dir
 from gamemanager.ui.alpha_preview import composite_on_checkerboard
 from .common import IconPickerResult
 from .icon_construction import BorderShaderDialog, IconFramingDialog
-from .settings import _bind_dialog_shortcut
+from .shared import (
+    bind_dialog_shortcut as _bind_dialog_shortcut,
+    icon_style_gallery_entries as _icon_style_gallery_entries,
+    normalize_image_bytes_for_canvas as _normalize_image_bytes_for_canvas,
+)
 from .template_management import TemplateGalleryDialog
 
 
@@ -81,24 +90,6 @@ def _shader_swatch_css(rgb: tuple[int, int, int]) -> str:
     )
 
 
-def _normalize_image_bytes_for_canvas(payload: bytes) -> bytes:
-    if not payload:
-        return payload
-    try:
-        from PIL import Image, ImageOps
-
-        with Image.open(BytesIO(payload)) as img:
-            img.load()
-            img = ImageOps.exif_transpose(img)
-            if img.mode not in {"RGB", "RGBA"}:
-                img = img.convert("RGBA")
-            out = BytesIO()
-            img.save(out, format="PNG")
-            return out.getvalue()
-    except Exception:
-        return payload
-
-
 def _is_supported_image_path(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
 
@@ -109,19 +100,11 @@ def _google_image_search_url(query: str) -> str:
     return f"https://www.google.com/search?tbm=isch&q={quote_plus(query)}"
 
 
-def _project_data_dir() -> Path:
-    override = os.environ.get("GAMEMANAGER_DATA_DIR", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    project_root = Path(__file__).resolve().parents[3]
-    return project_root / ".gamemanager_data"
-
-
 def _web_capture_session_root() -> Path:
-    legacy = _project_data_dir() / "web_capture_sessions"
+    legacy = project_data_dir() / "web_capture_sessions"
     if legacy.exists() and legacy.is_dir():
         shutil.rmtree(legacy, ignore_errors=True)
-    root = _project_data_dir() / "web_capture_session"
+    root = project_data_dir() / "web_capture_session"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -145,6 +128,38 @@ def _web_capture_session_dir() -> Path:
 
 def _cleanup_web_capture_session() -> None:
     _empty_directory(_web_capture_session_root())
+
+
+def _bring_window_to_front(widget: QWidget) -> None:
+    if widget.isMinimized():
+        widget.showNormal()
+    widget.show()
+    widget.raise_()
+    widget.activateWindow()
+    window_handle = widget.windowHandle()
+    if window_handle is not None:
+        try:
+            window_handle.requestActivate()
+        except Exception:
+            pass
+    if os.name != "nt":
+        return
+    # Best-effort Windows foreground activation fallback when Qt focus requests are blocked.
+    try:
+        import ctypes
+
+        hwnd = int(widget.winId())
+        if hwnd <= 0:
+            return
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        # Temporary topmost toggle helps force z-order refresh on some shells.
+        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
+        user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002)
+    except Exception:
+        return
 
 
 class ExternalDownloadWatcher:
@@ -276,11 +291,30 @@ class WebDownloadCaptureDialog(QDialog):
         query: str,
         parent: QWidget | None = None,
         selection_callback: Callable[[str], None] | None = None,
+        initial_download_dir: str | None = None,
+        download_dir_saver: Callable[[str], None] | None = None,
+        initial_download_mode: str = "auto",
+        download_dir_mode_saver: Callable[[str], None] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Web Image Capture")
         self._capture_dir = _web_capture_session_dir()
-        self._external_download_dir = Path(r"E:\Downloads")
+        self._download_dir_saver = download_dir_saver
+        self._download_dir_mode_saver = download_dir_mode_saver
+        self._browser_detection: BrowserDownloadDetection | None = None
+        self._download_mode = (
+            str(initial_download_mode or "auto").strip().casefold()
+        )
+        if self._download_mode not in {"auto", "manual"}:
+            self._download_mode = "auto"
+        self._external_download_dir = default_downloads_dir()
+        requested_dir = str(initial_download_dir or "").strip()
+        if self._download_mode == "manual" and requested_dir:
+            self._external_download_dir = Path(requested_dir).expanduser()
+        else:
+            self._browser_detection = detect_browser_download_dir()
+            self._external_download_dir = self._browser_detection.download_dir
+            self._download_mode = "auto"
         self._external_watcher: ExternalDownloadWatcher | None = None
         self._external_stage_lock = threading.Lock()
         self._selection_callback = selection_callback
@@ -303,11 +337,25 @@ class WebDownloadCaptureDialog(QDialog):
         url_row.addWidget(self.open_btn)
         self.open_external_btn = QPushButton("Open External + Capture", self)
         self.open_external_btn.clicked.connect(self._toggle_external_capture)
-        self.open_external_btn.setToolTip(
-            "Open in your default browser and capture new image downloads from E:\\Downloads."
-        )
+        self.open_external_btn.setToolTip("")
         url_row.addWidget(self.open_external_btn)
         layout.addLayout(url_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Downloads Folder:", self))
+        self.download_dir_edit = QLineEdit(str(self._external_download_dir), self)
+        self.download_dir_edit.editingFinished.connect(self._on_download_dir_edit_committed)
+        folder_row.addWidget(self.download_dir_edit, 1)
+        self.browse_download_dir_btn = QPushButton("Browse...", self)
+        self.browse_download_dir_btn.clicked.connect(self._on_browse_download_dir)
+        folder_row.addWidget(self.browse_download_dir_btn)
+        self.detect_download_dir_btn = QPushButton("Detect Browser Default", self)
+        self.detect_download_dir_btn.clicked.connect(self._on_detect_browser_default_download_dir)
+        folder_row.addWidget(self.detect_download_dir_btn)
+        layout.addLayout(folder_row)
+        self.detected_browser_label = QLabel(self)
+        self.detected_browser_label.setWordWrap(True)
+        layout.addWidget(self.detected_browser_label)
 
         mode_note = QLabel(
             "Embedded browser capture is disabled. "
@@ -362,6 +410,8 @@ class WebDownloadCaptureDialog(QDialog):
         self._external_poll_timer.timeout.connect(self._poll_external_updates)
         self._external_poll_timer.start()
 
+        self._refresh_detected_browser_label()
+        self._refresh_open_external_tooltip()
         self._ingest_existing_capture_files()
         self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         QTimer.singleShot(0, self._auto_start_external_capture)
@@ -380,6 +430,84 @@ class WebDownloadCaptureDialog(QDialog):
             self._ingest_external_captures(watcher.pop_new_paths())
         except Exception:
             return
+
+    def _refresh_detected_browser_label(self) -> None:
+        if self._download_mode == "manual":
+            self.detected_browser_label.setText(
+                f"Manual folder override active: {self.download_dir_edit.text().strip()}"
+            )
+            return
+        detection = self._browser_detection
+        if detection is None:
+            self.detected_browser_label.setText("Browser default detection: unavailable.")
+            return
+        self.detected_browser_label.setText(
+            "Detected browser default: "
+            f"{detection.browser_label} | {detection.download_dir} ({detection.source})"
+        )
+
+    def _refresh_open_external_tooltip(self) -> None:
+        self.open_external_btn.setToolTip(
+            "Open in your default browser and capture new image downloads from "
+            f"{self._external_download_dir}"
+        )
+
+    def _on_browse_download_dir(self) -> None:
+        current = self.download_dir_edit.text().strip()
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Browser Downloads Folder",
+            current or str(default_downloads_dir()),
+        )
+        if not selected:
+            return
+        self.download_dir_edit.setText(selected)
+        self._external_download_dir = Path(selected)
+        self._download_mode = "manual"
+        self._browser_detection = None
+        self._refresh_detected_browser_label()
+        self._refresh_open_external_tooltip()
+        self._persist_download_dir_settings(selected)
+
+    def _on_detect_browser_default_download_dir(self) -> None:
+        detection = detect_browser_download_dir()
+        self._browser_detection = detection
+        self._download_mode = "auto"
+        self._external_download_dir = detection.download_dir
+        self.download_dir_edit.setText(str(detection.download_dir))
+        self._refresh_detected_browser_label()
+        self._refresh_open_external_tooltip()
+        self._persist_download_dir_settings(str(detection.download_dir))
+
+    def _on_download_dir_edit_committed(self) -> None:
+        text = self.download_dir_edit.text().strip()
+        if not text:
+            return
+        self._external_download_dir = Path(text).expanduser()
+        self._download_mode = "manual"
+        self._browser_detection = None
+        self._refresh_detected_browser_label()
+        self._refresh_open_external_tooltip()
+        self._persist_download_dir_settings(text)
+
+    def _persist_download_dir_settings(self, path: str) -> None:
+        normalized = str(path or "").strip()
+        if normalized and self._download_dir_saver is not None:
+            try:
+                self._download_dir_saver(normalized)
+            except Exception:
+                pass
+        if self._download_dir_mode_saver is not None:
+            try:
+                self._download_dir_mode_saver(self._download_mode)
+            except Exception:
+                pass
+
+    def _resolve_external_download_dir_from_ui(self) -> Path | None:
+        text = self.download_dir_edit.text().strip()
+        if not text:
+            return None
+        return Path(text).expanduser()
 
     def _selected_capture_path(self) -> str | None:
         row = self.download_table.currentRow()
@@ -477,6 +605,15 @@ class WebDownloadCaptureDialog(QDialog):
         if self._external_watcher is not None and self._external_watcher.is_running():
             self._stop_external_capture(import_results=True)
             return
+        resolved = self._resolve_external_download_dir_from_ui()
+        if resolved is None:
+            QMessageBox.warning(
+                self,
+                "Download Folder Missing",
+                "Choose a valid downloads folder before starting capture.",
+            )
+            return
+        self._external_download_dir = resolved
         if not self._external_download_dir.exists():
             QMessageBox.warning(
                 self,
@@ -500,6 +637,7 @@ class WebDownloadCaptureDialog(QDialog):
         self.open_external_btn.setToolTip(
             "Stop the external browser capture session and import matching image files."
         )
+        self._persist_download_dir_settings(str(self._external_download_dir))
         self._refresh_capture_status_label()
         self._open_external_browser()
 
@@ -507,6 +645,10 @@ class WebDownloadCaptureDialog(QDialog):
         if self._tearing_down:
             return
         if self._external_watcher is not None and self._external_watcher.is_running():
+            return
+        resolved = self._resolve_external_download_dir_from_ui()
+        if resolved is None or not resolved.exists():
+            self._refresh_capture_status_label()
             return
         self._toggle_external_capture()
 
@@ -519,9 +661,7 @@ class WebDownloadCaptureDialog(QDialog):
         if import_results:
             self._ingest_external_captures(paths)
         self.open_external_btn.setText("Open External + Capture")
-        self.open_external_btn.setToolTip(
-            "Open in your default browser and capture new image downloads from E:\\Downloads."
-        )
+        self._refresh_open_external_tooltip()
         self._refresh_capture_status_label()
 
     def _stage_external_capture(self, source_path: Path) -> str | None:
@@ -624,10 +764,7 @@ class WebDownloadCaptureDialog(QDialog):
             self.download_table.scrollToItem(self.download_table.item(row, 1))
         if not self.auto_focus_check.isChecked():
             return
-        if self.isMinimized():
-            self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        _bring_window_to_front(self)
 
     def _unique_name(self, filename: str) -> str:
         candidate = filename
@@ -700,20 +837,6 @@ class WebDownloadCaptureDialog(QDialog):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._shutdown_web_capture(import_results=False)
         super().closeEvent(event)
-
-
-def _icon_style_gallery_entries() -> list[tuple[str, str, Path | None]]:
-    from gamemanager.services.icon_pipeline import resolve_icon_template
-
-    entries: list[tuple[str, str, Path | None]] = [("none", "No Template", None)]
-    for label, value in icon_style_options():
-        key = str(value or "").strip()
-        if not key or key == "none":
-            continue
-        spec = resolve_icon_template(key, circular_ring=False)
-        entries.append((key, str(label), spec.path))
-    return entries
-
 
 class SGDBResourcePriorityDialog(QDialog):
     def __init__(
@@ -848,6 +971,10 @@ class IconPickerDialog(QDialog):
         bg_removal_engine_saver=None,
         initial_border_shader: dict[str, object] | None = None,
         border_shader_saver=None,
+        initial_web_download_dir: str | None = None,
+        web_download_dir_saver: Callable[[str], None] | None = None,
+        initial_web_download_mode: str = "auto",
+        web_download_mode_saver: Callable[[str], None] | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -862,6 +989,12 @@ class IconPickerDialog(QDialog):
         self._icon_style_saver = icon_style_saver
         self._bg_removal_engine_saver = bg_removal_engine_saver
         self._border_shader_saver = border_shader_saver
+        self._web_download_dir = str(initial_web_download_dir or "").strip()
+        self._web_download_dir_saver = web_download_dir_saver
+        self._web_download_mode = str(initial_web_download_mode or "auto").strip().casefold()
+        if self._web_download_mode not in {"auto", "manual"}:
+            self._web_download_mode = "auto"
+        self._web_download_mode_saver = web_download_mode_saver
         self.cancel_all_requested = False
         self._web_capture_dialog: WebDownloadCaptureDialog | None = None
         self._local_image_path: str | None = None
@@ -1584,6 +1717,10 @@ class IconPickerDialog(QDialog):
             query,
             self,
             selection_callback=self._on_web_capture_image_selected,
+            initial_download_dir=self._web_download_dir,
+            download_dir_saver=self._on_web_download_dir_changed,
+            initial_download_mode=self._web_download_mode,
+            download_dir_mode_saver=self._on_web_download_mode_changed,
         )
         browser.setWindowModality(Qt.WindowModality.NonModal)
         browser.finished.connect(self._on_web_capture_dialog_finished)
@@ -1597,6 +1734,28 @@ class IconPickerDialog(QDialog):
 
     def _on_web_capture_image_selected(self, path: str) -> None:
         self._set_local_source(path, "Web Download")
+
+    def _on_web_download_dir_changed(self, path: str) -> None:
+        normalized = str(path or "").strip()
+        if not normalized:
+            return
+        self._web_download_dir = normalized
+        if self._web_download_dir_saver is not None:
+            try:
+                self._web_download_dir_saver(normalized)
+            except Exception:
+                pass
+
+    def _on_web_download_mode_changed(self, mode: str) -> None:
+        normalized = str(mode or "").strip().casefold()
+        if normalized not in {"auto", "manual"}:
+            return
+        self._web_download_mode = normalized
+        if self._web_download_mode_saver is not None:
+            try:
+                self._web_download_mode_saver(normalized)
+            except Exception:
+                pass
 
     def _set_local_source(self, path: str, source_label: str) -> None:
         image_bytes: bytes

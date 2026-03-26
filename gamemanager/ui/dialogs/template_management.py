@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from io import BytesIO
 import os
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -32,7 +31,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gamemanager.services.icon_pipeline import icon_style_options, resolve_icon_template
 from gamemanager.services.image_prep import (
     ImagePrepOptions,
     SUPPORTED_IMAGE_EXTENSIONS,
@@ -50,6 +48,7 @@ from gamemanager.services.template_transparency import (
     normalize_falloff_mode,
 )
 from gamemanager.ui.alpha_preview import composite_on_checkerboard, draw_checkerboard
+from .shared import bind_dialog_shortcut as _bind_dialog_shortcut
 _TEMPLATE_GALLERY_SIZE_PREF_KEY = "template_gallery_preview_size"
 _TEMPLATE_GALLERY_SIZE_MIN = 48
 _TEMPLATE_GALLERY_SIZE_MAX = 256
@@ -201,30 +200,6 @@ class TemplateGalleryDialog(QDialog):
 
     def selected_key(self) -> str:
         return str(self._selected_key or "none")
-
-
-def _icon_style_gallery_entries() -> list[tuple[str, str, Path | None]]:
-    entries: list[tuple[str, str, Path | None]] = [("none", "No Template", None)]
-    for label, value in icon_style_options():
-        key = str(value or "").strip()
-        if not key or key == "none":
-            continue
-        spec = resolve_icon_template(key, circular_ring=False)
-        entries.append((key, str(label), spec.path))
-    return entries
-
-
-def _bind_dialog_shortcut(
-    dialog: QDialog,
-    sequence: str,
-    callback: Callable[[], None],
-) -> QAction:
-    action = QAction(dialog)
-    action.setShortcut(QKeySequence(sequence))
-    action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-    action.triggered.connect(callback)
-    dialog.addAction(action)
-    return action
 
 
 class _DropPathListWidget(QListWidget):
