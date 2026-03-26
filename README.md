@@ -57,11 +57,22 @@ python -m pip install -r requirements-dev.txt
 python -m gamemanager
 ```
 
+Standalone icon tool:
+
+```powershell
+python -m iconmaker_gui
+```
+
+`GameManager` and `IconMaker` are mutually exclusive at runtime (only one can run at a time).
+
 ## Test
 
 ```powershell
-pytest
+.\tools\run_tests.ps1
 ```
+
+This always runs tests in the `GameManager` conda environment (`conda run -n GameManager`),
+independent of your currently active shell environment.
 
 ## Data, Cache, and Secret Storage
 
@@ -187,6 +198,7 @@ pytest
   - debug alpha-mask preview
 - Layer visibility toggles: background/template/cutout/text.
 - Exports a final composited PNG used directly by icon assignment/conversion.
+- Shared with standalone `IconMaker` to keep icon construction parity between both GUIs.
 
 ### 9) Icon converter tool
 

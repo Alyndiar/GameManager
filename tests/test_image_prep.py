@@ -166,6 +166,61 @@ def test_apply_background_color_transparency_white_mode() -> None:
     assert alpha.getpixel((8, 8)) == 255
 
 
+def test_apply_background_color_transparency_center_flood_fill_can_remove_center_island() -> None:
+    image = Image.new("RGBA", (21, 21), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 20, 20), outline=(0, 0, 0, 255), width=2)
+    draw.rectangle((9, 9, 11, 11), fill=(0, 0, 0, 255))
+
+    edge_only = apply_background_color_transparency(
+        _png_bytes(image),
+        mode="black",
+        tolerance=12,
+        custom_color_rgb=(0, 0, 0),
+        use_hsv_for_custom=False,
+        use_center_flood_fill=False,
+    )
+    with_center = apply_background_color_transparency(
+        _png_bytes(image),
+        mode="black",
+        tolerance=12,
+        custom_color_rgb=(0, 0, 0),
+        use_hsv_for_custom=False,
+        use_center_flood_fill=True,
+    )
+
+    edge_alpha = Image.open(BytesIO(edge_only)).convert("RGBA").getchannel("A")
+    center_alpha = Image.open(BytesIO(with_center)).convert("RGBA").getchannel("A")
+
+    assert edge_alpha.getpixel((1, 1)) == 0
+    assert edge_alpha.getpixel((10, 10)) == 255
+    assert center_alpha.getpixel((1, 1)) == 0
+    assert center_alpha.getpixel((10, 10)) == 0
+
+
+def test_apply_background_color_transparency_supports_falloff() -> None:
+    image = Image.new("RGBA", (3, 1), (0, 0, 0, 255))
+    px = image.load()
+    px[0, 0] = (0, 0, 0, 255)
+    px[1, 0] = (15, 15, 15, 255)
+    px[2, 0] = (40, 40, 40, 255)
+    payload = apply_background_color_transparency(
+        _png_bytes(image),
+        mode="black",
+        tolerance=20,
+        custom_color_rgb=(0, 0, 0),
+        use_hsv_for_custom=False,
+        falloff_mode="lin",
+        curve_strength=50,
+        use_center_flood_fill=False,
+    )
+    out = Image.open(BytesIO(payload)).convert("RGBA")
+    alpha = out.getchannel("A")
+    assert alpha.getpixel((0, 0)) == 0
+    assert 0 < alpha.getpixel((1, 0)) < 255
+    assert alpha.getpixel((2, 0)) == 255
+
+
 def test_apply_min_black_transparency_skips_when_exterior_and_center_already_transparent() -> None:
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
