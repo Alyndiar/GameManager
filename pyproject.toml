@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
+  "pytest-qt>=4.4.0",
 ]
 
 [tool.pytest.ini_options]
