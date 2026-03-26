@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -18,20 +17,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from gamemanager.services.browser_downloads import detect_browser_download_dir
 from .common import IconProviderSettingsResult, PerformanceSettingsResult
-
-
-def _bind_dialog_shortcut(
-    dialog: QDialog,
-    sequence: str,
-    callback: Callable[[], None],
-) -> QAction:
-    action = QAction(dialog)
-    action.setShortcut(QKeySequence(sequence))
-    action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-    action.triggered.connect(callback)
-    dialog.addAction(action)
-    return action
+from .shared import bind_dialog_shortcut as _bind_dialog_shortcut
 
 
 class PerformanceSettingsDialog(QDialog):
@@ -102,6 +90,46 @@ class PerformanceSettingsDialog(QDialog):
         max_row.addStretch(1)
         layout.addLayout(max_row)
 
+        web_mode_row = QHBoxLayout()
+        web_mode_row.addWidget(QLabel("Web capture folder:", self))
+        self.web_capture_mode_combo = QComboBox(self)
+        self.web_capture_mode_combo.addItem("Auto-detect", "auto")
+        self.web_capture_mode_combo.addItem("Manual", "manual")
+        mode = str(initial.web_capture_download_mode or "auto").strip().casefold()
+        mode_idx = self.web_capture_mode_combo.findData(
+            mode if mode in {"auto", "manual"} else "auto"
+        )
+        if mode_idx >= 0:
+            self.web_capture_mode_combo.setCurrentIndex(mode_idx)
+        web_mode_row.addWidget(self.web_capture_mode_combo)
+        web_mode_row.addStretch(1)
+        layout.addLayout(web_mode_row)
+
+        web_dir_row = QHBoxLayout()
+        web_dir_row.addWidget(QLabel("Downloads path:", self))
+        self.web_capture_dir_edit = QLineEdit(
+            str(initial.web_capture_download_dir or "").strip(),
+            self,
+        )
+        self.web_capture_dir_edit.setPlaceholderText(
+            "Used when mode is Manual"
+        )
+        web_dir_row.addWidget(self.web_capture_dir_edit, 1)
+        self.web_capture_dir_browse_btn = QPushButton("Browse...", self)
+        self.web_capture_dir_browse_btn.clicked.connect(self._on_browse_web_capture_dir)
+        web_dir_row.addWidget(self.web_capture_dir_browse_btn)
+        self.web_capture_dir_detect_btn = QPushButton("Detect", self)
+        self.web_capture_dir_detect_btn.clicked.connect(
+            self._on_detect_web_capture_dir
+        )
+        web_dir_row.addWidget(self.web_capture_dir_detect_btn)
+        layout.addLayout(web_dir_row)
+
+        self.web_capture_mode_combo.currentIndexChanged.connect(
+            self._sync_web_capture_dir_controls
+        )
+        self._sync_web_capture_dir_controls()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -125,7 +153,48 @@ class PerformanceSettingsDialog(QDialog):
             dir_cache_enabled=self.cache_enabled.isChecked(),
             dir_cache_max_entries=int(self.cache_max_spin.value()),
             startup_prewarm_mode=str(self.prewarm_mode_combo.currentData() or "minimal"),
+            web_capture_download_mode=str(
+                self.web_capture_mode_combo.currentData() or "auto"
+            ),
+            web_capture_download_dir=self.web_capture_dir_edit.text().strip(),
         )
+
+    def _on_browse_web_capture_dir(self) -> None:
+        current = self.web_capture_dir_edit.text().strip()
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Browser Downloads Folder",
+            current or str(Path.home() / "Downloads"),
+        )
+        if not selected:
+            return
+        self.web_capture_dir_edit.setText(selected)
+        idx = self.web_capture_mode_combo.findData("manual")
+        if idx >= 0:
+            self.web_capture_mode_combo.setCurrentIndex(idx)
+
+    def _on_detect_web_capture_dir(self) -> None:
+        detected = detect_browser_download_dir()
+        self.web_capture_dir_edit.setText(str(detected.download_dir))
+        idx = self.web_capture_mode_combo.findData("auto")
+        if idx >= 0:
+            self.web_capture_mode_combo.setCurrentIndex(idx)
+        QMessageBox.information(
+            self,
+            "Web Capture Detection",
+            (
+                f"Detected: {detected.browser_label}\n"
+                f"Folder: {detected.download_dir}\n"
+                f"Source: {detected.source}"
+            ),
+        )
+
+    def _sync_web_capture_dir_controls(self) -> None:
+        mode = str(self.web_capture_mode_combo.currentData() or "auto")
+        manual = mode == "manual"
+        self.web_capture_dir_edit.setEnabled(manual)
+        self.web_capture_dir_browse_btn.setEnabled(manual)
+        self.web_capture_dir_detect_btn.setEnabled(not manual)
 
     def _show_shortcuts(self) -> None:
         QMessageBox.information(

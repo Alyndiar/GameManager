@@ -501,7 +501,7 @@ class MainWindow(QMainWindow):
         self.template_alpha_btn = QPushButton("Tpl Alpha")
         self.repair_icon_paths_btn = QPushButton("Fix IcoPath")
         self.icon_settings_btn = QPushButton("Icon Src")
-        self.perf_btn = QPushButton("Perf")
+        self.perf_btn = QPushButton("Optns")
         self.move_backend_combo = QComboBox(self)
         self.move_backend_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
@@ -529,7 +529,7 @@ class MainWindow(QMainWindow):
             "Shortcut: Alt+X"
         )
         self.icon_settings_btn.setToolTip("Icon Provider Settings...\nShortcut: Alt+S")
-        self.perf_btn.setToolTip("Performance Settings...\nShortcut: Alt+P")
+        self.perf_btn.setToolTip("Options/Settings/Performance...\nShortcut: Alt+P")
         self.locate_teracopy_btn.setToolTip("Locate TeraCopy\nShortcut: Alt+L")
 
         compact_controls = [
@@ -1104,6 +1104,26 @@ class MainWindow(QMainWindow):
         normalized = normalize_background_removal_engine(value)
         self.state.set_ui_pref("icon_bg_removal_engine", normalized)
         self._request_gpu_status_update()
+
+    def _load_web_capture_download_dir_pref(self) -> str:
+        return self.state.get_ui_pref("web_capture_download_dir", "").strip()
+
+    def _save_web_capture_download_dir_pref(self, value: str) -> None:
+        self.state.set_ui_pref("web_capture_download_dir", str(value or "").strip())
+
+    def _load_web_capture_download_mode_pref(self) -> str:
+        mode = self.state.get_ui_pref("web_capture_download_mode", "").strip().casefold()
+        if mode in {"auto", "manual"}:
+            return mode
+        if self._load_web_capture_download_dir_pref():
+            return "manual"
+        return "auto"
+
+    def _save_web_capture_download_mode_pref(self, value: str) -> None:
+        normalized = str(value or "").strip().casefold()
+        if normalized not in {"auto", "manual"}:
+            normalized = "auto"
+        self.state.set_ui_pref("web_capture_download_mode", normalized)
 
     def _request_gpu_status_update(self) -> None:
         if self._gpu_status_process is not None:
@@ -2310,6 +2330,8 @@ class MainWindow(QMainWindow):
             startup_prewarm_mode=self.state.get_ui_pref(
                 "perf_startup_prewarm_mode", "minimal"
             ),
+            web_capture_download_mode=self._load_web_capture_download_mode_pref(),
+            web_capture_download_dir=self._load_web_capture_download_dir_pref(),
         )
         dialog = PerformanceSettingsDialog(initial, self)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -2320,6 +2342,8 @@ class MainWindow(QMainWindow):
         self.state.set_ui_pref("perf_dir_cache_enabled", "1" if payload.dir_cache_enabled else "0")
         self.state.set_ui_pref("perf_dir_cache_max_entries", str(payload.dir_cache_max_entries))
         self.state.set_ui_pref("perf_startup_prewarm_mode", payload.startup_prewarm_mode)
+        self._save_web_capture_download_mode_pref(payload.web_capture_download_mode)
+        self._save_web_capture_download_dir_pref(payload.web_capture_download_dir)
         QMessageBox.information(
             self,
             "Performance Settings",
@@ -2522,6 +2546,10 @@ class MainWindow(QMainWindow):
                     bg_removal_engine_saver=self._save_bg_engine_pref,
                     initial_border_shader=border_shader_pref,
                     border_shader_saver=self._save_border_shader_pref,
+                    initial_web_download_dir=self._load_web_capture_download_dir_pref(),
+                    web_download_dir_saver=self._save_web_capture_download_dir_pref,
+                    initial_web_download_mode=self._load_web_capture_download_mode_pref(),
+                    web_download_mode_saver=self._save_web_capture_download_mode_pref,
                     parent=self,
                 )
                 if dialog.exec() != dialog.DialogCode.Accepted:
