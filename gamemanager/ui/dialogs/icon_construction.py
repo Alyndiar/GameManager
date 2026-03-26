@@ -59,6 +59,24 @@ from gamemanager.services.icon_pipeline import (
     text_preserve_to_dict,
 )
 from gamemanager.ui.alpha_preview import composite_on_checkerboard, draw_checkerboard
+from .icon_construction_common import (
+    UPSCALE_METHOD_OPTIONS,
+    normalize_upscale_method as _normalize_upscale_method,
+    shader_swatch_css as _shader_swatch_css,
+    shader_tone_label as _shader_tone_label,
+)
+from .icon_construction_cutout_state import (
+    CUTOUT_FALLOFF_VALUES,
+    any_curve_mode_entries,
+    cutout_mode_uses_curve_strength,
+    default_curve_strength_for_mode,
+    load_cutout_falloff_settings,
+    load_cutout_picked_colors_state,
+    normalize_cutout_falloff,
+    normalize_cutout_scope,
+    serialize_cutout_picked_rows,
+    upsert_cutout_mark_point,
+)
 from .shared import (
     bind_dialog_shortcut as _bind_dialog_shortcut,
     icon_style_gallery_entries as _icon_style_gallery_entries,
@@ -72,36 +90,6 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     ImageFilter = None  # type: ignore[assignment]
     ImageOps = None  # type: ignore[assignment]
-
-
-def _shader_tone_label(mode: str) -> str:
-    return "Lightness" if mode == "hsl" else "Value"
-
-
-def _shader_swatch_css(rgb: tuple[int, int, int]) -> str:
-    red, green, blue = rgb
-    return (
-        "QPushButton {"
-        f" background-color: rgb({red}, {green}, {blue});"
-        " border: 1px solid #555;"
-        " min-width: 28px;"
-        " min-height: 18px;"
-        " }"
-    )
-
-
-UPSCALE_METHOD_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("Qt Smooth (fast)", "qt_smooth"),
-    ("Pillow Bicubic", "bicubic"),
-    ("Pillow Lanczos", "lanczos"),
-    ("Pillow Lanczos + Unsharp", "lanczos_unsharp"),
-)
-
-
-def _normalize_upscale_method(method: str | None) -> str:
-    value = str(method or "qt_smooth").strip().casefold()
-    valid = {item[1] for item in UPSCALE_METHOD_OPTIONS}
-    return value if value in valid else "qt_smooth"
 
 
 class BorderShaderControls(QWidget):
@@ -2523,109 +2511,27 @@ class IconFramingDialog(QDialog):
         self._apply_processing_settings()
 
     def _set_cutout_picked_colors_from_params(self, params: dict[str, object]) -> None:
-        normalized = normalize_background_removal_params(params)
-        entries = normalized.get("picked_colors", [])
-        items: list[dict[str, object]] = []
-        self._cutout_mark_history = {}
-        self._active_cutout_mark_row_id = None
-        if isinstance(entries, list):
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                color = entry.get("color")
-                if not isinstance(color, (list, tuple)) or len(color) < 3:
-                    continue
-                try:
-                    red = max(0, min(255, int(color[0])))
-                    green = max(0, min(255, int(color[1])))
-                    blue = max(0, min(255, int(color[2])))
-                    tolerance = max(0, min(30, int(entry.get("tolerance", 10) or 10)))
-                except (TypeError, ValueError):
-                    continue
-                scope = str(entry.get("scope", "global") or "global").strip().casefold()
-                if scope not in {"global", "contig"}:
-                    scope = "global"
-                falloff = str(entry.get("falloff", "flat") or "flat").strip().casefold()
-                if falloff not in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}:
-                    falloff = "flat"
-                include_seeds_raw = entry.get("include_seeds")
-                exclude_seeds_raw = entry.get("exclude_seeds")
-                include_seeds: list[list[float]] = []
-                exclude_seeds: list[list[float]] = []
-                if isinstance(include_seeds_raw, list):
-                    for seed in include_seeds_raw:
-                        if not isinstance(seed, (list, tuple)) or len(seed) < 2:
-                            continue
-                        try:
-                            sx = max(0.0, min(1.0, float(seed[0])))
-                            sy = max(0.0, min(1.0, float(seed[1])))
-                        except (TypeError, ValueError):
-                            continue
-                        packed = [sx, sy]
-                        if packed not in include_seeds:
-                            include_seeds.append(packed)
-                if isinstance(exclude_seeds_raw, list):
-                    for seed in exclude_seeds_raw:
-                        if not isinstance(seed, (list, tuple)) or len(seed) < 2:
-                            continue
-                        try:
-                            sx = max(0.0, min(1.0, float(seed[0])))
-                            sy = max(0.0, min(1.0, float(seed[1])))
-                        except (TypeError, ValueError):
-                            continue
-                        packed = [sx, sy]
-                        if packed not in exclude_seeds:
-                            exclude_seeds.append(packed)
-                row_id = self._cutout_row_uid_counter
-                self._cutout_row_uid_counter += 1
-                item = {
-                    "id": row_id,
-                    "color": [red, green, blue],
-                    "tolerance": tolerance,
-                    "scope": scope,
-                    "falloff": falloff,
-                    "include_seeds": include_seeds,
-                    "exclude_seeds": exclude_seeds,
-                }
-                if item not in items:
-                    items.append(item)
-                self._cutout_mark_history[row_id] = {"undo": [], "redo": []}
+        items, history, next_row_uid = load_cutout_picked_colors_state(
+            params,
+            self._cutout_row_uid_counter,
+        )
         self._cutout_picked_colors = items
-
-    @staticmethod
-    def _default_curve_strength_for_mode(mode: str) -> int:
-        token = str(mode or "").strip().casefold()
-        if token == "exp":
-            return 35
-        if token == "log":
-            return 65
-        if token == "gauss":
-            return 45
-        return 50
-
-    @staticmethod
-    def _cutout_mode_uses_curve_strength(mode: str) -> bool:
-        return str(mode or "").strip().casefold() in {"exp", "log", "gauss"}
+        self._cutout_mark_history = history
+        self._cutout_row_uid_counter = next_row_uid
+        self._active_cutout_mark_row_id = None
 
     def _set_cutout_falloff_settings_from_params(self, params: dict[str, object]) -> None:
-        normalized = normalize_background_removal_params(params)
+        advanced, strength = load_cutout_falloff_settings(params)
         blocked_adv = self.cutout_falloff_advanced_check.blockSignals(True)
-        self.cutout_falloff_advanced_check.setChecked(
-            bool(normalized.get("pick_colors_advanced", False))
-        )
+        self.cutout_falloff_advanced_check.setChecked(advanced)
         self.cutout_falloff_advanced_check.blockSignals(blocked_adv)
         blocked_curve = self.cutout_curve_strength_spin.blockSignals(True)
-        strength = int(normalized.get("pick_colors_curve_strength", 50) or 50)
-        self.cutout_curve_strength_spin.setValue(max(0, min(100, strength)))
+        self.cutout_curve_strength_spin.setValue(strength)
         self.cutout_curve_strength_spin.blockSignals(blocked_curve)
         self._sync_cutout_falloff_controls()
 
     def _cutout_any_curve_mode_entries(self) -> bool:
-        for entry in self._cutout_picked_colors:
-            mode = str(entry.get("falloff", "flat") or "flat")
-            if self._cutout_mode_uses_curve_strength(mode):
-                return True
-        return False
+        return any_curve_mode_entries(self._cutout_picked_colors)
 
     def _sync_cutout_falloff_controls(self) -> None:
         show_curve = (
@@ -2782,22 +2688,6 @@ class IconFramingDialog(QDialog):
         self._update_cutout_mark_controls()
         self._apply_processing_settings()
 
-    def _upsert_cutout_mark_point(
-        self,
-        points: list[list[float]],
-        point: tuple[float, float],
-    ) -> None:
-        x_new, y_new = point
-        for idx, existing in enumerate(points):
-            if not isinstance(existing, (list, tuple)) or len(existing) < 2:
-                continue
-            if abs(float(existing[0]) - x_new) <= 0.002 and abs(float(existing[1]) - y_new) <= 0.002:
-                points[idx] = [x_new, y_new]
-                return
-        points.append([x_new, y_new])
-        if len(points) > 512:
-            del points[0]
-
     def _on_canvas_cutout_mark_point(self, value: object) -> None:
         if self._cutout_mark_mode not in {"add", "remove"}:
             return
@@ -2815,11 +2705,11 @@ class IconFramingDialog(QDialog):
         if self._cutout_mark_mode == "add":
             include_points = entry.setdefault("include_seeds", [])
             if isinstance(include_points, list):
-                self._upsert_cutout_mark_point(include_points, point)
+                upsert_cutout_mark_point(include_points, point)
         else:
             exclude_points = entry.setdefault("exclude_seeds", [])
             if isinstance(exclude_points, list):
-                self._upsert_cutout_mark_point(exclude_points, point)
+                upsert_cutout_mark_point(exclude_points, point)
         after = self._cutout_mark_snapshot(entry)
         if after != before:
             self._push_cutout_mark_undo_snapshot(row_id, before)
@@ -2960,7 +2850,7 @@ class IconFramingDialog(QDialog):
             falloff_combo.addItem("Gauss", "gauss")
             falloff_value = str(entry.get("falloff", "flat") or "flat").strip().casefold()
             falloff_idx = falloff_combo.findData(
-                falloff_value if falloff_value in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"} else "flat"
+                falloff_value if falloff_value in CUTOUT_FALLOFF_VALUES else "flat"
             )
             if falloff_idx >= 0:
                 falloff_combo.setCurrentIndex(falloff_idx)
@@ -3025,9 +2915,7 @@ class IconFramingDialog(QDialog):
     def _on_cutout_pick_scope_changed(self, index: int, scope_value: str) -> None:
         if index < 0 or index >= len(self._cutout_picked_colors):
             return
-        normalized = str(scope_value or "global").strip().casefold()
-        if normalized not in {"global", "contig"}:
-            normalized = "global"
+        normalized = normalize_cutout_scope(scope_value)
         self._cutout_picked_colors[index]["scope"] = normalized
         row_id = int(self._cutout_picked_colors[index].get("id", -1))
         if normalized != "contig" and self._active_cutout_mark_row_id == row_id:
@@ -3039,15 +2927,13 @@ class IconFramingDialog(QDialog):
     def _on_cutout_pick_falloff_changed(self, index: int, falloff_value: str) -> None:
         if index < 0 or index >= len(self._cutout_picked_colors):
             return
-        falloff = str(falloff_value or "flat").strip().casefold()
-        if falloff not in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}:
-            falloff = "flat"
+        falloff = normalize_cutout_falloff(falloff_value)
         self._cutout_picked_colors[index]["falloff"] = falloff
         if (
-            self._cutout_mode_uses_curve_strength(falloff)
+            cutout_mode_uses_curve_strength(falloff)
             and not self.cutout_falloff_advanced_check.isChecked()
         ):
-            self.cutout_curve_strength_spin.setValue(self._default_curve_strength_for_mode(falloff))
+            self.cutout_curve_strength_spin.setValue(default_curve_strength_for_mode(falloff))
         self._sync_cutout_falloff_controls()
         self._on_cutout_params_changed()
 
@@ -3708,35 +3594,7 @@ class IconFramingDialog(QDialog):
     def selected_bg_removal_params(self) -> dict[str, object]:
         advanced = bool(self.cutout_falloff_advanced_check.isChecked())
         curve_strength = int(self.cutout_curve_strength_spin.value()) if advanced else 50
-        picked_rows: list[dict[str, object]] = []
-        for entry in self._cutout_picked_colors:
-            color = entry.get("color", [0, 0, 0])
-            scope = str(entry.get("scope", "global") or "global").strip().casefold()
-            if scope not in {"global", "contig"}:
-                scope = "global"
-            falloff = str(entry.get("falloff", "flat") or "flat").strip().casefold()
-            if falloff not in {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}:
-                falloff = "flat"
-            include_seeds = (
-                list(entry.get("include_seeds", []))
-                if isinstance(entry.get("include_seeds"), list)
-                else []
-            )
-            exclude_seeds = (
-                list(entry.get("exclude_seeds", []))
-                if isinstance(entry.get("exclude_seeds"), list)
-                else []
-            )
-            picked_rows.append(
-                {
-                    "color": list(color) if isinstance(color, (list, tuple)) else [0, 0, 0],
-                    "tolerance": int(entry.get("tolerance", 10) or 10),
-                    "scope": scope,
-                    "falloff": falloff,
-                    "include_seeds": include_seeds,
-                    "exclude_seeds": exclude_seeds,
-                }
-            )
+        picked_rows = serialize_cutout_picked_rows(self._cutout_picked_colors)
         payload: dict[str, object] = {
             "alpha_matting": self.alpha_matting_check.isChecked(),
             "alpha_matting_foreground_threshold": int(self.fg_threshold_spin.value()),
