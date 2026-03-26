@@ -87,3 +87,26 @@ def test_process_template_file_writes_png_output(tmp_path: Path) -> None:
     out = Image.open(output_path).convert("RGBA")
     assert out.getchannel("A").getpixel((0, 0)) == 0
     assert out.getchannel("A").getpixel((3, 3)) == 255
+
+
+def test_falloff_lin_applies_partial_alpha_within_tolerance_band() -> None:
+    image = Image.new("RGBA", (3, 1), (0, 0, 0, 255))
+    px = image.load()
+    px[0, 0] = (0, 0, 0, 255)
+    px[1, 0] = (15, 15, 15, 255)
+    px[2, 0] = (40, 40, 40, 255)
+
+    payload = make_background_transparent(
+        _png_bytes(image),
+        options=TemplateTransparencyOptions(
+            threshold=20,
+            falloff_mode="lin",
+            use_edge_flood_fill=False,
+            use_center_flood_fill=False,
+        ),
+        background_color=(0, 0, 0),
+    )
+    alpha = _read_alpha(payload)
+    assert alpha.getpixel((0, 0)) == 0
+    assert 0 < alpha.getpixel((1, 0)) < 255
+    assert alpha.getpixel((2, 0)) == 255

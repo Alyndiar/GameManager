@@ -9,11 +9,18 @@ import sys
 import traceback
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
-from gamemanager.app_state import AppState
-from gamemanager.ui.main_window import MainWindow
-
+from gamemanager.runtime import (
+    DEFAULT_ICONMAKER_GAMEMANAGER_MUTEX,
+    AppInstanceLock,
+    show_already_running_message,
+)
+from gamemanager.services.persistent_workers import (
+    ensure_persistent_icon_workers_async,
+    shutdown_persistent_icon_workers,
+)
 _CRASH_LOG_HANDLE = None
 
 
@@ -155,17 +162,38 @@ def _enable_crash_logging(data_dir: Path) -> None:
 
 
 def run() -> int:
+    instance_lock = AppInstanceLock(DEFAULT_ICONMAKER_GAMEMANAGER_MUTEX)
+    if not instance_lock.acquire():
+        show_already_running_message(
+            current_app_name="GameManager",
+            other_app_name="GameManager or IconMaker",
+        )
+        return 1
+    state = None
+    window = None
     _configure_runtime_noise_controls()
     db_path = _default_db_path()
     _enable_crash_logging(db_path.parent)
     app = QApplication(sys.argv)
+    app.aboutToQuit.connect(shutdown_persistent_icon_workers)
+    try:
+        from gamemanager.app_state import AppState
+        from gamemanager.ui.main_window import MainWindow
+    except Exception:
+        instance_lock.release()
+        raise
     state = AppState(db_path)
     window = MainWindow(state)
     screen = app.primaryScreen()
     if screen is not None:
         window.setGeometry(screen.availableGeometry())
     window.showMaximized()
-    return app.exec()
+    QTimer.singleShot(1200, lambda: ensure_persistent_icon_workers_async(worker_count=2))
+    try:
+        return app.exec()
+    finally:
+        shutdown_persistent_icon_workers()
+        instance_lock.release()
 
 
 if __name__ == "__main__":

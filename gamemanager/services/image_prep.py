@@ -42,6 +42,9 @@ class ImagePrepOptions:
     background_color_rgb: tuple[int, int, int] = (0, 0, 0)
     background_tolerance: int | None = None  # 0..30; None falls back to min_black_level
     background_use_hsv: bool = True
+    background_falloff_mode: str = "flat"
+    background_curve_strength: int = 50
+    background_use_center_flood_fill: bool = False
     min_black_level: int = 0
     overwrite: bool = False
     recursive: bool = False
@@ -248,6 +251,9 @@ def apply_background_color_transparency(
     tolerance: int = 0,
     custom_color_rgb: tuple[int, int, int] | list[int] | None = None,
     use_hsv_for_custom: bool = True,
+    falloff_mode: str = "flat",
+    curve_strength: int = 50,
+    use_center_flood_fill: bool = False,
 ) -> bytes:
     base_color, level, color_space = resolve_background_removal_config(
         mode=mode,
@@ -266,7 +272,10 @@ def apply_background_color_transparency(
             threshold=level,
             color_tolerance_mode="max",
             compare_color_space=color_space,
+            falloff_mode=str(falloff_mode or "flat"),
+            curve_strength=max(0, min(100, int(curve_strength))),
             use_edge_flood_fill=True,
+            use_center_flood_fill=bool(use_center_flood_fill),
             preserve_existing_alpha=True,
         ),
         background_color=base_color,
@@ -284,6 +293,9 @@ def apply_min_black_transparency(
         tolerance=min_black_level,
         custom_color_rgb=(0, 0, 0),
         use_hsv_for_custom=False,
+        falloff_mode="flat",
+        curve_strength=50,
+        use_center_flood_fill=False,
     )
 
 
@@ -452,6 +464,9 @@ def prepare_images_to_512_png(
                 tolerance=tolerance,
                 custom_color_rgb=opts.background_color_rgb,
                 use_hsv_for_custom=bool(opts.background_use_hsv),
+                falloff_mode=str(opts.background_falloff_mode),
+                curve_strength=int(opts.background_curve_strength),
+                use_center_flood_fill=bool(opts.background_use_center_flood_fill),
             )
             normalized = normalize_to_square_png(
                 image_bytes,
@@ -531,6 +546,9 @@ def prepare_images_to_template_folder(
                 tolerance=tolerance,
                 custom_color_rgb=opts.background_color_rgb,
                 use_hsv_for_custom=bool(opts.background_use_hsv),
+                falloff_mode=str(opts.background_falloff_mode),
+                curve_strength=int(opts.background_curve_strength),
+                use_center_flood_fill=bool(opts.background_use_center_flood_fill),
             )
             normalized = normalize_to_square_png(
                 image_bytes,
