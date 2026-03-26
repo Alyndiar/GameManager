@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
-from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -46,31 +45,26 @@ from gamemanager.app_state import AppState
 from gamemanager.models import InventoryItem, MovePlanItem, OperationReport, RootDisplayInfo
 from gamemanager.services.cancellation import OperationCancelled
 from gamemanager.services.icon_cache import icon_cache_key
-from gamemanager.services.icon_pipeline import (
-    border_shader_to_dict,
-    normalize_border_shader_config,
-    normalize_icon_style,
-)
 from gamemanager.services.icon_sources import IconSearchSettings
 from gamemanager.services.background_removal import normalize_background_removal_engine
 from gamemanager.services.normalization import cleaned_name_from_full
-from gamemanager.services.sorting import natural_key
-from gamemanager.services.storage import mountpoint_sort_key
 from gamemanager.services.teracopy import DEFAULT_TERACOPY_PATH, resolve_teracopy_path
 from gamemanager.ui.dialogs import (
     CleanupPreviewDialog,
     DeleteGroupDialog,
-    IconConverterDialog,
-    IconPickerDialog,
-    TemplatePrepDialog,
     PerformanceSettingsDialog,
     PerformanceSettingsResult,
     IconProviderSettingsDialog,
     IconProviderSettingsResult,
     MovePreviewDialog,
     TagReviewDialog,
-    TemplateTransparencyDialog,
 )
+from gamemanager.ui.main_window_infotip_ops import MainWindowInfoTipOpsMixin
+from gamemanager.ui.main_window_inventory_ops import MainWindowInventoryOpsMixin
+from gamemanager.ui.main_window_icon_ops import MainWindowIconOpsMixin
+from gamemanager.ui.main_window_operation_ops import MainWindowOperationOpsMixin
+from gamemanager.ui.main_window_prewarm_ops import MainWindowPrewarmOpsMixin
+from gamemanager.ui.main_window_refresh_ops import MainWindowRefreshOpsMixin
 from gamemanager.ui.alpha_preview import composite_on_checkerboard
 
 
@@ -159,18 +153,6 @@ def _column_index_for_field(field_name: str) -> int:
     return 1
 
 
-def _build_sort_chain(primary_field: str, primary_ascending: bool) -> list[tuple[str, bool]]:
-    ordered = [(primary_field, primary_ascending)] + DEFAULT_RIGHT_SORT_CHAIN
-    seen: set[str] = set()
-    chain: list[tuple[str, bool]] = []
-    for field, asc in ordered:
-        if field in seen:
-            continue
-        seen.add(field)
-        chain.append((field, asc))
-    return chain
-
-
 def _filter_only_duplicate_cleaned_names(items: list[InventoryItem]) -> list[InventoryItem]:
     counts = Counter(item.cleaned_name.strip().casefold() for item in items)
     return [
@@ -186,15 +168,6 @@ def _filter_by_root_id(
     if selected_root_id is None:
         return items
     return [item for item in items if item.root_id == selected_root_id]
-
-
-def _filter_by_cleaned_name_query(
-    items: list[InventoryItem], query_text: str
-) -> list[InventoryItem]:
-    needle = query_text.strip().casefold()
-    if not needle:
-        return items
-    return [item for item in items if needle in item.cleaned_name.casefold()]
 
 
 class FlowLayout(QLayout):
@@ -394,11 +367,24 @@ class InfoTipBackfillWorker(QObject):
             self.finished.emit()
 
 
-class MainWindow(QMainWindow):
+class MainWindow(
+    MainWindowPrewarmOpsMixin,
+    MainWindowRefreshOpsMixin,
+    MainWindowInventoryOpsMixin,
+    MainWindowOperationOpsMixin,
+    MainWindowInfoTipOpsMixin,
+    MainWindowIconOpsMixin,
+    QMainWindow,
+):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
         self.setWindowTitle("Game Backup Manager")
+        self._left_sort_options = LEFT_SORT_OPTIONS
+        self._left_label_options = LEFT_LABEL_OPTIONS
+        self._right_columns = RIGHT_COLUMNS
+        self._icon_view_sizes = ICON_VIEW_SIZES
+        self._default_right_sort_chain = DEFAULT_RIGHT_SORT_CHAIN
         self.root_infos: list[RootDisplayInfo] = []
         self.inventory: list[InventoryItem] = []
         self._refresh_needed = False
@@ -436,6 +422,9 @@ class MainWindow(QMainWindow):
         self._operation_in_progress = False
         self._operation_title = ""
         self._operation_complete_handler: Callable[[OperationReport], None] | None = None
+        self._report_worker_cls = ReportWorker
+        self._refresh_worker_cls = RefreshWorker
+        self._infotip_backfill_worker_cls = InfoTipBackfillWorker
         self._interactive_operation_active = False
         self._interactive_cancel_requested = False
         self._ml_prewarm_started = False
@@ -748,33 +737,79 @@ class MainWindow(QMainWindow):
         self.splitter.setSizes([300, 1000])
 
         self.setCentralWidget(root)
+        self.statusBar().setStyleSheet("QStatusBar::item { border: none; }")
         self._status_left_label = QLabel("", self)
         self._status_left_label.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self.statusBar().addWidget(self._status_left_label, 1)
+        self._status_operation_sep = QFrame(self)
+        self._status_operation_sep.setFrameShape(QFrame.Shape.VLine)
+        self._status_operation_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._status_operation_sep.setLineWidth(1)
+        self._status_operation_sep.setMidLineWidth(0)
+        self._status_operation_sep.setStyleSheet("color: rgba(220,220,220,110);")
+        self.statusBar().addPermanentWidget(self._status_operation_sep, 0)
         self._status_operation_label = QLabel("", self)
         self._status_operation_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        self._status_operation_label.setMinimumWidth(260)
+        self._status_operation_label.setMinimumWidth(220)
         self.statusBar().addPermanentWidget(self._status_operation_label, 0)
+
+        self._status_background_sep = QFrame(self)
+        self._status_background_sep.setFrameShape(QFrame.Shape.VLine)
+        self._status_background_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._status_background_sep.setLineWidth(1)
+        self._status_background_sep.setMidLineWidth(0)
+        self._status_background_sep.setStyleSheet("color: rgba(220,220,220,110);")
+        self.statusBar().addPermanentWidget(self._status_background_sep, 0)
         self._status_background_label = QLabel("", self)
         self._status_background_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        self._status_background_label.setMinimumWidth(240)
+        self._status_background_label.setMinimumWidth(220)
         self.statusBar().addPermanentWidget(self._status_background_label, 0)
-        self._status_gpu_label = QLabel("| GPU: Checking...", self)
+
+        self._status_gpu_sep = QFrame(self)
+        self._status_gpu_sep.setFrameShape(QFrame.Shape.VLine)
+        self._status_gpu_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._status_gpu_sep.setLineWidth(1)
+        self._status_gpu_sep.setMidLineWidth(0)
+        self._status_gpu_sep.setStyleSheet("color: rgba(220,220,220,110);")
+        self.statusBar().addPermanentWidget(self._status_gpu_sep, 0)
+        self._status_gpu_label = QLabel("GPU: Checking...", self)
         self._status_gpu_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self.statusBar().addPermanentWidget(self._status_gpu_label, 0)
-        self._status_selected_label = QLabel("| Selected: 0 games, 0 B", self)
+
+        self._status_vram_sep = QFrame(self)
+        self._status_vram_sep.setFrameShape(QFrame.Shape.VLine)
+        self._status_vram_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._status_vram_sep.setLineWidth(1)
+        self._status_vram_sep.setMidLineWidth(0)
+        self._status_vram_sep.setStyleSheet("color: rgba(220,220,220,110);")
+        self.statusBar().addPermanentWidget(self._status_vram_sep, 0)
+        self._status_vram_label = QLabel("", self)
+        self._status_vram_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.statusBar().addPermanentWidget(self._status_vram_label, 0)
+
+        self._status_selected_sep = QFrame(self)
+        self._status_selected_sep.setFrameShape(QFrame.Shape.VLine)
+        self._status_selected_sep.setFrameShadow(QFrame.Shadow.Plain)
+        self._status_selected_sep.setLineWidth(1)
+        self._status_selected_sep.setMidLineWidth(0)
+        self._status_selected_sep.setStyleSheet("color: rgba(220,220,220,110);")
+        self.statusBar().addPermanentWidget(self._status_selected_sep, 0)
+        self._status_selected_label = QLabel("Selected: 0 games, 0 B", self)
         self._status_selected_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self.statusBar().addPermanentWidget(self._status_selected_label, 0)
+        self._refresh_status_section_visibility()
         self._wire_events()
         self._setup_shortcuts()
         app = QApplication.instance()
@@ -785,143 +820,6 @@ class MainWindow(QMainWindow):
         self._update_cancel_button_state()
         self.refresh_all()
         QTimer.singleShot(0, self._apply_initial_splitter_sizes)
-
-    def _start_ml_prewarm(self) -> None:
-        self._prewarm_scheduled = False
-        if self._ml_prewarm_started or self._prewarm_in_progress:
-            return
-        mode = self._startup_prewarm_mode()
-        if mode == "off":
-            self._ml_prewarm_started = True
-            return
-        resources = self._prewarm_resource_ids_for_mode(mode)
-        if not resources:
-            self._ml_prewarm_started = True
-            return
-        self._ml_prewarm_started = True
-        self._prewarm_in_progress = True
-        self._set_background_progress("Preload models", 0, len(resources))
-        process = QProcess(self)
-        process.setProgram(sys.executable)
-        process.setArguments(
-            [
-                "-m",
-                "gamemanager.services.prewarm_subprocess",
-                "--worker",
-                "--resources-json",
-                json.dumps(resources, ensure_ascii=False),
-            ]
-        )
-        process.setWorkingDirectory(str(Path(__file__).resolve().parents[2]))
-        self._prewarm_stdout_buffer = ""
-        self._prewarm_stderr_buffer = ""
-        process.readyReadStandardOutput.connect(self._on_prewarm_stdout_ready)
-        process.readyReadStandardError.connect(self._on_prewarm_stderr_ready)
-        process.errorOccurred.connect(self._on_prewarm_process_error)
-        process.finished.connect(self._on_prewarm_process_finished)
-        self._prewarm_process = process
-        process.start()
-
-    def _startup_prewarm_mode(self) -> str:
-        value = self.state.get_ui_pref("perf_startup_prewarm_mode", "minimal").strip().casefold()
-        if value in {"off", "minimal", "full"}:
-            return value
-        return "minimal"
-
-    def _prewarm_resource_ids_for_mode(self, mode: str) -> list[str]:
-        mode_key = str(mode or "minimal").strip().casefold()
-        if mode_key == "off":
-            return []
-        if mode_key == "full":
-            return ["torch_runtime", "background_stack", "text_stack"]
-
-        resources = ["torch_runtime"]
-        bg_engine = normalize_background_removal_engine(
-            self.state.get_ui_pref("icon_bg_removal_engine", "none")
-        )
-        if bg_engine == "rembg":
-            resources.append("background_rembg")
-        elif bg_engine == "bria_rmbg":
-            resources.append("background_bria")
-
-        text_method = self.state.get_ui_pref("icon_text_extraction_method", "none").strip().casefold()
-        if text_method == "paddleocr":
-            resources.append("text_paddle")
-        elif text_method == "opencv_db":
-            resources.append("text_opencv")
-
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for item in resources:
-            if item in seen:
-                continue
-            seen.add(item)
-            ordered.append(item)
-        return ordered
-
-    def _schedule_startup_prewarm_if_ready(self) -> None:
-        if self._ml_prewarm_started or self._prewarm_in_progress or self._prewarm_scheduled:
-            return
-        if not self._first_show_done or not self._initial_refresh_done:
-            return
-        if self._startup_prewarm_mode() == "off":
-            self._ml_prewarm_started = True
-            return
-        self._prewarm_scheduled = True
-        self._set_background_progress("Preload scheduled", 0, 1)
-        self._prewarm_delay_timer.start(1500)
-
-    def _on_prewarm_stdout_ready(self) -> None:
-        if self._prewarm_process is None:
-            return
-        text = bytes(self._prewarm_process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        if not text:
-            return
-        self._prewarm_stdout_buffer += text
-        lines = self._prewarm_stdout_buffer.splitlines()
-        if self._prewarm_stdout_buffer and not self._prewarm_stdout_buffer.endswith(("\n", "\r")):
-            self._prewarm_stdout_buffer = lines.pop() if lines else self._prewarm_stdout_buffer
-        else:
-            self._prewarm_stdout_buffer = ""
-        for raw in lines:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = str(payload.get("type") or "")
-            if kind == "progress":
-                self._on_prewarm_progress(
-                    str(payload.get("stage") or "Preload"),
-                    int(payload.get("current") or 0),
-                    int(payload.get("total") or 0),
-                )
-            elif kind == "done":
-                self._on_prewarm_completed(str(payload.get("message") or "Preload complete"))
-            elif kind == "error":
-                self._on_prewarm_failed(str(payload.get("message") or "Preload failed"))
-            elif kind == "warning":
-                self._set_background_progress(str(payload.get("message") or "Preload warning"), 1, 1)
-
-    def _on_prewarm_stderr_ready(self) -> None:
-        if self._prewarm_process is None:
-            return
-        text = bytes(self._prewarm_process.readAllStandardError()).decode("utf-8", errors="replace")
-        if text:
-            self._prewarm_stderr_buffer += text
-
-    def _on_prewarm_process_error(self, error: QProcess.ProcessError) -> None:
-        if self._prewarm_process is None:
-            return
-        self._on_prewarm_failed(f"Preload process error: {int(error)}")
-        self._on_prewarm_finished()
-
-    def _on_prewarm_process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
-        if exit_code != 0 and self._prewarm_stderr_buffer.strip():
-            self._on_prewarm_failed(self._prewarm_stderr_buffer.strip().splitlines()[-1])
-        self._on_prewarm_finished()
 
     def _wire_events(self) -> None:
         self.add_root_btn.clicked.connect(self._on_add_root)
@@ -1097,34 +995,6 @@ class MainWindow(QMainWindow):
         self._teracopy_executable = resolve_teracopy_path(self._teracopy_path_pref)
         self._update_move_backend_ui()
 
-    def _save_icon_style_pref(self, value: str) -> None:
-        self.state.set_ui_pref("icon_style", value.strip() or "none")
-
-    def _save_bg_engine_pref(self, value: str) -> None:
-        normalized = normalize_background_removal_engine(value)
-        self.state.set_ui_pref("icon_bg_removal_engine", normalized)
-        self._request_gpu_status_update()
-
-    def _load_web_capture_download_dir_pref(self) -> str:
-        return self.state.get_ui_pref("web_capture_download_dir", "").strip()
-
-    def _save_web_capture_download_dir_pref(self, value: str) -> None:
-        self.state.set_ui_pref("web_capture_download_dir", str(value or "").strip())
-
-    def _load_web_capture_download_mode_pref(self) -> str:
-        mode = self.state.get_ui_pref("web_capture_download_mode", "").strip().casefold()
-        if mode in {"auto", "manual"}:
-            return mode
-        if self._load_web_capture_download_dir_pref():
-            return "manual"
-        return "auto"
-
-    def _save_web_capture_download_mode_pref(self, value: str) -> None:
-        normalized = str(value or "").strip().casefold()
-        if normalized not in {"auto", "manual"}:
-            normalized = "auto"
-        self.state.set_ui_pref("web_capture_download_mode", normalized)
-
     def _request_gpu_status_update(self) -> None:
         if self._gpu_status_process is not None:
             self._gpu_status_update_pending = True
@@ -1132,7 +1002,8 @@ class MainWindow(QMainWindow):
         bg_engine = normalize_background_removal_engine(
             self.state.get_ui_pref("icon_bg_removal_engine", "none")
         )
-        self._status_gpu_label.setText("| GPU: Checking...")
+        self._set_status_section_text(self._status_gpu_label, self._status_gpu_sep, "GPU: Checking...")
+        self._set_status_section_text(self._status_vram_label, self._status_vram_sep, "")
         process = QProcess(self)
         process.setProgram(sys.executable)
         process.setArguments(
@@ -1192,17 +1063,24 @@ class MainWindow(QMainWindow):
                     parsed = parsed_obj
                     break
         if parsed and parsed.get("type") == "gpu_status":
-            summary = str(parsed.get("summary") or "| GPU: Unknown")
+            summary = str(parsed.get("summary") or "GPU: Unknown")
+            vram_summary = str(parsed.get("vram_summary") or "")
             tooltip = str(parsed.get("tooltip") or "")
-            self._status_gpu_label.setText(summary)
+            self._set_status_section_text(self._status_gpu_label, self._status_gpu_sep, summary)
+            self._set_status_section_text(self._status_vram_label, self._status_vram_sep, vram_summary)
             self._status_gpu_label.setToolTip(tooltip)
+            self._status_vram_label.setToolTip(tooltip)
         elif parsed and parsed.get("type") == "error":
             message = str(parsed.get("message") or "status probe failed")
-            self._status_gpu_label.setText("| GPU: Probe failed")
+            self._set_status_section_text(self._status_gpu_label, self._status_gpu_sep, "GPU: Probe failed")
+            self._set_status_section_text(self._status_vram_label, self._status_vram_sep, "")
             self._status_gpu_label.setToolTip(message)
+            self._status_vram_label.setToolTip("")
         else:
-            self._status_gpu_label.setText("| GPU: Probe failed")
+            self._set_status_section_text(self._status_gpu_label, self._status_gpu_sep, "GPU: Probe failed")
+            self._set_status_section_text(self._status_vram_label, self._status_vram_sep, "")
             self._status_gpu_label.setToolTip(err_text or payload_text or "Unknown probe error")
+            self._status_vram_label.setToolTip("")
         if self._gpu_status_update_pending:
             self._gpu_status_update_pending = False
             QTimer.singleShot(0, self._request_gpu_status_update)
@@ -2027,175 +1905,6 @@ class MainWindow(QMainWindow):
         self._update_cancel_button_state()
         self._finish_teracopy_session()
 
-    def _run_infotip_refresh_operation(
-        self,
-        targets: list[tuple[str, str]],
-        *,
-        title: str,
-        show_summary: bool = True,
-    ) -> bool:
-        normalized_targets = [
-            (os.path.normpath(path), (name or "").strip())
-            for path, name in targets
-            if str(path).strip() and str(name).strip()
-        ]
-        if not normalized_targets:
-            return False
-
-        def _run(progress_cb, should_cancel):
-            report = OperationReport(total=len(normalized_targets))
-            total = len(normalized_targets)
-            for idx, (folder_path, cleaned_name) in enumerate(normalized_targets, start=1):
-                if should_cancel():
-                    raise OperationCancelled("InfoTip refresh canceled.")
-                progress_cb("Refresh InfoTip", idx - 1, total)
-                try:
-                    updated, tip = self.state.ensure_folder_info_tip(
-                        folder_path,
-                        cleaned_name,
-                        overwrite_existing=True,
-                        force_refresh=True,
-                    )
-                except Exception as exc:
-                    report.failed += 1
-                    report.details.append(f"{cleaned_name}: {exc}")
-                    continue
-                if tip:
-                    if updated:
-                        report.succeeded += 1
-                    else:
-                        report.skipped += 1
-                    continue
-                report.failed += 1
-                report.details.append(f"{cleaned_name}: no description found")
-            progress_cb("Refresh InfoTip", total, total)
-            return report
-
-        def _done(report: OperationReport) -> None:
-            if show_summary:
-                lines = [
-                    f"Attempted: {report.total}",
-                    f"Updated: {report.succeeded}",
-                    f"Unchanged: {report.skipped}",
-                    f"Failed: {report.failed}",
-                ]
-                if report.details:
-                    lines.append("")
-                    lines.extend(report.details[:8])
-                QMessageBox.information(self, "InfoTip Refresh", "\n".join(lines))
-            self.refresh_all()
-
-        return self._start_report_operation(title, _run, _done)
-
-    def _on_refresh_selected_infotips(self) -> None:
-        selected = [item for item in self._selected_right_entries() if item.is_dir]
-        if not selected:
-            QMessageBox.information(
-                self,
-                "InfoTip Refresh",
-                "Select at least one game folder first.",
-            )
-            return
-        targets = [
-            (
-                entry.full_path,
-                (entry.cleaned_name or entry.full_name).strip(),
-            )
-            for entry in selected
-            if entry.icon_status == "valid"
-        ]
-        if not targets:
-            QMessageBox.information(
-                self,
-                "InfoTip Refresh",
-                "Selected entries do not have folder icons yet.",
-            )
-            return
-        self._run_infotip_refresh_operation(
-            targets,
-            title="Refresh InfoTips",
-            show_summary=True,
-        )
-
-    def _refresh_visible_entry_tooltip(self, full_path: str) -> None:
-        normalized = os.path.normpath(full_path)
-        root_info_by_id = {info.root_id: info for info in self.root_infos}
-        for row, entry in enumerate(self._visible_right_items):
-            if os.path.normpath(entry.full_path) != normalized:
-                continue
-            tooltip = self._entry_tooltip_text(
-                entry,
-                self._source_for_item(entry, root_info_by_id),
-            )
-            for col in range(len(RIGHT_COLUMNS)):
-                cell = self.right_table.item(row, col)
-                if cell is not None:
-                    cell.setToolTip(tooltip)
-            tile = self.right_icon_list.item(row)
-            if tile is not None:
-                tile.setToolTip(tooltip)
-            break
-
-    def _on_edit_selected_infotip(self) -> None:
-        selected = [item for item in self._selected_right_entries() if item.is_dir]
-        if len(selected) != 1:
-            QMessageBox.information(
-                self,
-                "Manual InfoTip Entry",
-                "Select exactly one game folder to edit its InfoTip.",
-            )
-            return
-        entry = selected[0]
-        if entry.icon_status != "valid":
-            QMessageBox.information(
-                self,
-                "Manual InfoTip Entry",
-                "The selected game does not have a folder icon yet.",
-            )
-            return
-        current_tip = (entry.info_tip or "").strip()
-        new_tip, ok = QInputDialog.getMultiLineText(
-            self,
-            "Manual InfoTip Entry",
-            "InfoTip:",
-            current_tip,
-        )
-        if not ok:
-            return
-        normalized_tip = new_tip.strip()
-        if not normalized_tip:
-            QMessageBox.warning(
-                self,
-                "Manual InfoTip Entry",
-                "InfoTip cannot be empty.",
-            )
-            return
-        cleaned = (entry.cleaned_name or entry.full_name).strip()
-        try:
-            changed = self.state.set_manual_folder_info_tip(
-                entry.full_path,
-                cleaned,
-                normalized_tip,
-            )
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Manual InfoTip Entry",
-                f"Could not update InfoTip:\n{exc}",
-            )
-            return
-        if not changed:
-            QMessageBox.warning(
-                self,
-                "Manual InfoTip Entry",
-                "Could not update InfoTip on disk.",
-            )
-            return
-        target = self._find_inventory_item_by_path(entry.full_path) or entry
-        target.info_tip = normalized_tip
-        self._refresh_visible_entry_tooltip(entry.full_path)
-        self._update_counts_status()
-
     def _on_manual_rename_selected_entry(self) -> None:
         selected = self._selected_right_entries()
         if len(selected) != 1:
@@ -2447,312 +2156,6 @@ class MainWindow(QMainWindow):
                 return item
         return None
 
-    def _apply_icon_result_to_entry(
-        self,
-        entry: InventoryItem,
-        ico_path: str | None,
-        desktop_ini_path: str | None,
-        info_tip: str | None = None,
-    ) -> None:
-        target = self._find_inventory_item_by_path(entry.full_path) or entry
-        target.icon_status = "valid"
-        target.folder_icon_path = os.path.normpath(ico_path) if ico_path else target.folder_icon_path
-        target.desktop_ini_path = os.path.normpath(desktop_ini_path) if desktop_ini_path else target.desktop_ini_path
-        if info_tip is not None and info_tip.strip():
-            target.info_tip = info_tip.strip()
-        try:
-            stat = Path(target.full_path).stat()
-            target.modified_at = datetime.fromtimestamp(stat.st_mtime)
-            # Preserve current aggregate size value and pin it to new dir mtime in cache.
-            if target.is_dir:
-                self.state.remember_directory_size(
-                    target.full_path,
-                    target.size_bytes,
-                    mtime_ns=int(stat.st_mtime_ns),
-                )
-        except OSError:
-            return
-
-    def _on_assign_folder_icon_selected(self) -> None:
-        selected = [item for item in self._selected_right_entries() if item.is_dir]
-        if not selected:
-            QMessageBox.information(
-                self,
-                "No Folder Selected",
-                "Select one or more folder rows to assign an icon.",
-            )
-            return
-
-        allow_replace_existing = len(selected) == 1
-        selected_count = len(selected)
-        cancelled = 0
-        cancel_all_requested = False
-        skipped = 0
-        applied = 0
-        replaced = 0
-        failed: list[str] = []
-        if selected_count > 1:
-            self._begin_interactive_operation("Assign icons", selected_count)
-        try:
-            for idx, entry in enumerate(selected, start=1):
-                if selected_count > 1 and self._step_interactive_operation(
-                    "Assign icons", idx - 1, selected_count
-                ):
-                    cancel_all_requested = True
-                    break
-                had_valid_icon = entry.icon_status == "valid"
-                if had_valid_icon and not allow_replace_existing:
-                    skipped += 1
-                    continue
-                query_name = entry.cleaned_name.strip() or "Game"
-                resource_order, enabled_resources = self.state.sgdb_resource_preferences()
-                requested_resources = [
-                    value for value in resource_order if value in enabled_resources
-                ]
-                icon_style_pref = normalize_icon_style(
-                    self.state.get_ui_pref("icon_style", "none"),
-                    circular_ring=False,
-                )
-                bg_engine_pref = normalize_background_removal_engine(
-                    self.state.get_ui_pref("icon_bg_removal_engine", "none")
-                )
-                border_shader_pref = self._load_border_shader_pref()
-
-                try:
-                    candidates = self.state.search_icon_candidates(
-                        query_name, query_name, sgdb_resources=requested_resources
-                    )
-                except Exception as exc:
-                    candidates = []
-                    failed.append(f"{entry.full_name}: search failed ({exc})")
-
-                dialog = IconPickerDialog(
-                    folder_name=query_name,
-                    candidates=candidates,
-                    preview_loader=self.state.candidate_preview,
-                    image_loader=self.state.download_candidate,
-                    search_callback=lambda resources, q=query_name: self.state.search_icon_candidates(
-                        q,
-                        q,
-                        sgdb_resources=resources,
-                    ),
-                    initial_resource_order=resource_order,
-                    initial_enabled_resources=enabled_resources,
-                    resource_prefs_saver=self.state.save_sgdb_resource_preferences,
-                    show_cancel_all=selected_count > 1,
-                    initial_icon_style=icon_style_pref,
-                    icon_style_saver=self._save_icon_style_pref,
-                    initial_bg_removal_engine=bg_engine_pref,
-                    bg_removal_engine_saver=self._save_bg_engine_pref,
-                    initial_border_shader=border_shader_pref,
-                    border_shader_saver=self._save_border_shader_pref,
-                    initial_web_download_dir=self._load_web_capture_download_dir_pref(),
-                    web_download_dir_saver=self._save_web_capture_download_dir_pref,
-                    initial_web_download_mode=self._load_web_capture_download_mode_pref(),
-                    web_download_mode_saver=self._save_web_capture_download_mode_pref,
-                    parent=self,
-                )
-                if dialog.exec() != dialog.DialogCode.Accepted:
-                    cancelled += 1
-                    if dialog.cancel_all_requested:
-                        cancel_all_requested = True
-                        break
-                    continue
-                payload = dialog.result_payload()
-                image_bytes: bytes
-                icon_style = payload.icon_style
-                bg_removal_engine = payload.bg_removal_engine
-                bg_removal_params = dict(payload.bg_removal_params or {})
-                text_preserve_config = dict(payload.text_preserve_config or {})
-                border_shader = border_shader_to_dict(payload.border_shader)
-                if payload.prepared_is_final_composite:
-                    icon_style = "none"
-                    bg_removal_engine = "none"
-                    bg_removal_params = {}
-                    text_preserve_config = {"enabled": False, "strength": 45, "feather": 1}
-                    border_shader = {"enabled": False}
-                text_method_pref = str(text_preserve_config.get("method", "none") or "none")
-                self.state.set_ui_pref("icon_text_extraction_method", text_method_pref)
-                if payload.prepared_image_bytes is not None:
-                    image_bytes = payload.prepared_image_bytes
-                elif payload.source_image_bytes is not None:
-                    image_bytes = payload.source_image_bytes
-                elif payload.local_image_path:
-                    try:
-                        image_bytes = Path(payload.local_image_path).read_bytes()
-                    except OSError as exc:
-                        failed.append(f"{entry.full_name}: cannot read local image ({exc})")
-                        continue
-                elif payload.candidate is not None:
-                    try:
-                        image_bytes = self.state.download_candidate(payload.candidate)
-                    except Exception as exc:
-                        failed.append(f"{entry.full_name}: download failed ({exc})")
-                        continue
-                else:
-                    failed.append(f"{entry.full_name}: no candidate selected")
-                    continue
-                info_tip_value = (payload.info_tip or "").strip()
-                if not info_tip_value:
-                    try:
-                        auto_tip = self.state.get_or_fetch_game_infotip(
-                            entry.cleaned_name or entry.full_name
-                        )
-                    except Exception:
-                        auto_tip = None
-                    if auto_tip:
-                        info_tip_value = auto_tip
-
-                try:
-                    result = self.state.apply_folder_icon(
-                        folder_path=entry.full_path,
-                        source_image=image_bytes,
-                        icon_name_hint=entry.cleaned_name or entry.full_name,
-                        info_tip=info_tip_value,
-                        icon_style=icon_style,
-                        bg_removal_engine=bg_removal_engine,
-                        bg_removal_params=bg_removal_params,
-                        text_preserve_config=text_preserve_config,
-                        border_shader=border_shader,
-                    )
-                except Exception as exc:
-                    failed.append(f"{entry.full_name}: apply failed ({exc})")
-                    continue
-                if result.status != "applied":
-                    failed.append(f"{entry.full_name}: {result.message}")
-                    continue
-                applied += 1
-                try:
-                    self._apply_icon_result_to_entry(
-                        entry,
-                        result.ico_path,
-                        result.desktop_ini_path,
-                        info_tip_value,
-                    )
-                except Exception as exc:
-                    failed.append(f"{entry.full_name}: post-apply update failed ({exc})")
-                if had_valid_icon:
-                    replaced += 1
-        finally:
-            if selected_count > 1:
-                self._end_interactive_operation()
-
-        if applied > 0:
-            self._folder_icon_cache.clear()
-            self._folder_icon_preview_cache.clear()
-            try:
-                self._populate_right(self.inventory)
-            except Exception as exc:
-                failed.append(f"UI refresh failed ({exc})")
-                self._set_refresh_needed(True)
-        # Keep single-item flow quiet and also avoid a no-op popup on full cancel.
-        if selected_count == 1:
-            if failed:
-                QMessageBox.warning(
-                    self,
-                    "Assign Folder Icon",
-                    "\n".join(failed[:8]),
-                )
-            return
-        if (
-            applied == 0
-            and replaced == 0
-            and skipped == 0
-            and not failed
-            and cancelled > 0
-        ):
-            return
-        lines = [f"Applied: {applied}"]
-        if replaced:
-            lines.append(f"Replaced existing: {replaced}")
-        lines.append(f"Skipped existing: {skipped}")
-        if cancelled:
-            lines.append(f"Cancelled: {cancelled}")
-        if cancel_all_requested:
-            lines.append("Run cancelled by user.")
-        if failed:
-            lines.append(f"Failed: {len(failed)}")
-            lines.append("")
-            lines.extend(failed[:8])
-        QMessageBox.information(self, "Assign Folder Icon", "\n".join(lines))
-
-    def _on_open_icon_converter(self) -> None:
-        if self._icon_converter_dialog is not None:
-            self._icon_converter_dialog.show()
-            self._icon_converter_dialog.raise_()
-            self._icon_converter_dialog.activateWindow()
-            return
-        icon_style_pref = normalize_icon_style(
-            self.state.get_ui_pref("icon_style", "none"),
-            circular_ring=False,
-        )
-        bg_engine_pref = normalize_background_removal_engine(
-            self.state.get_ui_pref("icon_bg_removal_engine", "none")
-        )
-        border_shader_pref = self._load_border_shader_pref()
-        dialog = IconConverterDialog(
-            initial_icon_style=icon_style_pref,
-            icon_style_saver=self._save_icon_style_pref,
-            initial_bg_removal_engine=bg_engine_pref,
-            bg_removal_engine_saver=self._save_bg_engine_pref,
-            initial_border_shader=border_shader_pref,
-            border_shader_saver=self._save_border_shader_pref,
-            parent=self,
-        )
-        dialog.finished.connect(self._on_icon_converter_closed)
-        self._icon_converter_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _on_icon_converter_closed(self, _result: int) -> None:
-        self._icon_converter_dialog = None
-
-    def _on_open_template_prep(self) -> None:
-        if self._template_prep_dialog is not None:
-            self._template_prep_dialog.show()
-            self._template_prep_dialog.raise_()
-            self._template_prep_dialog.activateWindow()
-            return
-        dialog = TemplatePrepDialog(parent=self)
-        dialog.finished.connect(self._on_template_prep_closed)
-        self._template_prep_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _on_template_prep_closed(self, _result: int) -> None:
-        self._template_prep_dialog = None
-
-    def _on_open_template_transparency(self) -> None:
-        if self._template_transparency_dialog is not None:
-            self._template_transparency_dialog.show()
-            self._template_transparency_dialog.raise_()
-            self._template_transparency_dialog.activateWindow()
-            return
-        dialog = TemplateTransparencyDialog(parent=self)
-        dialog.finished.connect(self._on_template_transparency_closed)
-        self._template_transparency_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _on_template_transparency_closed(self, _result: int) -> None:
-        self._template_transparency_dialog = None
-
-    def _on_repair_absolute_icon_paths(self) -> None:
-        report = self.state.repair_absolute_icon_paths()
-        self.refresh_all()
-        lines = [
-            f"Repaired: {report.succeeded}",
-            f"Failed: {report.failed}",
-            f"Unchanged: {report.skipped}",
-        ]
-        if report.details:
-            lines.append("")
-            lines.extend(report.details[:12])
-        QMessageBox.information(self, "Repair Icon Paths", "\n".join(lines))
-
     def _delete_path_with_elevation(self, full_path: str) -> tuple[bool, str]:
         path = os.path.normpath(full_path)
         if not os.path.exists(path):
@@ -2899,130 +2302,62 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "Deletion Completed", f"Deleted: {deleted}")
 
-    def _selected_root_id(self) -> int | None:
-        rows = self.left_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        row = rows[0].row()
-        item = self.left_table.item(row, 0)
-        if item is None:
-            return None
-        return item.data(Qt.ItemDataRole.UserRole)
-
     def _status_base_text(self) -> str:
         active_roots = 1 if self._selected_root_id() is not None else len(self.root_infos)
         visible_games = len(self._visible_right_items)
-        return (
-            f"Roots active: {active_roots}/{self._loaded_roots_count} | "
-            f"Games visible: {visible_games}/{self._loaded_entries_count}"
-        )
+        return f"Roots active: {active_roots}/{self._loaded_roots_count}    Games visible: {visible_games}/{self._loaded_entries_count}"
 
-    def _entry_tooltip_text(self, entry: InventoryItem, row_source: str) -> str:
-        lines = [
-            f"Name: {entry.full_name}",
-            f"Cleaned: {entry.cleaned_name}",
-            f"Path: {entry.full_path}",
-            f"Source: {row_source}",
+    def _set_status_section_text(self, label: QLabel, separator: QFrame, text: str) -> None:
+        value = str(text or "").strip()
+        label.setText(value)
+        label.setVisible(bool(value))
+        separator.setVisible(False)
+        self._refresh_status_section_visibility()
+
+    def _refresh_status_section_visibility(self) -> None:
+        sections = [
+            (self._status_operation_label, self._status_operation_sep),
+            (self._status_background_label, self._status_background_sep),
+            (self._status_gpu_label, self._status_gpu_sep),
+            (self._status_vram_label, self._status_vram_sep),
+            (self._status_selected_label, self._status_selected_sep),
         ]
-        tip = (entry.info_tip or "").strip()
-        if tip:
-            lines.append(f"InfoTip: {tip}")
-        return "\n".join(lines)
-
-    def _update_selected_info_box(self) -> None:
-        selected = self._selected_right_entries()
-        if not selected:
-            self.selected_info_label.setText(
-                "Select a game to view its one-line description."
-            )
-            return
-        entry = selected[0]
-        tip = (entry.info_tip or "").strip()
-        if tip:
-            self.selected_info_label.setText(tip)
-            return
-        self.selected_info_label.setText("No description available for this game yet.")
+        has_left = self._status_left_label.isVisible()
+        seen_visible = False
+        for label, separator in sections:
+            visible = label.isVisible() and bool(label.text().strip())
+            label.setVisible(visible)
+            separator.setVisible(visible and (has_left or seen_visible))
+            if visible:
+                seen_visible = True
 
     def _update_counts_status(self) -> None:
         selected = self._selected_right_entries()
         selected_size = sum(item.size_bytes for item in selected)
         self._status_left_label.setText(self._status_base_text())
-        self._status_selected_label.setText(
-            f"| Selected: {len(selected)} games, {_format_bytes(selected_size)}"
+        self._set_status_section_text(
+            self._status_selected_label,
+            self._status_selected_sep,
+            f"Selected: {len(selected)} games, {_format_bytes(selected_size)}",
         )
         self._update_selected_info_box()
-
-    def _on_add_root(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "Select Root Folder")
-        if not selected:
-            return
-        try:
-            result = self.state.add_root(selected)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Cannot Add Root", str(exc))
-            return
-        except OSError as exc:
-            QMessageBox.warning(self, "Cannot Add Root", f"Filesystem error: {exc}")
-            return
-        if result == "duplicate":
-            QMessageBox.information(
-                self,
-                "Already Added",
-                f"Root is already in the list:\n{selected}",
-            )
-            return
-        self.root_infos = self.state.refresh_roots_only()
-        self._loaded_roots_count = len(self.root_infos)
-        self._populate_left(self.root_infos)
-        self._mark_refresh_needed(True)
-        self._update_counts_status()
-
-    def _on_remove_root(self) -> None:
-        root_id = self._selected_root_id()
-        if root_id is None:
-            QMessageBox.information(self, "No Selection", "Select a root row first.")
-            return
-        self.state.remove_root(root_id)
-        self.refresh_all()
-
-    def refresh_all(self) -> None:
-        if self._refresh_in_progress:
-            self._refresh_queued = True
-            self._set_operation_progress("Refresh queued", 1, 1)
-            return
-
-        self._refresh_in_progress = True
-        self._set_refresh_busy_ui(True)
-        self._set_operation_progress("Starting refresh", 0, 1)
-        thread = QThread(self)
-        worker = RefreshWorker(self.state)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_refresh_progress)
-        worker.completed.connect(self._on_refresh_completed)
-        worker.canceled.connect(self._on_refresh_canceled)
-        worker.failed.connect(self._on_refresh_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_refresh_finished)
-        self._refresh_thread = thread
-        self._refresh_worker = worker
-        thread.start()
-
-    def _set_refresh_busy_ui(self, busy: bool) -> None:
-        self.refresh_btn.setEnabled(not busy)
-        self.refresh_btn.setText("Refreshing..." if busy else "Refresh")
-        self._update_cancel_button_state()
 
     def _set_operation_progress(self, stage: str, current: int, total: int) -> None:
         current_i = max(0, int(current))
         total_i = max(0, int(total))
         if total_i > 0:
             current_i = min(current_i, total_i)
-            self._status_operation_label.setText(f"| {stage}: {current_i}/{total_i}")
+            self._set_status_section_text(
+                self._status_operation_label,
+                self._status_operation_sep,
+                f"{stage}: {current_i}/{total_i}",
+            )
             return
-        self._status_operation_label.setText(f"| {stage}")
+        self._set_status_section_text(
+            self._status_operation_label,
+            self._status_operation_sep,
+            stage,
+        )
 
     def _set_background_progress(self, stage: str, current: int, total: int) -> None:
         current_i = max(0, int(current))
@@ -3030,307 +2365,23 @@ class MainWindow(QMainWindow):
         if total_i > 0:
             current_i = min(current_i, total_i)
             pct = int(round((current_i / total_i) * 100.0))
-            self._status_background_label.setText(
-                f"| {stage}: {current_i}/{total_i} ({pct}%)"
+            self._set_status_section_text(
+                self._status_background_label,
+                self._status_background_sep,
+                f"{stage}: {current_i}/{total_i} ({pct}%)",
             )
             return
-        self._status_background_label.setText(f"| {stage}")
+        self._set_status_section_text(
+            self._status_background_label,
+            self._status_background_sep,
+            stage,
+        )
 
     def _clear_background_progress(self) -> None:
-        self._status_background_label.setText("")
+        self._set_status_section_text(self._status_background_label, self._status_background_sep, "")
 
     def _clear_operation_progress(self) -> None:
-        self._status_operation_label.setText("")
-
-    def _on_refresh_progress(self, stage: str, current: int, total: int) -> None:
-        self._set_operation_progress(stage, current, total)
-
-    def _on_prewarm_progress(self, stage: str, current: int, total: int) -> None:
-        self._set_background_progress(stage, current, total)
-
-    def _on_prewarm_completed(self, message: str) -> None:
-        msg = message.strip() or "Preload complete"
-        self._set_background_progress(msg, 1, 1)
-
-    def _on_prewarm_failed(self, message: str) -> None:
-        err = message.strip() or "Preload failed"
-        self._set_background_progress(f"{err}", 1, 1)
-
-    def _on_prewarm_finished(self) -> None:
-        if self._prewarm_process is not None:
-            self._prewarm_process.deleteLater()
-        self._prewarm_process = None
-        self._prewarm_in_progress = False
-        self._request_gpu_status_update()
-        QTimer.singleShot(2000, self._clear_background_progress)
-
-    def _on_refresh_completed(self, root_infos: object, inventory: object) -> None:
-        if not self._initial_refresh_done:
-            self._initial_refresh_done = True
-        self.root_infos = list(root_infos) if isinstance(root_infos, list) else []
-        self.inventory = list(inventory) if isinstance(inventory, list) else []
-        self._prune_icon_caches()
-        self._hide_right_icon_hover_preview()
-        self._loaded_roots_count = len(self.root_infos)
-        self._loaded_entries_count = len(self.inventory)
-        self._populate_left(self.root_infos)
-        self._populate_right(self.inventory)
-        self._mark_refresh_needed(False)
-        self._update_counts_status()
-        self._set_operation_progress("Refresh complete", 1, 1)
-        self._schedule_startup_prewarm_if_ready()
-        self._start_info_tip_backfill_if_needed()
-
-    def _on_refresh_failed(self, message: str) -> None:
-        err = message.strip() or "Unknown refresh error."
-        QMessageBox.warning(self, "Refresh Failed", err)
-        self._set_operation_progress("Refresh failed", 1, 1)
-
-    def _on_refresh_canceled(self, message: str) -> None:
-        msg = message.strip() or "Refresh canceled."
-        self._set_operation_progress(msg, 1, 1)
-
-    def _on_refresh_finished(self) -> None:
-        self._refresh_thread = None
-        self._refresh_worker = None
-        self._refresh_in_progress = False
-        self._set_refresh_busy_ui(False)
-        if self._refresh_queued:
-            self._refresh_queued = False
-            QTimer.singleShot(0, self.refresh_all)
-            return
-        if (
-            not self._operation_in_progress
-            and not self._interactive_operation_active
-            and not self._teracopy_processes
-        ):
-            self._clear_operation_progress()
-
-    def _start_info_tip_backfill_if_needed(self) -> None:
-        if self._infotip_backfill_in_progress:
-            return
-        if self.state.get_ui_pref("icon_infotip_backfill_done_v1", "0").strip() == "1":
-            return
-        candidates: list[tuple[str, str]] = []
-        for entry in self.inventory:
-            if not entry.is_dir:
-                continue
-            if entry.icon_status != "valid":
-                continue
-            if (entry.info_tip or "").strip():
-                continue
-            cleaned = (entry.cleaned_name or entry.full_name).strip()
-            if not cleaned:
-                continue
-            candidates.append((entry.full_path, cleaned))
-        if not candidates:
-            self.state.set_ui_pref("icon_infotip_backfill_done_v1", "1")
-            return
-        thread = QThread(self)
-        worker = InfoTipBackfillWorker(self.state, candidates)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_info_tip_backfill_progress)
-        worker.completed.connect(self._on_info_tip_backfill_completed)
-        worker.failed.connect(self._on_info_tip_backfill_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_info_tip_backfill_finished)
-        self._infotip_backfill_in_progress = True
-        self._infotip_backfill_thread = thread
-        self._infotip_backfill_worker = worker
-        thread.start()
-
-    def _on_info_tip_backfill_progress(self, stage: str, current: int, total: int) -> None:
-        self._set_background_progress(stage, current, total)
-
-    def _on_info_tip_backfill_completed(self, payload: object) -> None:
-        data = payload if isinstance(payload, dict) else {}
-        tip_map_raw = data.get("tips_by_path", {}) if isinstance(data, dict) else {}
-        tip_map = (
-            {
-                os.path.normpath(str(path)): str(text).strip()
-                for path, text in tip_map_raw.items()
-                if str(text).strip()
-            }
-            if isinstance(tip_map_raw, dict)
-            else {}
-        )
-        if tip_map:
-            for entry in self.inventory:
-                key = os.path.normpath(entry.full_path)
-                tip = tip_map.get(key)
-                if tip:
-                    entry.info_tip = tip
-            self._populate_right(self.inventory)
-        updated = int(data.get("updated", 0)) if isinstance(data, dict) else 0
-        failed = int(data.get("failed", 0)) if isinstance(data, dict) else 0
-        attempted = int(data.get("attempted", 0)) if isinstance(data, dict) else 0
-        self._set_background_progress(
-            f"InfoTip backfill done (updated {updated}, failed {failed})",
-            attempted,
-            attempted,
-        )
-        self.state.set_ui_pref("icon_infotip_backfill_done_v1", "1")
-        QTimer.singleShot(2000, self._clear_background_progress)
-
-    def _on_info_tip_backfill_failed(self, message: str) -> None:
-        err = message.strip() or "InfoTip backfill failed"
-        self._set_background_progress(err, 1, 1)
-        self.state.set_ui_pref("icon_infotip_backfill_done_v1", "1")
-        QTimer.singleShot(2000, self._clear_background_progress)
-
-    def _on_info_tip_backfill_finished(self) -> None:
-        self._infotip_backfill_in_progress = False
-        self._infotip_backfill_thread = None
-        self._infotip_backfill_worker = None
-
-    def _set_background_operation_busy(self, busy: bool) -> None:
-        self.cleanup_btn.setEnabled(not busy)
-        self.move_btn.setEnabled(not busy)
-        self.add_root_btn.setEnabled(not busy)
-        self.remove_root_btn.setEnabled(not busy)
-        self.tags_btn.setEnabled(not busy)
-        self.refresh_btn.setEnabled((not busy) and (not self._refresh_in_progress))
-        self._update_cancel_button_state()
-
-    def _start_report_operation(
-        self,
-        title: str,
-        run_fn: Callable[
-            [Callable[[str, int, int], None], Callable[[], bool]],
-            OperationReport,
-        ],
-        on_complete: Callable[[OperationReport], None],
-    ) -> bool:
-        if self._operation_in_progress:
-            QMessageBox.information(
-                self,
-                "Operation In Progress",
-                "Wait for the current operation to finish first.",
-            )
-            return False
-        if self._refresh_in_progress:
-            QMessageBox.information(
-                self,
-                "Refresh In Progress",
-                "Wait for the current refresh to finish first.",
-            )
-            return False
-        if self._teracopy_processes:
-            QMessageBox.information(
-                self,
-                "Move In Progress",
-                "Wait for the current TeraCopy operation to finish first.",
-            )
-            return False
-
-        self._operation_in_progress = True
-        self._operation_title = title.strip() or "Operation"
-        self._operation_complete_handler = on_complete
-        self._set_background_operation_busy(True)
-        self._set_operation_progress(self._operation_title, 0, 1)
-
-        thread = QThread(self)
-        worker = ReportWorker(run_fn)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_operation_progress)
-        worker.completed.connect(self._on_operation_completed)
-        worker.canceled.connect(self._on_operation_canceled)
-        worker.failed.connect(self._on_operation_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_operation_finished)
-        self._operation_thread = thread
-        self._operation_worker = worker
-        thread.start()
-        return True
-
-    def _on_operation_progress(self, stage: str, current: int, total: int) -> None:
-        label = stage.strip() or self._operation_title or "Operation"
-        self._set_operation_progress(label, current, total)
-
-    def _on_operation_completed(self, report_obj: object) -> None:
-        report = report_obj if isinstance(report_obj, OperationReport) else OperationReport()
-        handler = self._operation_complete_handler
-        if handler is not None:
-            handler(report)
-        self._set_operation_progress(self._operation_title or "Operation complete", 1, 1)
-
-    def _on_operation_failed(self, message: str) -> None:
-        err = message.strip() or "Unknown operation error."
-        QMessageBox.warning(self, "Operation Failed", err)
-        self._set_operation_progress(
-            f"{self._operation_title or 'Operation'} failed", 1, 1
-        )
-
-    def _on_operation_canceled(self, message: str) -> None:
-        msg = message.strip() or f"{self._operation_title or 'Operation'} canceled"
-        self._set_operation_progress(msg, 1, 1)
-
-    def _on_operation_finished(self) -> None:
-        self._operation_thread = None
-        self._operation_worker = None
-        self._operation_complete_handler = None
-        self._operation_in_progress = False
-        self._operation_title = ""
-        self._set_background_operation_busy(False)
-        if (
-            not self._refresh_in_progress
-            and not self._interactive_operation_active
-            and not self._teracopy_processes
-        ):
-            self._clear_operation_progress()
-
-    def _update_cancel_button_state(self) -> None:
-        can_cancel = (
-            self._refresh_in_progress
-            or self._operation_in_progress
-            or self._interactive_operation_active
-            or bool(self._teracopy_processes)
-        )
-        self.cancel_op_btn.setEnabled(can_cancel)
-
-    def _on_cancel_operation(self) -> None:
-        if self._refresh_in_progress and self._refresh_worker is not None:
-            self._refresh_worker.request_cancel()
-            self._set_operation_progress("Canceling refresh", 0, 1)
-            self._update_cancel_button_state()
-            return
-        if self._operation_in_progress and self._operation_worker is not None:
-            self._operation_worker.request_cancel()
-            self._set_operation_progress("Canceling operation", 0, 1)
-            self._update_cancel_button_state()
-            return
-        if self._interactive_operation_active:
-            self._interactive_cancel_requested = True
-            self._set_operation_progress("Cancel requested", 0, 1)
-            self._update_cancel_button_state()
-            return
-        if self._teracopy_processes:
-            self._cancel_teracopy_session()
-            self._update_cancel_button_state()
-
-    def _begin_interactive_operation(self, title: str, total: int) -> None:
-        self._interactive_operation_active = True
-        self._interactive_cancel_requested = False
-        self._set_operation_progress(title, 0, max(1, total))
-        self._update_cancel_button_state()
-
-    def _step_interactive_operation(self, title: str, current: int, total: int) -> bool:
-        self._set_operation_progress(title, current, max(1, total))
-        QApplication.processEvents()
-        return self._interactive_cancel_requested
-
-    def _end_interactive_operation(self) -> None:
-        self._interactive_operation_active = False
-        self._interactive_cancel_requested = False
-        self._update_cancel_button_state()
-        if not self._refresh_in_progress and not self._operation_in_progress and not self._teracopy_processes:
-            self._clear_operation_progress()
+        self._set_status_section_text(self._status_operation_label, self._status_operation_sep, "")
 
     def _apply_initial_splitter_sizes(self) -> None:
         if self._initial_split_applied:
@@ -3342,267 +2393,6 @@ class MainWindow(QMainWindow):
         left_needed = sizes[0] if sizes and sizes[0] > 0 else self.left_panel.minimumSizeHint().width()
         self.splitter.setSizes([left_needed, max(1, total - left_needed)])
         self._initial_split_applied = True
-
-    def _mark_refresh_needed(self, needed: bool) -> None:
-        self._refresh_needed = needed
-        if needed:
-            self.refresh_btn.setStyleSheet(
-                "QPushButton { background-color: #6b1d1d; color: #ffffff; font-weight: 600; }"
-            )
-            self.refresh_btn.setToolTip("Manual refresh required.\nShortcut: Ctrl+R")
-            return
-        self.refresh_btn.setStyleSheet("")
-        self.refresh_btn.setToolTip("Refresh\nShortcut: Ctrl+R")
-
-    def _sorted_roots(self, roots: list[RootDisplayInfo]) -> list[RootDisplayInfo]:
-        sort_key = LEFT_SORT_OPTIONS[self.left_sort_combo.currentText()]
-        if sort_key == "source_label":
-            return sorted(
-                roots,
-                key=lambda x: (mountpoint_sort_key(x.mountpoint), x.source_label.casefold()),
-            )
-        if sort_key == "drive_name":
-            return sorted(
-                roots,
-                key=lambda x: (mountpoint_sort_key(x.mountpoint), x.drive_name.casefold()),
-            )
-        return sorted(roots, key=lambda x: x.free_space_bytes, reverse=True)
-
-    def _root_text(self, info: RootDisplayInfo) -> str:
-        mode = LEFT_LABEL_OPTIONS[self.left_label_combo.currentText()]
-        return _source_display_text(mode, info.source_label, info.drive_name)
-
-    def _source_for_item(
-        self, entry: InventoryItem, root_info_by_id: dict[int, RootDisplayInfo]
-    ) -> str:
-        mode = LEFT_LABEL_OPTIONS[self.left_label_combo.currentText()]
-        info = root_info_by_id.get(entry.root_id)
-        if info is None:
-            return entry.source_label
-        return _source_display_text(mode, info.source_label, info.drive_name)
-
-    def _load_border_shader_pref(self) -> dict[str, object]:
-        raw = self.state.get_ui_pref("icon_border_shader", "").strip()
-        if not raw:
-            return border_shader_to_dict(None)
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return border_shader_to_dict(None)
-        if not isinstance(parsed, dict):
-            return border_shader_to_dict(None)
-        return border_shader_to_dict(normalize_border_shader_config(parsed))
-
-    def _save_border_shader_pref(self, payload: dict[str, object]) -> None:
-        normalized = border_shader_to_dict(normalize_border_shader_config(payload))
-        self.state.set_ui_pref(
-            "icon_border_shader",
-            json.dumps(normalized, ensure_ascii=False, sort_keys=True),
-        )
-
-    def _sort_value_for_field(
-        self,
-        entry: InventoryItem,
-        field: str,
-        root_info_by_id: dict[int, RootDisplayInfo],
-    ):
-        if field == "full_name":
-            return natural_key(entry.full_name)
-        if field == "cleaned_name":
-            return natural_key(entry.cleaned_name)
-        if field == "created_at":
-            return entry.created_at
-        if field == "modified_at":
-            return entry.modified_at
-        if field == "size_bytes":
-            return entry.size_bytes
-        if field == "source":
-            return natural_key(self._source_for_item(entry, root_info_by_id))
-        return natural_key(entry.full_name)
-
-    def _sorted_inventory(
-        self, items: list[InventoryItem], root_info_by_id: dict[int, RootDisplayInfo]
-    ) -> list[InventoryItem]:
-        primary_field = RIGHT_COLUMNS[self._right_sort_column][0]
-        chain = _build_sort_chain(primary_field, self._right_sort_ascending)
-        ordered = list(items)
-        for field, asc in reversed(chain):
-            key_func: Callable[[InventoryItem], object] = (
-                lambda item, f=field: self._sort_value_for_field(
-                    item, f, root_info_by_id
-                )
-            )
-            ordered.sort(key=key_func, reverse=not asc)
-        return ordered
-
-    def _build_root_cell_widget(self, info: RootDisplayInfo) -> QWidget:
-        container = QFrame(self.left_table)
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(2)
-
-        top_line = QHBoxLayout()
-        top_line.setContentsMargins(0, 0, 0, 0)
-        top_line.setSpacing(8)
-
-        left_label = QLabel(self._root_text(info), container)
-        left_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-
-        free_label = QLabel(
-            _format_size_and_free(info.total_size_bytes, info.free_space_bytes),
-            container,
-        )
-        free_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        top_line.addWidget(left_label, 1)
-        top_line.addWidget(free_label, 0)
-        layout.addLayout(top_line)
-
-        path_label = QLabel(info.root_path, container)
-        path_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        layout.addWidget(path_label)
-        return container
-
-    def _populate_left(self, roots: list[RootDisplayInfo]) -> None:
-        selected_root_id = self._selected_root_id()
-        ordered = self._sorted_roots(roots)
-        self.left_table.setUpdatesEnabled(False)
-        try:
-            self.left_table.setRowCount(len(ordered))
-            for row, info in enumerate(ordered):
-                item = QTableWidgetItem("")
-                item.setData(Qt.ItemDataRole.UserRole, info.root_id)
-                item.setToolTip(
-                    f"Source: {info.source_label}\nDrive: {info.drive_name}\nRoot: {info.root_path}\nMountpoint: {info.mountpoint}"
-                )
-                item.setFlags(
-                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                )
-                self.left_table.setItem(row, 0, item)
-                self.left_table.setCellWidget(row, 0, self._build_root_cell_widget(info))
-                if selected_root_id is not None and info.root_id == selected_root_id:
-                    self.left_table.selectRow(row)
-            self.left_table.resizeRowsToContents()
-        finally:
-            self.left_table.setUpdatesEnabled(True)
-
-    def _populate_right(self, items: list[InventoryItem]) -> None:
-        root_info_by_id = {info.root_id: info for info in self.root_infos}
-        selected_root_id = self._selected_root_id()
-        visible_items = _filter_by_root_id(items, selected_root_id)
-        visible_items = _filter_by_cleaned_name_query(
-            visible_items, self.left_filter_edit.text()
-        )
-        visible_items = (
-            _filter_only_duplicate_cleaned_names(visible_items)
-            if self._show_only_duplicates
-            else visible_items
-        )
-        sorted_items = self._sorted_inventory(visible_items, root_info_by_id)
-        icon_px = ICON_VIEW_SIZES[self._right_icon_size_index]
-        self._visible_right_items = sorted_items
-        self.right_table.setUpdatesEnabled(False)
-        self.right_icon_list.setUpdatesEnabled(False)
-        try:
-            self.right_table.setRowCount(len(sorted_items))
-            self.right_icon_list.clear()
-            for row, entry in enumerate(sorted_items):
-                row_icon = self._icon_for_entry(entry)
-                row_source = self._source_for_item(entry, root_info_by_id)
-                name_item = QTableWidgetItem(entry.full_name)
-                name_item.setIcon(row_icon)
-                self.right_table.setItem(row, 0, name_item)
-                self.right_table.setItem(row, 1, QTableWidgetItem(entry.cleaned_name))
-                self.right_table.setItem(
-                    row, 2, QTableWidgetItem(entry.modified_at.strftime("%Y-%m-%d %H:%M:%S"))
-                )
-                self.right_table.setItem(
-                    row, 3, QTableWidgetItem(entry.created_at.strftime("%Y-%m-%d %H:%M:%S"))
-                )
-                self.right_table.setItem(row, 4, QTableWidgetItem(_format_bytes(entry.size_bytes)))
-                self.right_table.setItem(
-                    row, 5, QTableWidgetItem(row_source)
-                )
-                tooltip = self._entry_tooltip_text(entry, row_source)
-                for col in range(len(RIGHT_COLUMNS)):
-                    cell = self.right_table.item(row, col)
-                    if cell is not None:
-                        cell.setToolTip(tooltip)
-
-                tile_text = entry.cleaned_name.strip() or entry.full_name
-                tile_icon = row_icon
-                if tile_icon.cacheKey() == self._blank_icon.cacheKey():
-                    tile_icon = self._icon_placeholder(icon_px)
-                tile = QListWidgetItem(tile_icon, tile_text)
-                tile.setToolTip(tooltip)
-                tile.setData(Qt.ItemDataRole.UserRole, row)
-                tile.setTextAlignment(
-                    int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-                )
-                self.right_icon_list.addItem(tile)
-
-            self.right_table.resizeColumnsToContents()
-        finally:
-            self.right_table.setUpdatesEnabled(True)
-            self.right_icon_list.setUpdatesEnabled(True)
-        self._apply_right_icon_size_ui()
-        self._update_counts_status()
-
-    def _restore_right_icon_selection(
-        self,
-        selected_paths: list[str],
-        anchor_path: str | None = None,
-    ) -> None:
-        if self._right_view_mode != "icons" or not selected_paths:
-            return
-        path_to_rows: dict[str, list[int]] = {}
-        for row, entry in enumerate(self._visible_right_items):
-            path_to_rows.setdefault(entry.full_path, []).append(row)
-        rows_to_select: list[int] = []
-        for path in selected_paths:
-            rows_to_select.extend(path_to_rows.get(path, []))
-        if not rows_to_select:
-            return
-        rows_to_select = sorted(set(rows_to_select))
-        blocked = self.right_icon_list.blockSignals(True)
-        try:
-            self.right_icon_list.clearSelection()
-            for row in rows_to_select:
-                item = self.right_icon_list.item(row)
-                if item is not None:
-                    item.setSelected(True)
-            anchor_row: int | None = None
-            if anchor_path:
-                anchor_rows = path_to_rows.get(anchor_path, [])
-                if anchor_rows:
-                    anchor_row = anchor_rows[0]
-            if anchor_row is None:
-                anchor_row = rows_to_select[0]
-            anchor_item = self.right_icon_list.item(anchor_row)
-            if anchor_item is not None:
-                self.right_icon_list.setCurrentItem(anchor_item)
-                self.right_icon_list.scrollToItem(anchor_item)
-        finally:
-            self.right_icon_list.blockSignals(blocked)
-        self._update_counts_status()
-
-    def _prune_icon_caches(self) -> None:
-        valid_icon_keys: set[str] = set()
-        valid_preview_keys: set[str] = set()
-        for entry in self.inventory:
-            if not (entry.is_dir and entry.icon_status == "valid" and entry.folder_icon_path):
-                continue
-            icon_path = os.path.normpath(entry.folder_icon_path)
-            valid_icon_keys.add(icon_cache_key(icon_path, 16))
-            valid_preview_keys.add(icon_cache_key(icon_path, 256))
-        self._folder_icon_cache = {
-            key: icon for key, icon in self._folder_icon_cache.items() if key in valid_icon_keys
-        }
-        self._folder_icon_preview_cache = {
-            key: pix
-            for key, pix in self._folder_icon_preview_cache.items()
-            if key in valid_preview_keys
-        }
 
     def _on_find_tags(self) -> None:
         if not self.inventory:
