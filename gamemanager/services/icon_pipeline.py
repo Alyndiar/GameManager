@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
 from contextlib import redirect_stderr, redirect_stdout
-import colorsys
 from dataclasses import dataclass
-import filecmp
 from functools import lru_cache
 import gc
 from io import BytesIO, StringIO
-import json
 import logging
 import os
-import re
-import shutil
 from pathlib import Path
 import threading
 from typing import Final
@@ -59,86 +53,13 @@ def _sync_template_sources() -> None:
     )
 
 
-def _remove_if_empty(path: Path) -> None:
-    try:
-        if path.exists() and path.is_dir() and not any(path.iterdir()):
-            path.rmdir()
-    except OSError:
-        return
-
-
-def _merge_move_dir(src: Path, dst: Path) -> None:
-    if not src.exists() or not src.is_dir():
-        return
-    dst.mkdir(parents=True, exist_ok=True)
-    for entry in src.iterdir():
-        src_path = src / entry.name
-        dst_path = dst / entry.name
-        if src_path.is_dir():
-            _merge_move_dir(src_path, dst_path)
-            _remove_if_empty(src_path)
-            continue
-        if dst_path.exists():
-            try:
-                if filecmp.cmp(src_path, dst_path, shallow=False):
-                    src_path.unlink()
-            except OSError:
-                pass
-            continue
-        try:
-            shutil.move(str(src_path), str(dst_path))
-        except OSError:
-            continue
-    _remove_if_empty(src)
-
-
-def _configure_local_ml_model_cache() -> None:
-    model_root = project_data_dir() / "models"
-    model_root.mkdir(parents=True, exist_ok=True)
-    paddleocr_root = model_root / "paddleocr"
-    paddle_root = model_root / "paddle"
-    xdg_root = model_root / "xdg"
-    paddleocr_root.mkdir(parents=True, exist_ok=True)
-    paddle_root.mkdir(parents=True, exist_ok=True)
-    xdg_root.mkdir(parents=True, exist_ok=True)
-
-    # Migrate legacy user-profile model stores into project-local data.
-    home = Path.home()
-    _merge_move_dir(home / ".paddleocr", paddleocr_root)
-    _merge_move_dir(home / ".cache" / "paddle", paddle_root)
-
-    os.environ.setdefault("PADDLE_OCR_BASE_DIR", str(paddleocr_root))
-    os.environ.setdefault("PADDLE_HOME", str(paddle_root))
-    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_root))
-
-
 _pipeline_runtime.configure_local_ml_model_cache(project_data_dir() / "models")
 _sync_template_sources()
 
 
-@dataclass(frozen=True, slots=True)
-class IconTemplate:
-    template_id: str
-    label: str
-    shape: str | None
-    path: Path | None
-
-
-@dataclass(frozen=True, slots=True)
-class TemplateAnalysis:
-    overlay: Image.Image
-    interior_mask: Image.Image | None
-    shape: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class BorderShaderConfig:
-    enabled: bool = False
-    mode: str = "hsv"
-    hue: int = 0
-    saturation: int = 100
-    tone: int = 100
-    intensity: int = 0
+IconTemplate = _template_domain.IconTemplate
+TemplateAnalysis = _template_domain.TemplateAnalysis
+BorderShaderConfig = _template_domain.BorderShaderConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,9 +93,6 @@ _TEXT_EXTRACTION_RUNTIME_STATUS: dict[str, str] = {}
 _TEXT_MODEL_LOCK = threading.Lock()
 _ACTIVE_TEXT_MODELS: set[str] = set()
 _PARKED_PADDLEOCR_ENGINE: object | None = None
-_TEMPLATE_MAP_LOCK = threading.Lock()
-_TEMPLATE_MAP_CACHE: dict[str, "IconTemplate"] | None = None
-_TEMPLATE_MAP_CACHE_KEY: tuple[int, int] | None = None
 
 
 def _silence_paddle_text_logs() -> None:
@@ -300,107 +218,6 @@ def _draw_square_fallback_overlay(size: int) -> Image.Image:
         width=border,
     )
     return ring
-
-
-def _slugify_template_id(raw_value: str) -> str:
-    token = re.sub(r"[^a-z0-9]+", "_", raw_value.strip().casefold()).strip("_")
-    return token or "template"
-
-
-def _label_from_stem(stem: str) -> str:
-    token = stem.strip()
-    if not token:
-        return "Template"
-    return token
-
-
-def _shape_from_name(stem: str) -> str | None:
-    lowered = stem.casefold()
-    if any(token in lowered for token in ("round", "circle", "ring", "orb")):
-        return "round"
-    if any(token in lowered for token in ("square", "rect", "box", "frame")):
-        return "square"
-    return None
-
-
-def _build_default_templates() -> dict[str, IconTemplate]:
-    round_path = next((p for p in ROUND_TEMPLATE_PATHS if p.exists()), None)
-    square_path = next((p for p in SQUARE_TEMPLATE_PATHS if p.exists()), None)
-    templates: dict[str, IconTemplate] = {
-        "none": IconTemplate("none", "Disabled", None, None),
-    }
-    if round_path is not None:
-        templates["round"] = IconTemplate("round", "Round Border", "round", round_path)
-    if square_path is not None:
-        templates["square"] = IconTemplate("square", "Square Border", "square", square_path)
-    return templates
-
-
-def _parse_template_metadata(template_path: Path) -> tuple[str | None, str | None]:
-    meta_path = template_path.with_suffix(".json")
-    if not meta_path.exists():
-        return None, None
-    try:
-        payload = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None, None
-    if not isinstance(payload, dict):
-        return None, None
-    raw_shape = str(payload.get("shape", "")).strip().casefold()
-    shape = raw_shape if raw_shape in {"round", "square"} else None
-    label = str(payload.get("label", "")).strip() or None
-    return shape, label
-
-
-def _discover_custom_templates() -> list[IconTemplate]:
-    CUSTOM_TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
-    return _discover_templates_from_dir(CUSTOM_TEMPLATE_DIR)
-
-
-def _discover_templates_from_dir(template_dir: Path) -> list[IconTemplate]:
-    if not template_dir.exists():
-        return []
-    discovered: list[IconTemplate] = []
-    for path in sorted(template_dir.glob("*.png"), key=lambda p: p.name.casefold()):
-        shape_meta, _label_meta = _parse_template_metadata(path)
-        shape = shape_meta or _shape_from_name(path.stem) or "square"
-        template_id = _slugify_template_id(path.stem)
-        label = _label_from_stem(path.stem)
-        discovered.append(
-            IconTemplate(
-                template_id=template_id,
-                label=label,
-                shape=shape,
-                path=path,
-            )
-        )
-    return discovered
-
-
-def _discover_builtin_templates() -> list[IconTemplate]:
-    return _discover_templates_from_dir(BUILTIN_TEMPLATE_DIR)
-
-
-def _insert_template_entry(mapping: dict[str, IconTemplate], template: IconTemplate) -> None:
-    key = template.template_id
-    if key in mapping:
-        idx = 2
-        while f"{key}_{idx}" in mapping:
-            idx += 1
-        key = f"{key}_{idx}"
-    mapping[key] = IconTemplate(
-        template_id=key,
-        label=template.label,
-        shape=template.shape,
-        path=template.path,
-    )
-
-
-def _dir_mtime_ns(path: Path) -> int:
-    try:
-        return int(path.stat().st_mtime_ns)
-    except OSError:
-        return -1
 
 
 def _icon_template_map() -> dict[str, IconTemplate]:
@@ -2052,25 +1869,6 @@ def _load_template_analysis(path_text: str, template_mtime_ns: int) -> TemplateA
 def _get_template_analysis(template: IconTemplate) -> TemplateAnalysis | None:
     _sync_template_sources()
     return _template_domain._get_template_analysis(template)
-
-
-def _inner_shape_mask(shape: str, size: int) -> Image.Image:
-    inset = max(2, int(size * 0.035))
-    mask = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(mask)
-    if shape == "round":
-        draw.ellipse(
-            (inset, inset, size - inset - 1, size - inset - 1),
-            fill=255,
-        )
-    else:
-        radius = max(6, int(size * 0.10))
-        draw.rounded_rectangle(
-            (inset, inset, size - inset - 1, size - inset - 1),
-            radius=radius,
-            fill=255,
-        )
-    return mask
 
 
 def _fit_to_square(image: Image.Image, size: int) -> Image.Image:
