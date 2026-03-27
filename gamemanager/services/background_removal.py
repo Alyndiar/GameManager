@@ -15,6 +15,8 @@ import warnings
 
 from PIL import Image, ImageFilter, ImageOps
 
+from gamemanager.services.paths import project_data_dir
+
 
 BACKGROUND_REMOVAL_OPTIONS: list[tuple[str, str]] = [
     ("Disabled", "none"),
@@ -47,14 +49,6 @@ _PICK_COLOR_FALLOFF_ALIASES: dict[str, str] = {
 }
 _PICK_COLOR_FALLOFF_VALUES: set[str] = {"flat", "lin", "smooth", "cos", "exp", "log", "gauss"}
 _PICK_COLOR_SCOPE_VALUES: set[str] = {"global", "contig"}
-
-
-def _project_data_dir() -> Path:
-    override = os.environ.get("GAMEMANAGER_DATA_DIR", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    project_root = Path(__file__).resolve().parents[2]
-    return project_root / ".gamemanager_data"
 
 
 def _remove_if_empty(path: Path) -> None:
@@ -91,7 +85,7 @@ def _merge_move_dir(src: Path, dst: Path) -> None:
 
 
 def _configure_local_model_cache() -> None:
-    model_root = _project_data_dir() / "models"
+    model_root = project_data_dir() / "models"
     model_root.mkdir(parents=True, exist_ok=True)
 
     u2net_home = model_root / "u2net"
