@@ -5,7 +5,7 @@ import json
 from io import BytesIO
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QBuffer, QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QByteArray, QBuffer, QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -65,6 +65,7 @@ from .icon_construction_common import (
     shader_swatch_css as _shader_swatch_css,
     shader_tone_label as _shader_tone_label,
 )
+from .icon_construction_canvas_ops import IconFramingCanvasOpsMixin
 from .icon_construction_cutout_state import (
     CUTOUT_FALLOFF_VALUES,
     any_curve_mode_entries,
@@ -75,8 +76,9 @@ from .icon_construction_cutout_state import (
     normalize_cutout_falloff,
     normalize_cutout_scope,
     serialize_cutout_picked_rows,
-    upsert_cutout_mark_point,
 )
+from .icon_construction_processing_ops import IconFramingProcessingOpsMixin
+from .icon_construction_workers import FramingProcessingWorker, SeedColorButton
 from .shared import (
     bind_dialog_shortcut as _bind_dialog_shortcut,
     icon_style_gallery_entries as _icon_style_gallery_entries,
@@ -1628,156 +1630,11 @@ class IconFrameCanvas(QWidget):
         out_image.save(buffer, "PNG")
         return bytes(payload)
 
-class FramingProcessingWorker(QObject):
-    progress = Signal(str, int, int)
-    completed = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(
-        self,
-        source_image_bytes: bytes,
-        bg_engine: str,
-        bg_params: dict[str, object],
-        text_config: dict[str, object],
-        include_cutout: bool,
-        include_text_overlay: bool,
-        include_text_alpha: bool,
-    ):
-        super().__init__()
-        self._source_image_bytes = source_image_bytes
-        self._bg_engine = normalize_background_removal_engine(bg_engine)
-        self._bg_params = normalize_background_removal_params(bg_params)
-        self._text_config = text_preserve_to_dict(
-            normalize_text_preserve_config(text_config)
-        )
-        self._include_cutout = bool(include_cutout)
-        self._include_text_overlay = bool(include_text_overlay)
-        self._include_text_alpha = bool(include_text_alpha)
-
-    @Slot()
-    def run(self) -> None:
-        total = int(self._include_cutout) + int(self._include_text_overlay or self._include_text_alpha)
-        if total <= 0:
-            self.completed.emit({})
-            self.finished.emit()
-            return
-
-        result: dict[str, object] = {}
-        step = 0
-        cut_img = None
-        src_img = None
-        try:
-            if Image is not None:
-                with Image.open(BytesIO(self._source_image_bytes)) as loaded:
-                    loaded.load()
-                    src_img = ImageOps.exif_transpose(loaded).convert("RGBA")
-            if self._include_cutout or self._include_text_overlay or self._include_text_alpha:
-                if self._bg_engine == "none":
-                    if src_img is not None:
-                        cut_img = Image.new("RGBA", src_img.size, (0, 0, 0, 0))
-                else:
-                    step += 1
-                    self.progress.emit(
-                        f"Preparing cutout ({self._bg_engine})",
-                        step - 1,
-                        total,
-                    )
-                    raw_cutout = remove_background_bytes(
-                        self._source_image_bytes,
-                        engine=self._bg_engine,
-                        params=self._bg_params,
-                    )
-                    raw_cutout = _normalize_image_bytes_for_canvas(raw_cutout)
-                    result["cutout_bytes"] = raw_cutout
-                    if Image is not None:
-                        with Image.open(BytesIO(raw_cutout)) as loaded_cut:
-                            loaded_cut.load()
-                            cut_img = ImageOps.exif_transpose(loaded_cut).convert("RGBA")
-                            extrema = cut_img.getchannel("A").getextrema()
-                            if not (extrema and extrema[0] < 255):
-                                result["cutout_error"] = "Cutout output has no transparency."
-                    self.progress.emit(
-                        f"Preparing cutout ({self._bg_engine})",
-                        step,
-                        total,
-                    )
-            if self._include_text_overlay or self._include_text_alpha:
-                step += 1
-                method = str(self._text_config.get("method", "none") or "none")
-                self.progress.emit(f"Extracting text ({method})", step - 1, total)
-                if Image is not None and src_img is not None:
-                    if cut_img is None:
-                        if self._bg_engine == "none":
-                            cut_img = Image.new("RGBA", src_img.size, (0, 0, 0, 0))
-                        else:
-                            raw_cutout = remove_background_bytes(
-                                self._source_image_bytes,
-                                engine=self._bg_engine,
-                                params=self._bg_params,
-                            )
-                            raw_cutout = _normalize_image_bytes_for_canvas(raw_cutout)
-                            with Image.open(BytesIO(raw_cutout)) as loaded_cut:
-                                loaded_cut.load()
-                                cut_img = ImageOps.exif_transpose(loaded_cut).convert("RGBA")
-                    if self._include_text_overlay:
-                        overlay = build_text_extraction_overlay(src_img, cut_img, self._text_config)
-                        if overlay is not None:
-                            out = BytesIO()
-                            overlay.save(out, format="PNG")
-                            result["text_overlay_bytes"] = out.getvalue()
-                    if self._include_text_alpha:
-                        alpha_mask = build_text_extraction_alpha_mask(
-                            src_img, cut_img, self._text_config
-                        )
-                        if alpha_mask is not None:
-                            mask_rgba = Image.new("RGBA", alpha_mask.size, (255, 255, 255, 0))
-                            mask_rgba.putalpha(alpha_mask)
-                            out = BytesIO()
-                            mask_rgba.save(out, format="PNG")
-                            result["text_alpha_bytes"] = out.getvalue()
-                self.progress.emit(f"Extracting text ({method})", step, total)
-            self.completed.emit(result)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
-
-
-class SeedColorButton(QPushButton):
-    singleClicked = Signal()
-    doubleClicked = Signal()
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._ignore_release_once = False
-        self._single_click_timer = QTimer(self)
-        self._single_click_timer.setSingleShot(True)
-        self._single_click_timer.timeout.connect(self.singleClicked.emit)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self._ignore_release_once:
-                self._ignore_release_once = False
-                event.accept()
-                return
-            self._single_click_timer.start(max(1, QApplication.doubleClickInterval()))
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self._single_click_timer.isActive():
-                self._single_click_timer.stop()
-            self._ignore_release_once = True
-            self.doubleClicked.emit()
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
-
-
-class IconFramingDialog(QDialog):
+class IconFramingDialog(
+    IconFramingCanvasOpsMixin,
+    IconFramingProcessingOpsMixin,
+    QDialog,
+):
     def __init__(
         self,
         image_bytes: bytes,
@@ -2485,31 +2342,6 @@ class IconFramingDialog(QDialog):
         self._refresh_seed_color_controls()
         self._apply_processing_settings()
 
-    def _on_canvas_seed_color_picked(self, value: object) -> None:
-        if self._active_seed_pick_index is None:
-            return
-        try:
-            red = int(value[0])  # type: ignore[index]
-            green = int(value[1])  # type: ignore[index]
-            blue = int(value[2])  # type: ignore[index]
-        except Exception:
-            self._active_seed_pick_index = None
-            self._canvas.set_seed_pick_mode(False)
-            self._refresh_seed_color_controls()
-            self._refresh_cutout_status()
-            return
-        idx = self._active_seed_pick_index
-        if 0 <= idx < len(self._seed_colors):
-            self._seed_colors[idx] = (
-                max(0, min(255, red)),
-                max(0, min(255, green)),
-                max(0, min(255, blue)),
-            )
-        self._active_seed_pick_index = None
-        self._canvas.set_seed_pick_mode(False)
-        self._refresh_seed_color_controls()
-        self._apply_processing_settings()
-
     def _set_cutout_picked_colors_from_params(self, params: dict[str, object]) -> None:
         items, history, next_row_uid = load_cutout_picked_colors_state(
             params,
@@ -2688,35 +2520,6 @@ class IconFramingDialog(QDialog):
         self._update_cutout_mark_controls()
         self._apply_processing_settings()
 
-    def _on_canvas_cutout_mark_point(self, value: object) -> None:
-        if self._cutout_mark_mode not in {"add", "remove"}:
-            return
-        entry = self._active_cutout_mark_entry()
-        if entry is None or str(entry.get("scope", "global")) != "contig":
-            return
-        try:
-            x_val = float(value[0])  # type: ignore[index]
-            y_val = float(value[1])  # type: ignore[index]
-        except Exception:
-            return
-        point = (max(0.0, min(1.0, x_val)), max(0.0, min(1.0, y_val)))
-        row_id = int(entry.get("id", -1))
-        before = self._cutout_mark_snapshot(entry)
-        if self._cutout_mark_mode == "add":
-            include_points = entry.setdefault("include_seeds", [])
-            if isinstance(include_points, list):
-                upsert_cutout_mark_point(include_points, point)
-        else:
-            exclude_points = entry.setdefault("exclude_seeds", [])
-            if isinstance(exclude_points, list):
-                upsert_cutout_mark_point(exclude_points, point)
-        after = self._cutout_mark_snapshot(entry)
-        if after != before:
-            self._push_cutout_mark_undo_snapshot(row_id, before)
-        self._rebuild_cutout_pick_color_rows()
-        self._update_cutout_mark_controls()
-        self._apply_processing_settings()
-
     def _set_cutout_color_pick_mode(self, enabled: bool) -> None:
         self._cutout_pick_mode_active = bool(enabled)
         self._canvas.set_cutout_color_pick_mode(bool(enabled))
@@ -2748,33 +2551,6 @@ class IconFramingDialog(QDialog):
         self._cutout_mark_history.clear()
         self._active_cutout_mark_row_id = None
         self._set_cutout_mark_mode("none")
-        self._rebuild_cutout_pick_color_rows()
-        self._apply_processing_settings()
-
-    def _on_canvas_cutout_color_picked(self, value: object) -> None:
-        try:
-            red = max(0, min(255, int(value[0])))  # type: ignore[index]
-            green = max(0, min(255, int(value[1])))  # type: ignore[index]
-            blue = max(0, min(255, int(value[2])))  # type: ignore[index]
-        except Exception:
-            self._set_cutout_color_pick_mode(False)
-            return
-        self._set_cutout_color_pick_mode(False)
-        row_id = self._cutout_row_uid_counter
-        self._cutout_row_uid_counter += 1
-        entry = {
-            "id": row_id,
-            "color": [red, green, blue],
-            "tolerance": 10,
-            "scope": "global",
-            "falloff": "flat",
-            "include_seeds": [],
-            "exclude_seeds": [],
-        }
-        if entry not in self._cutout_picked_colors:
-            self._cutout_picked_colors.append(entry)
-            self._cutout_mark_history[row_id] = {"undo": [], "redo": []}
-        self._sync_cutout_falloff_controls()
         self._rebuild_cutout_pick_color_rows()
         self._apply_processing_settings()
 
@@ -3042,31 +2818,6 @@ class IconFramingDialog(QDialog):
         if len(points) > 512:
             del points[0]
 
-    def _on_canvas_manual_text_mark_point(self, value: object) -> None:
-        if self._manual_text_mark_mode not in {"add", "remove"}:
-            return
-        try:
-            x_val = float(value[0])  # type: ignore[index]
-            y_val = float(value[1])  # type: ignore[index]
-        except Exception:
-            return
-        point = (max(0.0, min(1.0, x_val)), max(0.0, min(1.0, y_val)))
-        before = self._manual_points_snapshot()
-        if self._manual_text_mark_mode == "add":
-            self._upsert_manual_mark_point(self._manual_add_points, point)
-        else:
-            self._upsert_manual_mark_point(self._manual_remove_points, point)
-        after = self._manual_points_snapshot()
-        if after != before:
-            self._manual_undo_stack.append(before)
-            if len(self._manual_undo_stack) > self._manual_history_limit:
-                del self._manual_undo_stack[0]
-            self._manual_redo_stack.clear()
-            self._update_manual_history_buttons()
-        self._canvas.set_manual_text_points(self._manual_add_points, self._manual_remove_points)
-        self._refresh_manual_mark_count_label()
-        self._apply_processing_settings()
-
     def _refresh_manual_mark_count_label(self) -> None:
         self.manual_mark_count_label.setText(
             f"Add: {len(self._manual_add_points)}   Remove: {len(self._manual_remove_points)}"
@@ -3089,22 +2840,6 @@ class IconFramingDialog(QDialog):
         self._apply_processing_settings()
         self._update_roi_label()
 
-    def _on_canvas_roi_changed(self, roi_value: object) -> None:
-        roi: list[float] | None = None
-        if isinstance(roi_value, (list, tuple)) and len(roi_value) >= 4:
-            try:
-                roi = [
-                    float(roi_value[0]),
-                    float(roi_value[1]),
-                    float(roi_value[2]),
-                    float(roi_value[3]),
-                ]
-            except (TypeError, ValueError):
-                roi = None
-        self._text_roi = roi
-        self._update_roi_label()
-        self._apply_processing_settings()
-
     def _update_roi_label(self) -> None:
         if not self._text_roi:
             self.roi_value_label.setText("ROI: full image")
@@ -3121,185 +2856,6 @@ class IconFramingDialog(QDialog):
     def _on_spinner_param_changed(self, *_args) -> None:
         self._spinner_apply_timer.start()
         self._refresh_cutout_status()
-
-    def _set_processing_status(self, text: str) -> None:
-        self.processing_status_label.setText(text.strip() or "Ready.")
-
-    def _set_processing_controls_busy(self, busy: bool) -> None:
-        self.border_combo.setEnabled(not busy)
-        self.zoom_spin.setEnabled(not busy)
-        self.zoom_out_btn.setEnabled(not busy)
-        self.zoom_in_btn.setEnabled(not busy)
-        self.reset_btn.setEnabled(not busy)
-        self.upscale_method_combo.setEnabled(not busy)
-        self.bg_removal_combo.setEnabled(not busy and self._template_enabled())
-        self.text_method_combo.setEnabled(not busy and self._template_enabled())
-        self.layer_all_btn.setEnabled(not busy)
-        self.layer_none_btn.setEnabled(not busy)
-        self.roi_draw_btn.setEnabled(not busy and self._roi_method_enabled())
-        self.roi_clear_btn.setEnabled(not busy and self._roi_method_enabled())
-        pick_colors_enabled = (
-            not busy
-            and self._cutout_method_enabled()
-            and self.selected_bg_removal_engine() == "pick_colors"
-        )
-        self.cutout_pick_add_btn.setEnabled(pick_colors_enabled)
-        self.cutout_pick_clear_btn.setEnabled(pick_colors_enabled and bool(self._cutout_picked_colors))
-        self.cutout_falloff_advanced_check.setEnabled(pick_colors_enabled)
-        for button in self._seed_swatch_buttons:
-            button.setEnabled(not busy and self._text_method_enabled())
-        for idx in range(self.cutout_pick_rows_layout.count()):
-            item = self.cutout_pick_rows_layout.itemAt(idx)
-            widget = item.widget()
-            if widget is not None:
-                widget.setEnabled(pick_colors_enabled)
-        self.manual_mark_undo_btn.setEnabled(False)
-        self.manual_mark_redo_btn.setEnabled(False)
-        self.manual_mark_add_btn.setEnabled(not busy and self._text_method_enabled())
-        self.manual_mark_remove_btn.setEnabled(not busy and self._text_method_enabled())
-        self.manual_mark_stop_btn.setEnabled(not busy and self._text_method_enabled())
-        if busy and self._canvas.cutout_color_pick_mode():
-            self._set_cutout_color_pick_mode(False)
-        if busy and self._cutout_mark_mode != "none":
-            self._set_cutout_mark_mode("none")
-        self._sync_cutout_falloff_controls()
-        self._update_cutout_mark_controls()
-        if not busy:
-            self._update_manual_history_buttons()
-
-    def _start_processing_worker(
-        self,
-        bg_engine: str,
-        bg_params: dict[str, object],
-        text_cfg: dict[str, object],
-        *,
-        text_debug_alpha: bool,
-    ) -> None:
-        include_cutout = bg_engine != "none"
-        include_text = bool(text_cfg.get("enabled", False)) and (
-            str(text_cfg.get("method", "none")) != "none"
-        )
-        if self._processing_in_progress:
-            self._pending_processing = True
-            self._set_processing_status("Queued settings update...")
-            return
-        if not include_cutout and not include_text:
-            self._canvas.set_bg_removal_engine(bg_engine)
-            self._canvas.set_bg_removal_params(bg_params)
-            self._canvas.set_text_preserve_config(text_cfg)
-            self._refresh_cutout_status()
-            self._set_processing_status("Ready.")
-            return
-
-        self._processing_in_progress = True
-        self._pending_processing = False
-        self._canvas.set_async_processing_busy(True)
-        self._set_processing_controls_busy(True)
-        self._set_processing_status("Preparing layers...")
-        thread = QThread(self)
-        worker = FramingProcessingWorker(
-            source_image_bytes=self._canvas.source_image_bytes(),
-            bg_engine=bg_engine,
-            bg_params=bg_params,
-            text_config=text_cfg,
-            include_cutout=include_cutout,
-            include_text_overlay=include_text,
-            include_text_alpha=include_text and text_debug_alpha,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_processing_progress)
-        worker.completed.connect(
-            lambda payload, be=bg_engine, bp=bg_params, tc=text_cfg: self._on_processing_completed(
-                payload, be, bp, tc
-            )
-        )
-        worker.failed.connect(self._on_processing_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_processing_finished)
-        self._processing_thread = thread
-        self._processing_worker = worker
-        thread.start()
-
-    def _on_processing_progress(self, stage: str, current: int, total: int) -> None:
-        current_i = max(0, int(current))
-        total_i = max(0, int(total))
-        if total_i > 0:
-            current_i = min(current_i, total_i)
-            pct = int(round((current_i / total_i) * 100.0))
-            self._set_processing_status(f"{stage}: {current_i}/{total_i} ({pct}%)")
-            return
-        self._set_processing_status(stage)
-
-    def _on_processing_completed(
-        self,
-        payload_obj: object,
-        bg_engine: str,
-        bg_params: dict[str, object],
-        text_cfg: dict[str, object],
-    ) -> None:
-        payload = payload_obj if isinstance(payload_obj, dict) else {}
-        self._canvas.set_bg_removal_engine(bg_engine)
-        self._canvas.set_bg_removal_params(bg_params)
-        self._canvas.set_text_preserve_config(text_cfg)
-
-        cutout_key = self._canvas.build_cutout_cache_key(bg_engine, bg_params)
-        self._canvas.store_cutout_payload(
-            cutout_key,
-            payload.get("cutout_bytes") if isinstance(payload.get("cutout_bytes"), (bytes, bytearray)) else None,
-            error=str(payload.get("cutout_error") or "").strip() or None,
-        )
-
-        text_key = self._canvas.build_text_overlay_cache_key(bg_engine, bg_params, text_cfg)
-        text_payload = payload.get("text_overlay_bytes")
-        self._canvas.store_text_overlay_payload(
-            text_key,
-            bytes(text_payload) if isinstance(text_payload, (bytes, bytearray)) else None,
-        )
-
-        text_alpha_key = self._canvas.build_text_alpha_cache_key(bg_engine, bg_params, text_cfg)
-        text_alpha_payload = payload.get("text_alpha_bytes")
-        self._canvas.store_text_alpha_payload(
-            text_alpha_key,
-            bytes(text_alpha_payload) if isinstance(text_alpha_payload, (bytes, bytearray)) else None,
-        )
-        self._canvas.update()
-        self._refresh_cutout_status()
-        self._set_processing_status("Ready.")
-
-    def _on_processing_failed(self, message: str) -> None:
-        self._canvas.set_bg_removal_engine(self.selected_bg_removal_engine())
-        self._canvas.set_bg_removal_params(self.selected_bg_removal_params())
-        self._canvas.set_text_preserve_config(self.selected_text_preserve_config())
-        self._canvas.update()
-        self._set_processing_status(f"Processing failed: {message.strip() or 'Unknown error'}")
-        self._refresh_cutout_status()
-
-    def _on_processing_finished(self) -> None:
-        self._processing_thread = None
-        self._processing_worker = None
-        self._processing_in_progress = False
-        self._canvas.set_async_processing_busy(False)
-        self._set_processing_controls_busy(False)
-        if self._pending_processing:
-            self._pending_processing = False
-            self._apply_processing_settings()
-            return
-        if self._apply_after_processing:
-            self._apply_after_processing = False
-            QTimer.singleShot(0, self._on_apply)
-
-    def _apply_processing_settings(self) -> None:
-        if self._spinner_apply_timer.isActive():
-            self._spinner_apply_timer.stop()
-        self._start_processing_worker(
-            self.selected_bg_removal_engine(),
-            self.selected_bg_removal_params(),
-            self.selected_text_preserve_config(),
-            text_debug_alpha=self.debug_text_alpha_check.isChecked(),
-        )
 
     def _on_layer_visibility_changed(self, _enabled: bool) -> None:
         self._apply_layer_visibility_to_canvas()
@@ -3431,34 +2987,6 @@ class IconFramingDialog(QDialog):
             self._set_processing_status("Wait for background processing to finish before closing.")
             return
         super().reject()
-
-    def _shutdown_processing_thread(
-        self,
-        *,
-        timeout_ms: int = 2500,
-        allow_terminate: bool = False,
-    ) -> None:
-        thread = self._processing_thread
-        if thread is None:
-            return
-        try:
-            thread.requestInterruption()
-        except Exception:
-            pass
-        try:
-            if thread.isRunning():
-                thread.quit()
-                if not thread.wait(max(100, int(timeout_ms))) and allow_terminate:
-                    thread.terminate()
-                    thread.wait(max(100, int(timeout_ms // 2)))
-        except Exception:
-            pass
-        self._processing_thread = None
-        self._processing_worker = None
-        self._processing_in_progress = False
-        self._pending_processing = False
-        self._apply_after_processing = False
-        self._canvas.set_async_processing_busy(False)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._shutdown_processing_thread(timeout_ms=2200, allow_terminate=True)
