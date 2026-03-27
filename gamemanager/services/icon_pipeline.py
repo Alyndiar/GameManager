@@ -25,6 +25,8 @@ from gamemanager.services.background_removal import (
     normalize_background_removal_params,
     remove_background_bytes,
 )
+from gamemanager.services import icon_pipeline_runtime as _pipeline_runtime
+from gamemanager.services import icon_pipeline_templates as _template_domain
 from gamemanager.services.paths import project_data_dir, project_root
 
 # Keep PaddleX/PaddleOCR local-only by default, no startup host probing.
@@ -46,6 +48,15 @@ SQUARE_TEMPLATE_PATHS: Final[list[Path]] = [
     PACKAGE_DIR / "SquareTemplate.png",
     PACKAGE_DIR / "SquareTemplace.png",
 ]
+
+
+def _sync_template_sources() -> None:
+    _template_domain.configure_template_sources(
+        builtin_dir=BUILTIN_TEMPLATE_DIR,
+        custom_dir=CUSTOM_TEMPLATE_DIR,
+        round_paths=ROUND_TEMPLATE_PATHS,
+        square_paths=SQUARE_TEMPLATE_PATHS,
+    )
 
 
 def _remove_if_empty(path: Path) -> None:
@@ -101,7 +112,8 @@ def _configure_local_ml_model_cache() -> None:
     os.environ.setdefault("XDG_CACHE_HOME", str(xdg_root))
 
 
-_configure_local_ml_model_cache()
+_pipeline_runtime.configure_local_ml_model_cache(project_data_dir() / "models")
+_sync_template_sources()
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,134 +404,41 @@ def _dir_mtime_ns(path: Path) -> int:
 
 
 def _icon_template_map() -> dict[str, IconTemplate]:
-    global _TEMPLATE_MAP_CACHE, _TEMPLATE_MAP_CACHE_KEY
-    cache_key = (_dir_mtime_ns(BUILTIN_TEMPLATE_DIR), _dir_mtime_ns(CUSTOM_TEMPLATE_DIR))
-    with _TEMPLATE_MAP_LOCK:
-        if _TEMPLATE_MAP_CACHE is not None and _TEMPLATE_MAP_CACHE_KEY == cache_key:
-            return _TEMPLATE_MAP_CACHE
-        mapping = _build_default_templates()
-        for template in _discover_builtin_templates():
-            _insert_template_entry(mapping, template)
-        for template in _discover_custom_templates():
-            _insert_template_entry(mapping, template)
-        _TEMPLATE_MAP_CACHE = mapping
-        _TEMPLATE_MAP_CACHE_KEY = cache_key
-        return mapping
+    _sync_template_sources()
+    return _template_domain._icon_template_map()
 
 
 def icon_style_options() -> list[tuple[str, str]]:
-    mapping = _icon_template_map()
-    entries = [mapping["none"]]
-    custom = [tpl for key, tpl in mapping.items() if key != "none"]
-    custom.sort(
-        key=lambda tpl: (
-            0 if tpl.template_id == "round" else 1 if tpl.template_id == "square" else 2,
-            tpl.label.casefold(),
-            tpl.template_id.casefold(),
-        )
-    )
-    entries.extend(custom)
-    return [(tpl.label, tpl.template_id) for tpl in entries]
+    _sync_template_sources()
+    return _template_domain.icon_style_options()
 
 
 def normalize_icon_style(
     icon_style: str | None,
     circular_ring: bool | None = None,
 ) -> str:
-    style_map = _icon_template_map()
-    if icon_style:
-        style = icon_style.strip().casefold()
-        if style in style_map:
-            return style
-        if style in {"round", "circle", "ring"}:
-            round_like = sorted(
-                (
-                    key
-                    for key, tpl in style_map.items()
-                    if key != "none" and str(tpl.shape or "").casefold() == "round"
-                ),
-                key=str.casefold,
-            )
-            if round_like:
-                return round_like[0]
-        if style in {"square", "rect", "rectangle"}:
-            square_like = sorted(
-                (
-                    key
-                    for key, tpl in style_map.items()
-                    if key != "none" and str(tpl.shape or "").casefold() == "square"
-                ),
-                key=str.casefold,
-            )
-            if square_like:
-                return square_like[0]
-    if circular_ring is None:
-        return "none"
-    if not circular_ring:
-        return "none"
-    if "round" in style_map:
-        return "round"
-    round_like = sorted(
-        (
-            key
-            for key, tpl in style_map.items()
-            if key != "none" and str(tpl.shape or "").casefold() == "round"
-        ),
-        key=str.casefold,
-    )
-    return round_like[0] if round_like else "none"
+    _sync_template_sources()
+    return _template_domain.normalize_icon_style(icon_style, circular_ring)
 
 
 def resolve_icon_template(
     icon_style: str | None,
     circular_ring: bool | None = None,
 ) -> IconTemplate:
-    mapping = _icon_template_map()
-    style = normalize_icon_style(icon_style, circular_ring)
-    return mapping.get(style, mapping["none"])
+    _sync_template_sources()
+    return _template_domain.resolve_icon_template(icon_style, circular_ring)
 
 
 def normalize_border_shader_config(
     config: BorderShaderConfig | dict[str, object] | None,
 ) -> BorderShaderConfig:
-    if config is None:
-        return BorderShaderConfig()
-    if isinstance(config, BorderShaderConfig):
-        raw = config
-    elif isinstance(config, dict):
-        raw = BorderShaderConfig(
-            enabled=bool(config.get("enabled", False)),
-            mode=str(config.get("mode", "hsv")).strip().casefold() or "hsv",
-            hue=int(config.get("hue", 0) or 0),
-            saturation=int(config.get("saturation", 100) or 100),
-            tone=int(config.get("tone", 100) or 100),
-            intensity=int(config.get("intensity", 0) or 0),
-        )
-    else:
-        return BorderShaderConfig()
-    mode = raw.mode if raw.mode in {"hsv", "hsl"} else "hsv"
-    return BorderShaderConfig(
-        enabled=bool(raw.enabled),
-        mode=mode,
-        hue=max(0, min(359, int(raw.hue))),
-        saturation=max(0, min(100, int(raw.saturation))),
-        tone=max(0, min(100, int(raw.tone))),
-        intensity=max(0, min(100, int(raw.intensity))),
-    )
+    return _template_domain.normalize_border_shader_config(config)
 
 
 def border_shader_to_dict(
     config: BorderShaderConfig | dict[str, object] | None,
 ) -> dict[str, object]:
-    normalized = normalize_border_shader_config(config)
-    return {
-        "enabled": bool(normalized.enabled),
-        "mode": normalized.mode,
-        "hue": int(normalized.hue),
-        "saturation": int(normalized.saturation),
-        "tone": int(normalized.tone),
-        "intensity": int(normalized.intensity),
-    }
+    return _template_domain.border_shader_to_dict(config)
 
 
 def normalize_text_extraction_method(
@@ -2091,126 +2010,22 @@ def apply_text_preserve_to_cutout(
 
 
 def _shader_rgb(config: BorderShaderConfig) -> tuple[int, int, int]:
-    hue = config.hue / 360.0
-    sat = config.saturation / 100.0
-    tone = config.tone / 100.0
-    if config.mode == "hsl":
-        red, green, blue = colorsys.hls_to_rgb(hue, tone, sat)
-    else:
-        red, green, blue = colorsys.hsv_to_rgb(hue, sat, tone)
-    return (
-        max(0, min(255, int(round(red * 255.0)))),
-        max(0, min(255, int(round(green * 255.0)))),
-        max(0, min(255, int(round(blue * 255.0)))),
-    )
+    return _template_domain._shader_rgb(config)
 
 
 def _analysis_sidecar_path(template_path: Path) -> Path:
-    return template_path.with_suffix(".analysis.json")
+    return _template_domain._analysis_sidecar_path(template_path)
 
 
 def _shape_from_mask(mask: Image.Image | None) -> str | None:
-    if mask is None:
-        return None
-    bbox = mask.getbbox()
-    if bbox is None:
-        return None
-    left, top, right, bottom = bbox
-    width = max(1, right - left)
-    height = max(1, bottom - top)
-    if abs(width - height) > max(2, int(max(width, height) * 0.15)):
-        return "square"
-    values = mask.tobytes()
-    area = sum(1 for value in values if value > 20)
-    fill_ratio = area / float(width * height)
-    # Circle-like interiors tend to be around pi/4 of the bounding square.
-    if 0.68 <= fill_ratio <= 0.86:
-        return "round"
-    return "square"
+    return _template_domain._shape_from_mask(mask)
 
 
 def _analyze_template_alpha(
     overlay: Image.Image,
     alpha_threshold: int = 8,
 ) -> tuple[Image.Image | None, dict[str, object]]:
-    alpha = overlay.getchannel("A")
-    width, height = alpha.size
-    total = width * height
-    if total <= 0:
-        return None, {"interior_pixels": 0, "outside_pixels": 0, "transparent_pixels": 0}
-
-    alpha_bytes = alpha.tobytes()
-    transparent = [value <= alpha_threshold for value in alpha_bytes]
-    outside = [False] * total
-    queue: deque[int] = deque()
-
-    def _enqueue(index: int) -> None:
-        if 0 <= index < total and transparent[index] and not outside[index]:
-            outside[index] = True
-            queue.append(index)
-
-    for x in range(width):
-        _enqueue(x)
-        _enqueue((height - 1) * width + x)
-    for y in range(height):
-        _enqueue(y * width)
-        _enqueue(y * width + (width - 1))
-
-    while queue:
-        idx = queue.popleft()
-        x = idx % width
-        y = idx // width
-        if x > 0:
-            _enqueue(idx - 1)
-        if x + 1 < width:
-            _enqueue(idx + 1)
-        if y > 0:
-            _enqueue(idx - width)
-        if y + 1 < height:
-            _enqueue(idx + width)
-
-    interior_bytes = bytearray(total)
-    interior_pixels = 0
-    transparent_pixels = 0
-    outside_pixels = 0
-    min_x, min_y = width, height
-    max_x, max_y = -1, -1
-    for idx in range(total):
-        if not transparent[idx]:
-            continue
-        transparent_pixels += 1
-        if outside[idx]:
-            outside_pixels += 1
-            continue
-        interior_bytes[idx] = 255
-        interior_pixels += 1
-        x = idx % width
-        y = idx // width
-        if x < min_x:
-            min_x = x
-        if y < min_y:
-            min_y = y
-        if x > max_x:
-            max_x = x
-        if y > max_y:
-            max_y = y
-
-    if interior_pixels <= 0:
-        return None, {
-            "interior_pixels": 0,
-            "outside_pixels": outside_pixels,
-            "transparent_pixels": transparent_pixels,
-        }
-
-    interior_mask = Image.frombytes("L", (width, height), bytes(interior_bytes))
-    bbox = [int(min_x), int(min_y), int(max_x + 1), int(max_y + 1)]
-    stats: dict[str, object] = {
-        "interior_pixels": interior_pixels,
-        "outside_pixels": outside_pixels,
-        "transparent_pixels": transparent_pixels,
-        "interior_bbox": bbox,
-    }
-    return interior_mask, stats
+    return _template_domain._analyze_template_alpha(overlay, alpha_threshold)
 
 
 def _write_template_analysis_metadata(
@@ -2220,60 +2035,23 @@ def _write_template_analysis_metadata(
     shape: str | None,
     stats: dict[str, object],
 ) -> None:
-    payload = {
-        "template_file": template_path.name,
-        "template_mtime_ns": int(template_mtime_ns),
-        "shape": shape or "",
-        "alpha_threshold": 8,
-        **stats,
-    }
-    sidecar = _analysis_sidecar_path(template_path)
-    try:
-        sidecar.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        return
-
-
-@lru_cache(maxsize=64)
-def _load_template_analysis(path_text: str, template_mtime_ns: int) -> TemplateAnalysis | None:
-    if not path_text:
-        return None
-    template_path = Path(path_text)
-    if not template_path.exists():
-        return None
-    try:
-        image = Image.open(template_path)
-        image.load()
-        overlay = image.convert("RGBA")
-    except OSError:
-        return None
-    interior_mask, stats = _analyze_template_alpha(overlay, alpha_threshold=8)
-    shape_meta, _label_meta = _parse_template_metadata(template_path)
-    shape = shape_meta or _shape_from_mask(interior_mask) or _shape_from_name(template_path.stem)
-    _write_template_analysis_metadata(
+    _template_domain._write_template_analysis_metadata(
         template_path,
         template_mtime_ns=template_mtime_ns,
         shape=shape,
         stats=stats,
     )
-    return TemplateAnalysis(
-        overlay=overlay,
-        interior_mask=interior_mask,
-        shape=shape,
-    )
+
+
+@lru_cache(maxsize=64)
+def _load_template_analysis(path_text: str, template_mtime_ns: int) -> TemplateAnalysis | None:
+    _sync_template_sources()
+    return _template_domain._load_template_analysis(path_text, template_mtime_ns)
 
 
 def _get_template_analysis(template: IconTemplate) -> TemplateAnalysis | None:
-    if template.path is None:
-        return None
-    try:
-        mtime_ns = int(template.path.stat().st_mtime_ns)
-    except OSError:
-        return None
-    return _load_template_analysis(str(template.path), mtime_ns)
+    _sync_template_sources()
+    return _template_domain._get_template_analysis(template)
 
 
 def _inner_shape_mask(shape: str, size: int) -> Image.Image:
@@ -2296,12 +2074,7 @@ def _inner_shape_mask(shape: str, size: int) -> Image.Image:
 
 
 def _fit_to_square(image: Image.Image, size: int) -> Image.Image:
-    fitted = ImageOps.contain(image, (size, size), method=Image.Resampling.LANCZOS)
-    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    out.alpha_composite(
-        fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2)
-    )
-    return out
+    return _template_domain._fit_to_square(image, size)
 
 
 def _apply_template_overlay(
@@ -2310,24 +2083,13 @@ def _apply_template_overlay(
     template: IconTemplate,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
 ) -> Image.Image:
-    if template.template_id == "none":
-        return image
-    analysis = _get_template_analysis(template)
-    if analysis is not None:
-        overlay = analysis.overlay.resize((size, size), Image.Resampling.LANCZOS)
-    else:
-        # Non-file-backed generic overlays are intentionally not used.
-        return image
-    overlay = _apply_border_shader(overlay, border_shader)
-    return Image.alpha_composite(image, overlay)
+    _sync_template_sources()
+    return _template_domain.apply_template_overlay(image, size, template, border_shader)
 
 
 def _template_interior_mask(template: IconTemplate, size: int) -> Image.Image | None:
-    analysis = _get_template_analysis(template)
-    if analysis is not None and analysis.interior_mask is not None:
-        return analysis.interior_mask.resize((size, size), Image.Resampling.LANCZOS)
-    # Non-file-backed generic masks are intentionally not used.
-    return None
+    _sync_template_sources()
+    return _template_domain.template_interior_mask(template, size)
 
 
 def build_template_interior_mask_png(
@@ -2336,32 +2098,19 @@ def build_template_interior_mask_png(
     *,
     circular_ring: bool | None = None,
 ) -> bytes | None:
-    template = resolve_icon_template(icon_style, circular_ring)
-    if template.template_id == "none":
-        return None
-    mask = _template_interior_mask(template, size)
-    if mask is None:
-        return None
-    out = BytesIO()
-    mask.save(out, format="PNG")
-    return out.getvalue()
+    _sync_template_sources()
+    return _template_domain.build_template_interior_mask_png(
+        icon_style,
+        size=size,
+        circular_ring=circular_ring,
+    )
 
 
 def _apply_border_shader(
     overlay: Image.Image,
     border_shader: BorderShaderConfig | dict[str, object] | None,
 ) -> Image.Image:
-    shader = normalize_border_shader_config(border_shader)
-    if not shader.enabled or shader.intensity <= 0:
-        return overlay
-    if overlay.mode != "RGBA":
-        overlay = overlay.convert("RGBA")
-    tint_rgb = _shader_rgb(shader)
-    tint_layer = Image.new("RGBA", overlay.size, (*tint_rgb, 255))
-    blend_alpha = shader.intensity / 100.0
-    blended = Image.blend(overlay, tint_layer, blend_alpha)
-    blended.putalpha(overlay.getchannel("A"))
-    return blended
+    return _template_domain._apply_border_shader(overlay, border_shader)
 
 
 def _build_master(image_bytes: bytes) -> Image.Image:
@@ -2379,25 +2128,14 @@ def _build_composited_icon(
     foreground: Image.Image | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
 ) -> Image.Image:
-    if template.template_id == "none":
-        base = _fit_to_square(master, size)
-    else:
-        source = _fit_to_square(master, size)
-        base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        interior_mask = _template_interior_mask(template, size)
-        if interior_mask is not None:
-            # Keep outside area transparent; black-fill only within template interior.
-            black_fill = Image.new("RGBA", (size, size), (0, 0, 0, 255))
-            base.paste(black_fill, (0, 0), interior_mask)
-            src_alpha = source.getchannel("A")
-            combined_mask = ImageChops.multiply(src_alpha, interior_mask)
-            base.paste(source, (0, 0), combined_mask)
-        else:
-            base.alpha_composite(source)
-    base = _apply_template_overlay(base, size, template, border_shader=border_shader)
-    if foreground is not None:
-        base = Image.alpha_composite(base, _fit_to_square(foreground, size))
-    return base
+    _sync_template_sources()
+    return _template_domain.build_composited_icon(
+        master,
+        size,
+        template,
+        foreground=foreground,
+        border_shader=border_shader,
+    )
 
 
 def _escape_foreground_image(
@@ -2456,12 +2194,12 @@ def build_template_overlay_preview(
     size: int = 256,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
 ) -> bytes:
-    template = resolve_icon_template(icon_style, circular_ring=False)
-    base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    rendered = _apply_template_overlay(base, size, template, border_shader=border_shader)
-    out = BytesIO()
-    rendered.save(out, format="PNG")
-    return out.getvalue()
+    _sync_template_sources()
+    return _template_domain.build_template_overlay_preview(
+        icon_style,
+        size=size,
+        border_shader=border_shader,
+    )
 
 
 def build_multi_size_ico(
