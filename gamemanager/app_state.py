@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ from gamemanager.db import Database
 from gamemanager.models import (
     IconApplyResult,
     IconCandidate,
+    IconRebuildEntry,
     InventoryItem,
     MovePlanItem,
     OperationReport,
@@ -18,6 +20,13 @@ from gamemanager.models import (
     TagCandidate,
 )
 from gamemanager.services.icon_repair import repair_absolute_icon_paths
+from gamemanager.services.icon_readability import (
+    build_rebuild_preview_frames,
+    clean_backup_icon_files,
+    collect_existing_local_icons,
+    is_local_folder_icon,
+    rebuild_existing_local_icons,
+)
 from gamemanager.services.icon_cache import DiskImageCache
 from gamemanager.services.icon_pipeline import build_preview_png
 from gamemanager.services.icon_apply_subprocess import apply_folder_icon_in_subprocess
@@ -57,6 +66,24 @@ class AppState:
     @staticmethod
     def _pref_bool(value: str) -> bool:
         return value.strip().casefold() not in {"0", "false", "no", "off", ""}
+
+    @staticmethod
+    def _normalize_preview_payload(payload: bytes) -> bytes:
+        if not payload:
+            return payload
+        try:
+            from PIL import Image, ImageOps
+
+            with Image.open(BytesIO(payload)) as image:
+                image.load()
+                image = ImageOps.exif_transpose(image)
+                if image.mode not in {"RGB", "RGBA"}:
+                    image = image.convert("RGBA")
+                out = BytesIO()
+                image.save(out, format="PNG")
+                return out.getvalue()
+        except Exception:
+            return payload
 
     def _perf_scan_workers(self) -> int | None:
         raw = self.get_ui_pref("perf_scan_size_workers", "0").strip()
@@ -366,6 +393,9 @@ class AppState:
         return f"Success. Candidates found: {', '.join(chunks)}"
 
     def download_candidate(self, candidate: IconCandidate) -> bytes:
+        local_path = Path(str(candidate.image_url or "").strip())
+        if local_path.exists() and local_path.is_file():
+            return local_path.read_bytes()
         cache_key = candidate.image_url
         cached = self.download_cache.read(cache_key, extension=".img")
         if cached is not None:
@@ -390,9 +420,14 @@ class AppState:
         if cached is not None:
             return cached
         preview_source = candidate.preview_url or candidate.image_url
-        payload = download_candidate_image(preview_source)
+        preview_path = Path(str(preview_source or "").strip())
+        if preview_path.exists() and preview_path.is_file():
+            payload = preview_path.read_bytes()
+        else:
+            payload = download_candidate_image(preview_source)
+        normalized_payload = self._normalize_preview_payload(payload)
         preview = build_preview_png(
-            payload,
+            normalized_payload,
             size=size,
             icon_style=style_key,
             bg_removal_engine=bg_key,
@@ -412,6 +447,7 @@ class AppState:
         bg_removal_params: dict[str, object] | None = None,
         text_preserve_config: dict[str, object] | None = None,
         border_shader: dict[str, object] | None = None,
+        size_improvements: dict[int, dict[str, object]] | None = None,
     ) -> IconApplyResult:
         # Isolate icon build/apply in a subprocess so decoder/plugin crashes cannot
         # take down the main UI process.
@@ -425,6 +461,7 @@ class AppState:
             bg_removal_params=bg_removal_params,
             text_preserve_config=text_preserve_config,
             border_shader=border_shader,
+            size_improvements=size_improvements,
             temp_dir=self.db.db_path.parent / "tmp",
         )
 
@@ -516,3 +553,65 @@ class AppState:
 
     def repair_absolute_icon_paths(self) -> OperationReport:
         return repair_absolute_icon_paths(self.list_roots())
+
+    def _local_icon_targets(
+        self,
+        items: list[InventoryItem],
+    ) -> list[tuple[Path, Path]]:
+        targets: list[tuple[Path, Path]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            if not item.is_dir or item.icon_status != "valid" or not item.folder_icon_path:
+                continue
+            folder_path = Path(item.full_path)
+            icon_path = Path(item.folder_icon_path)
+            if not is_local_folder_icon(folder_path, icon_path):
+                continue
+            key = (str(folder_path.resolve()), str(icon_path.resolve()))
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((folder_path, icon_path))
+        return targets
+
+    def collect_icon_rebuild_entries(
+        self,
+        items: list[InventoryItem],
+    ) -> tuple[OperationReport, list[IconRebuildEntry]]:
+        return collect_existing_local_icons(self._local_icon_targets(items))
+
+    def rebuild_existing_icons(
+        self,
+        entries: list[IconRebuildEntry],
+        size_improvements: dict[int, dict[str, object]] | None = None,
+        *,
+        force_rebuild: bool = False,
+        create_backups: bool = True,
+        progress_cb: Callable[[str, int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> OperationReport:
+        return rebuild_existing_local_icons(
+            entries,
+            size_improvements=size_improvements,
+            force_rebuild=force_rebuild,
+            create_backups=create_backups,
+            progress_cb=progress_cb,
+            should_cancel=should_cancel,
+        )
+
+    def icon_rebuild_preview_frames(
+        self,
+        entry: IconRebuildEntry,
+        sizes: tuple[int, ...] = (16, 24, 32, 48),
+        size_improvements: dict[int, dict[str, object]] | None = None,
+    ) -> dict[int, tuple[bytes, bytes]]:
+        return build_rebuild_preview_frames(
+            entry,
+            sizes=sizes,
+            size_improvements=size_improvements,
+        )
+
+    def clean_backup_icons(self) -> OperationReport:
+        roots = self.list_roots()
+        root_paths = [Path(root.path) for root in roots]
+        return clean_backup_icon_files(root_paths)

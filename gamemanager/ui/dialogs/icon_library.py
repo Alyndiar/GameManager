@@ -741,7 +741,15 @@ class WebDownloadCaptureDialog(QDialog):
         cached = self._thumb_icon_cache.get(cache_key)
         if cached is not None:
             return cached
-        pix = QPixmap(str(path))
+        pix = QPixmap()
+        try:
+            payload = _normalize_image_bytes_for_canvas(path.read_bytes())
+        except OSError:
+            payload = b""
+        if payload:
+            pix.loadFromData(payload)
+        if pix.isNull():
+            pix = QPixmap(str(path))
         if pix.isNull():
             icon = QIcon()
             self._thumb_icon_cache[cache_key] = icon
@@ -975,6 +983,8 @@ class IconPickerDialog(QDialog):
         web_download_dir_saver: Callable[[str], None] | None = None,
         initial_web_download_mode: str = "auto",
         web_download_mode_saver: Callable[[str], None] | None = None,
+        processing_controls_visible: bool = True,
+        size_improvements: dict[int, dict[str, object]] | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -994,6 +1004,7 @@ class IconPickerDialog(QDialog):
         self._web_download_mode = str(initial_web_download_mode or "auto").strip().casefold()
         if self._web_download_mode not in {"auto", "manual"}:
             self._web_download_mode = "auto"
+        self._processing_controls_visible = bool(processing_controls_visible)
         self._web_download_mode_saver = web_download_mode_saver
         self.cancel_all_requested = False
         self._web_capture_dialog: WebDownloadCaptureDialog | None = None
@@ -1003,6 +1014,7 @@ class IconPickerDialog(QDialog):
         self._prepared_is_final_composite = False
         self._local_source_label = "Local File"
         self._local_source_row: int | None = None
+        self._size_improvements = dict(size_improvements or {})
         self._preview_pix_cache: dict[tuple[int, int, str], QPixmap] = {}
         self._hover_row: int | None = None
         self._border_shader = border_shader_to_dict(initial_border_shader)
@@ -1079,7 +1091,8 @@ class IconPickerDialog(QDialog):
         layout.addWidget(self.table)
 
         options_row = QHBoxLayout()
-        options_row.addWidget(QLabel("Icon Type:", self))
+        self.icon_type_label = QLabel("Icon Type:", self)
+        options_row.addWidget(self.icon_type_label)
         self.icon_style_combo = QComboBox(self)
         for label, value in icon_style_options():
             self.icon_style_combo.addItem(label, value)
@@ -1100,7 +1113,8 @@ class IconPickerDialog(QDialog):
         self.border_shader_btn.setToolTip("Border Shader Controls")
         self.border_shader_btn.clicked.connect(self._on_open_border_shader)
         options_row.addWidget(self.border_shader_btn)
-        options_row.addWidget(QLabel("Cutout:", self))
+        self.cutout_label = QLabel("Cutout:", self)
+        options_row.addWidget(self.cutout_label)
         self.bg_removal_combo = QComboBox(self)
         for label, value in BACKGROUND_REMOVAL_OPTIONS:
             self.bg_removal_combo.addItem(label, value)
@@ -1110,7 +1124,8 @@ class IconPickerDialog(QDialog):
             self.bg_removal_combo.setCurrentIndex(bg_idx)
         self.bg_removal_combo.currentIndexChanged.connect(self._on_bg_engine_changed)
         options_row.addWidget(self.bg_removal_combo)
-        options_row.addWidget(QLabel("Text:", self))
+        self.text_label = QLabel("Text:", self)
+        options_row.addWidget(self.text_label)
         self.text_extract_combo = QComboBox(self)
         for label, value in TEXT_EXTRACTION_METHOD_OPTIONS:
             self.text_extract_combo.addItem(label, value)
@@ -1164,6 +1179,31 @@ class IconPickerDialog(QDialog):
         layout.addWidget(buttons)
         self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         self._refresh_border_shader_button()
+        if not self._processing_controls_visible:
+            none_idx = self.icon_style_combo.findData("none")
+            if none_idx >= 0:
+                self.icon_style_combo.setCurrentIndex(none_idx)
+            bg_none_idx = self.bg_removal_combo.findData("none")
+            if bg_none_idx >= 0:
+                self.bg_removal_combo.setCurrentIndex(bg_none_idx)
+            text_none_idx = self.text_extract_combo.findData("none")
+            if text_none_idx >= 0:
+                self.text_extract_combo.setCurrentIndex(text_none_idx)
+            self._text_preserve_config = text_preserve_to_dict(
+                {"enabled": False, "method": "none"}
+            )
+            self._border_shader = border_shader_to_dict({"enabled": False})
+            for widget in (
+                self.icon_type_label,
+                self.icon_style_combo,
+                self.icon_style_gallery_btn,
+                self.border_shader_btn,
+                self.cutout_label,
+                self.bg_removal_combo,
+                self.text_label,
+                self.text_extract_combo,
+            ):
+                widget.setVisible(False)
         self._sync_template_dependents()
         self._update_resource_summary()
         self._update_refresh_candidates_button()
@@ -1172,7 +1212,8 @@ class IconPickerDialog(QDialog):
         _bind_dialog_shortcut(self, "Alt+F", self._on_adjust_framing)
         _bind_dialog_shortcut(self, "Ctrl+R", self._on_refresh_candidates)
         _bind_dialog_shortcut(self, "Alt+P", self._on_manage_resource_priority)
-        _bind_dialog_shortcut(self, "Alt+G", self._on_pick_icon_style_from_gallery)
+        if self._processing_controls_visible:
+            _bind_dialog_shortcut(self, "Alt+G", self._on_pick_icon_style_from_gallery)
         _bind_dialog_shortcut(self, "Ctrl+Return", self._validate_then_accept)
         _bind_dialog_shortcut(self, "Ctrl+Enter", self._validate_then_accept)
         if show_cancel_all:
@@ -1194,11 +1235,12 @@ class IconPickerDialog(QDialog):
             "Alt+F - Adjust framing",
             "Ctrl+R - Refresh results",
             "Alt+P - Resource priority",
-            "Alt+G - Open template gallery",
             "Ctrl+Enter - Accept selection",
             "Esc - Cancel dialog",
             "F1 - Show shortcuts",
         ]
+        if self._processing_controls_visible:
+            lines.insert(5, "Alt+G - Open template gallery")
         if hasattr(self, "cancel_all_btn"):
             lines.insert(-2, "Alt+C - Cancel all")
         QMessageBox.information(self, "Icon Picker Shortcuts", "\n".join(lines))
@@ -1816,6 +1858,7 @@ class IconPickerDialog(QDialog):
             initial_bg_removal_params=dict(self._bg_removal_params),
             initial_text_preserve_config=dict(self._text_preserve_config),
             border_shader=self._border_shader_config(),
+            size_improvements=self._size_improvements,
             parent=self,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:

@@ -116,3 +116,11 @@ class IconApplyResult:
     message: str
     ico_path: str | None = None
     desktop_ini_path: str | None = None
+
+
+@dataclass(slots=True)
+class IconRebuildEntry:
+    folder_path: str
+    icon_path: str
+    already_rebuilt: bool
+    summary: str

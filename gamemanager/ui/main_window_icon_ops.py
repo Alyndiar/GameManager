@@ -1,28 +1,368 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QDialog, QInputDialog, QMessageBox
 
-from gamemanager.models import InventoryItem
+from gamemanager.models import IconCandidate, IconRebuildEntry, InventoryItem
 from gamemanager.services.background_removal import normalize_background_removal_engine
 from gamemanager.services.icon_pipeline import (
     border_shader_to_dict,
+    default_icon_size_improvements,
     normalize_border_shader_config,
+    normalize_icon_size_improvements,
     normalize_icon_style,
 )
 from gamemanager.ui.dialogs import (
     IconConverterDialog,
     IconPickerDialog,
+    IconRebuildPreviewItem,
     TemplatePrepDialog,
     TemplateTransparencyDialog,
 )
 
 
+REBUILD_PREVIEW_MODES = ("all", "sample", "off")
+REBUILD_PREVIEW_MODE_LABELS = {
+    "all": "All",
+    "sample": "Sample",
+    "off": "Off",
+}
+REBUILD_PREVIEW_MODE_BY_LABEL = {
+    label: mode for mode, label in REBUILD_PREVIEW_MODE_LABELS.items()
+}
+REBUILD_PREVIEW_SAMPLE_COUNT = 8
+
+
 class MainWindowIconOpsMixin:
+    @staticmethod
+    def _current_folder_icon_candidate(entry: InventoryItem) -> IconCandidate | None:
+        icon_path_text = str(entry.folder_icon_path or "").strip()
+        if not icon_path_text:
+            return None
+        icon_path = Path(icon_path_text)
+        if not icon_path.exists() or not icon_path.is_file():
+            return None
+        return IconCandidate(
+            provider="Current Folder Icon",
+            candidate_id=f"local-existing:{entry.full_path}",
+            title=f"Current icon ({icon_path.name})",
+            preview_url=str(icon_path),
+            image_url=str(icon_path),
+            width=0,
+            height=0,
+            has_alpha=True,
+            source_url=str(icon_path),
+        )
+
+    def _icon_rebuild_target_entries(self) -> tuple[list[InventoryItem], bool]:
+        selected = [
+            item
+            for item in self._selected_right_entries()
+            if item.is_dir and item.icon_status == "valid" and item.folder_icon_path
+        ]
+        if selected:
+            return selected, True
+        return (
+            [
+            item
+            for item in self.inventory
+            if item.is_dir and item.icon_status == "valid" and item.folder_icon_path
+            ],
+            False,
+        )
+
+    @staticmethod
+    def _normalize_rebuild_preview_mode(value: str) -> str:
+        normalized = str(value or "").strip().casefold()
+        if normalized in REBUILD_PREVIEW_MODES:
+            return normalized
+        return "sample"
+
+    def _load_rebuild_preview_mode_pref(self) -> str:
+        value = self.state.get_ui_pref("icon_rebuild_preview_mode", "sample")
+        return self._normalize_rebuild_preview_mode(value)
+
+    def _save_rebuild_preview_mode_pref(self, value: str) -> None:
+        self.state.set_ui_pref(
+            "icon_rebuild_preview_mode",
+            self._normalize_rebuild_preview_mode(value),
+        )
+
+    def _load_rebuild_create_backups_pref(self) -> bool:
+        value = self.state.get_ui_pref("icon_rebuild_create_backups", "1").strip().casefold()
+        return value not in {"0", "false", "no", "off"}
+
+    def _save_rebuild_create_backups_pref(self, enabled: bool) -> None:
+        self.state.set_ui_pref("icon_rebuild_create_backups", "1" if enabled else "0")
+
+    def _load_icon_rebuild_mode_pref(self) -> str:
+        mode = self.state.get_ui_pref("icon_rebuild_mode", "guided").strip().casefold()
+        return mode if mode in {"guided", "automatic"} else "guided"
+
+    def _save_icon_rebuild_mode_pref(self, mode: str) -> None:
+        normalized = str(mode or "").strip().casefold()
+        self.state.set_ui_pref(
+            "icon_rebuild_mode",
+            normalized if normalized in {"guided", "automatic"} else "guided",
+        )
+
+    def _load_rebuild_size_improvement_defaults(self) -> dict[int, dict[str, object]]:
+        fallback = default_icon_size_improvements()
+        raw = self.state.get_ui_pref("icon_rebuild_size_improvements_defaults", "").strip()
+        if not raw:
+            return normalize_icon_size_improvements(fallback)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return normalize_icon_size_improvements(fallback)
+        if not isinstance(parsed, dict):
+            return normalize_icon_size_improvements(fallback)
+        return normalize_icon_size_improvements(parsed)
+
+    def _save_rebuild_size_improvement_defaults(
+        self,
+        defaults: dict[int, dict[str, object]],
+    ) -> None:
+        normalized = normalize_icon_size_improvements(defaults)
+        self.state.set_ui_pref(
+            "icon_rebuild_size_improvements_defaults",
+            json.dumps(normalized, sort_keys=True),
+        )
+
+    def _prompt_rebuild_preview_mode(self, candidate_count: int) -> str | None:
+        current_mode = self._load_rebuild_preview_mode_pref()
+        labels = [REBUILD_PREVIEW_MODE_LABELS[mode] for mode in REBUILD_PREVIEW_MODES]
+        current_label = REBUILD_PREVIEW_MODE_LABELS[current_mode]
+        current_index = labels.index(current_label) if current_label in labels else 1
+        selected_label, accepted = QInputDialog.getItem(
+            self,
+            "Rebuild Existing Icons",
+            (
+                "Preview mode before rebuild (single-icon rebuild previews remain on for "
+                "All/Sample):"
+            ),
+            labels,
+            current_index,
+            False,
+        )
+        if not accepted:
+            return None
+        mode = REBUILD_PREVIEW_MODE_BY_LABEL.get(str(selected_label), "sample")
+        self._save_rebuild_preview_mode_pref(mode)
+        if candidate_count <= 1 and mode in {"all", "sample"}:
+            return "all"
+        return mode
+
+    @staticmethod
+    def _preview_entries_for_mode(
+        entries: list[IconRebuildEntry],
+        mode: str,
+    ) -> list[IconRebuildEntry]:
+        normalized = str(mode).strip().casefold()
+        if normalized == "off":
+            return []
+        ordered = sorted(
+            entries,
+            key=lambda entry: (
+                0 if not bool(getattr(entry, "already_rebuilt", False)) else 1,
+                str(getattr(entry, "folder_path", "")).casefold(),
+            ),
+        )
+        if normalized == "all":
+            return ordered
+        if len(ordered) <= 1:
+            return ordered
+        return ordered[: min(REBUILD_PREVIEW_SAMPLE_COUNT, len(ordered))]
+
+    def _show_rebuild_preview_dialog(
+        self,
+        entries: list[IconRebuildEntry],
+        size_improvements: dict[int, dict[str, object]],
+        default_size_improvements: dict[int, dict[str, object]],
+        create_backups: bool,
+    ) -> tuple[dict[int, dict[str, object]], dict[int, dict[str, object]], bool] | None:
+        preview_items: list[IconRebuildPreviewItem] = []
+        for entry in entries:
+            folder_name = Path(str(entry.folder_path)).name or str(entry.folder_path)
+            preview_items.append(
+                IconRebuildPreviewItem(
+                    label=folder_name,
+                    folder_path=str(entry.folder_path),
+                    icon_path=str(entry.icon_path),
+                    already_rebuilt=bool(entry.already_rebuilt),
+                    summary=str(entry.summary),
+                    entry=entry,
+                )
+            )
+        if not preview_items:
+            return (
+                normalize_icon_size_improvements(size_improvements),
+                normalize_icon_size_improvements(default_size_improvements),
+                bool(create_backups),
+            )
+
+        dialog = self._icon_rebuild_preview_dialog_cls(
+            preview_items,
+            frame_loader=lambda entry, profile: self.state.icon_rebuild_preview_frames(
+                entry,
+                size_improvements=profile,
+            ),
+            size_improvements=size_improvements,
+            default_size_improvements=default_size_improvements,
+            create_backups=create_backups,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return (
+            dialog.size_improvements(),
+            dialog.default_size_improvements(),
+            dialog.create_backups_enabled(),
+        )
+
+    def _on_rebuild_existing_icons(self) -> None:
+        targets, used_selected_scope = self._icon_rebuild_target_entries()
+        if not targets:
+            QMessageBox.information(
+                self,
+                "Rebuild Existing Icons",
+                "No local folder icons found. Select folders with existing local icons or refresh inventory.",
+            )
+            return
+
+        collect_report, entries = self.state.collect_icon_rebuild_entries(targets)
+        if not entries:
+            QMessageBox.information(
+                self,
+                "Rebuild Existing Icons",
+                "No local folder icons were eligible for rebuild.",
+            )
+            return
+        single_icon_mode = len(targets) == 1 and len(entries) == 1
+        rebuild_mode = self._load_icon_rebuild_mode_pref()
+        automatic_mode = rebuild_mode == "automatic"
+        if single_icon_mode:
+            rebuild_candidates = [entries[0]]
+        else:
+            rebuild_candidates = [
+                entry
+                for entry in entries
+                if not bool(getattr(entry, "already_rebuilt", False))
+            ]
+        already_rebuilt_count = sum(1 for entry in entries if entry.already_rebuilt)
+        if not rebuild_candidates:
+            QMessageBox.information(
+                self,
+                "Rebuild Existing Icons",
+                "All eligible local icons are already marked as rebuilt (desktop.ini Rebuilt=true).",
+            )
+            return
+
+        preview_mode = "off" if automatic_mode else "all"
+        if (not single_icon_mode) and (not automatic_mode):
+            selected_mode = self._prompt_rebuild_preview_mode(len(rebuild_candidates))
+            if selected_mode is None:
+                return
+            preview_mode = selected_mode
+        preview_entries = self._preview_entries_for_mode(
+            rebuild_candidates,
+            preview_mode,
+        )
+        previewed_count = len(preview_entries)
+        default_size_improvements = self._load_rebuild_size_improvement_defaults()
+        size_improvements = copy.deepcopy(default_size_improvements)
+        create_backups = self._load_rebuild_create_backups_pref()
+        if preview_entries and (not automatic_mode):
+            preview_result = self._show_rebuild_preview_dialog(
+                preview_entries,
+                size_improvements=size_improvements,
+                default_size_improvements=default_size_improvements,
+                create_backups=create_backups,
+            )
+            if preview_result is None:
+                return
+            size_improvements, updated_defaults, create_backups = preview_result
+            self._save_rebuild_size_improvement_defaults(updated_defaults)
+            self._save_rebuild_create_backups_pref(create_backups)
+        elif automatic_mode:
+            self._save_icon_rebuild_mode_pref("automatic")
+
+        preview_scope_text = "Off"
+        if preview_mode == "all":
+            preview_scope_text = f"All ({previewed_count}/{len(rebuild_candidates)})"
+        elif preview_mode == "sample":
+            preview_scope_text = f"Sample ({previewed_count}/{len(rebuild_candidates)})"
+        prompt_lines = [
+            f"Scope: {'selected' if used_selected_scope else 'all local icons'}",
+            "",
+            f"Eligible local icons: {collect_report.total}",
+            f"Already rebuilt: {already_rebuilt_count}",
+            "",
+            f"Rebuild candidates now: {len(rebuild_candidates)}",
+            f"Rebuild previews: {preview_scope_text}",
+            f"Rebuild mode: {'Automatic (saved defaults)' if automatic_mode else 'Guided'}",
+            (
+                "Single-icon mode can force a rebuild even when Rebuilt=true."
+                if single_icon_mode
+                else ""
+            ),
+            (
+                "Proceed with rebuild now? Backup files (*.gm_backup_YYYYMMDDHHMMSS.ico) will be created first."
+                if create_backups
+                else "Proceed with rebuild now? Backups are disabled."
+            ),
+        ]
+        prompt_lines = [line for line in prompt_lines if line]
+        decision = QMessageBox.question(
+            self,
+            "Rebuild Existing Icons",
+            "\n".join(prompt_lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+
+        def _run(progress_cb, should_cancel):
+            return self.state.rebuild_existing_icons(
+                rebuild_candidates,
+                size_improvements=size_improvements,
+                force_rebuild=single_icon_mode,
+                create_backups=create_backups,
+                progress_cb=progress_cb,
+                should_cancel=should_cancel,
+            )
+
+        def _done(report):
+            if report.succeeded > 0:
+                self._folder_icon_cache.clear()
+                self._folder_icon_preview_cache.clear()
+                try:
+                    self._populate_right(self.inventory)
+                except Exception:
+                    self._set_refresh_needed(True)
+            if not single_icon_mode:
+                lines = [
+                    f"Rebuilt: {report.succeeded}",
+                    f"Failed: {report.failed}",
+                    f"Skipped: {report.skipped}",
+                ]
+                if report.details:
+                    lines.append("")
+                    lines.extend(report.details[:12])
+                QMessageBox.information(self, "Rebuild Existing Icons", "\n".join(lines))
+
+        self._start_report_operation(
+            "Rebuild Existing Icons",
+            _run,
+            _done,
+        )
+
     def _save_icon_style_pref(self, value: str) -> None:
         self.state.set_ui_pref("icon_style", value.strip() or "none")
 
@@ -100,6 +440,7 @@ class MainWindowIconOpsMixin:
         applied = 0
         replaced = 0
         failed: list[str] = []
+        creation_size_improvements = self._load_rebuild_size_improvement_defaults()
         if selected_count > 1:
             self._begin_interactive_operation("Assign icons", selected_count)
         try:
@@ -134,6 +475,9 @@ class MainWindowIconOpsMixin:
                 except Exception as exc:
                     candidates = []
                     failed.append(f"{entry.full_name}: search failed ({exc})")
+                current_icon_candidate = self._current_folder_icon_candidate(entry)
+                if current_icon_candidate is not None:
+                    candidates = [current_icon_candidate, *candidates]
 
                 dialog = IconPickerDialog(
                     folder_name=query_name,
@@ -159,6 +503,8 @@ class MainWindowIconOpsMixin:
                     web_download_dir_saver=self._save_web_capture_download_dir_pref,
                     initial_web_download_mode=self._load_web_capture_download_mode_pref(),
                     web_download_mode_saver=self._save_web_capture_download_mode_pref,
+                    processing_controls_visible=False,
+                    size_improvements=creation_size_improvements,
                     parent=self,
                 )
                 if dialog.exec() != dialog.DialogCode.Accepted:
@@ -169,16 +515,16 @@ class MainWindowIconOpsMixin:
                     continue
                 payload = dialog.result_payload()
                 image_bytes: bytes
-                icon_style = payload.icon_style
-                bg_removal_engine = payload.bg_removal_engine
-                bg_removal_params = dict(payload.bg_removal_params or {})
-                text_preserve_config = dict(payload.text_preserve_config or {})
-                border_shader = border_shader_to_dict(payload.border_shader)
+                icon_style = "none"
+                bg_removal_engine = "none"
+                bg_removal_params: dict[str, object] = {}
+                text_preserve_config: dict[str, object] = {"enabled": False, "method": "none"}
+                border_shader: dict[str, object] = {"enabled": False}
                 if payload.prepared_is_final_composite:
                     icon_style = "none"
                     bg_removal_engine = "none"
                     bg_removal_params = {}
-                    text_preserve_config = {"enabled": False, "strength": 45, "feather": 1}
+                    text_preserve_config = {"enabled": False, "method": "none"}
                     border_shader = {"enabled": False}
                 text_method_pref = str(text_preserve_config.get("method", "none") or "none")
                 self.state.set_ui_pref("icon_text_extraction_method", text_method_pref)
@@ -223,6 +569,7 @@ class MainWindowIconOpsMixin:
                         bg_removal_params=bg_removal_params,
                         text_preserve_config=text_preserve_config,
                         border_shader=border_shader,
+                        size_improvements=creation_size_improvements,
                     )
                 except Exception as exc:
                     failed.append(f"{entry.full_name}: apply failed ({exc})")
@@ -305,6 +652,8 @@ class MainWindowIconOpsMixin:
             bg_removal_engine_saver=self._save_bg_engine_pref,
             initial_border_shader=border_shader_pref,
             border_shader_saver=self._save_border_shader_pref,
+            processing_controls_visible=False,
+            size_improvements=self._load_rebuild_size_improvement_defaults(),
             parent=self,
         )
         dialog.finished.connect(self._on_icon_converter_closed)

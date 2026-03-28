@@ -44,6 +44,7 @@ from gamemanager.services.teracopy import DEFAULT_TERACOPY_PATH, resolve_teracop
 from gamemanager.ui.dialogs import (
     CleanupPreviewDialog,
     DeleteGroupDialog,
+    IconRebuildPreviewDialog,
     PerformanceSettingsDialog,
     PerformanceSettingsResult,
     IconProviderSettingsDialog,
@@ -422,6 +423,7 @@ class MainWindow(
         self._refresh_worker_cls = RefreshWorker
         self._infotip_backfill_worker_cls = InfoTipBackfillWorker
         self._move_preview_dialog_cls = MovePreviewDialog
+        self._icon_rebuild_preview_dialog_cls = IconRebuildPreviewDialog
         self._delete_group_dialog_cls = DeleteGroupDialog
         self._interactive_operation_active = False
         self._interactive_cancel_requested = False
@@ -486,6 +488,7 @@ class MainWindow(
         self.icon_convert_btn = QPushButton("Ico Conv")
         self.template_prep_btn = QPushButton("PrepTpl")
         self.template_alpha_btn = QPushButton("Tpl Alpha")
+        self.rebuild_icons_btn = QPushButton("Rebuild Ico")
         self.repair_icon_paths_btn = QPushButton("Fix IcoPath")
         self.icon_settings_btn = QPushButton("Icon Src")
         self.perf_btn = QPushButton("Optns")
@@ -511,6 +514,9 @@ class MainWindow(
         self.icon_convert_btn.setToolTip("Image to Icon Converter...\nShortcut: Ctrl+Shift+I")
         self.template_prep_btn.setToolTip("Template Batch Prep...\nShortcut: Ctrl+T")
         self.template_alpha_btn.setToolTip("Template Transparency...\nShortcut: Ctrl+Shift+T")
+        self.rebuild_icons_btn.setToolTip(
+            "Rebuild existing local folder icons (uses desktop.ini Rebuilt flag)\nShortcut: Ctrl+Shift+B"
+        )
         self.repair_icon_paths_btn.setToolTip(
             "Repair absolute/external desktop.ini icon paths to local folder icons\n"
             "Shortcut: Alt+X"
@@ -534,6 +540,7 @@ class MainWindow(
             self.icon_convert_btn,
             self.template_prep_btn,
             self.template_alpha_btn,
+            self.rebuild_icons_btn,
             self.icon_settings_btn,
             self.perf_btn,
             self.move_backend_label,
@@ -582,6 +589,7 @@ class MainWindow(
             self.icon_convert_btn,
             self.template_prep_btn,
             self.template_alpha_btn,
+            self.rebuild_icons_btn,
         ]
         if ENABLE_ICON_PATH_REPAIR_ACTION:
             icon_group_widgets.append(self.repair_icon_paths_btn)
@@ -834,6 +842,7 @@ class MainWindow(
         self.icon_convert_btn.clicked.connect(self._on_open_icon_converter)
         self.template_prep_btn.clicked.connect(self._on_open_template_prep)
         self.template_alpha_btn.clicked.connect(self._on_open_template_transparency)
+        self.rebuild_icons_btn.clicked.connect(self._on_rebuild_existing_icons)
         if ENABLE_ICON_PATH_REPAIR_ACTION:
             self.repair_icon_paths_btn.clicked.connect(self._on_repair_absolute_icon_paths)
         self.icon_settings_btn.clicked.connect(self._on_icon_provider_settings)
@@ -891,6 +900,7 @@ class MainWindow(
             ("Icon Converter", "Ctrl+Shift+I", self._on_open_icon_converter),
             ("Template Batch Prep", "Ctrl+T", self._on_open_template_prep),
             ("Template Transparency", "Ctrl+Shift+T", self._on_open_template_transparency),
+            ("Rebuild Existing Icons", "Ctrl+Shift+B", self._on_rebuild_existing_icons),
             ("Icon Provider Settings", "Alt+S", self._on_icon_provider_settings),
             ("Performance Settings", "Alt+P", self._on_open_performance_settings),
             ("Locate TeraCopy", "Alt+L", self._on_locate_teracopy),
@@ -936,6 +946,7 @@ class MainWindow(
             "Ctrl+I - Assign Folder Icon",
             "Alt+G - Search on Google",
             "Ctrl+Shift+I - Icon Converter",
+            "Ctrl+Shift+B - Rebuild Existing Icons",
             "Alt+I - Refresh InfoTip",
             "Alt+E - Manual InfoTip Entry",
             "Ctrl+T - Template Batch Prep",
@@ -1435,8 +1446,21 @@ class MainWindow(
             ),
             web_capture_download_mode=self._load_web_capture_download_mode_pref(),
             web_capture_download_dir=self._load_web_capture_download_dir_pref(),
+            icon_rebuild_create_backups=self.state.get_ui_pref(
+                "icon_rebuild_create_backups",
+                "1",
+            )
+            == "1",
+            icon_rebuild_mode=self.state.get_ui_pref(
+                "icon_rebuild_mode",
+                "guided",
+            ),
         )
-        dialog = PerformanceSettingsDialog(initial, self)
+        dialog = PerformanceSettingsDialog(
+            initial,
+            cleanup_backups_callback=self._on_clean_backup_icons_from_options,
+            parent=self,
+        )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         payload = dialog.result_payload()
@@ -1447,12 +1471,45 @@ class MainWindow(
         self.state.set_ui_pref("perf_startup_prewarm_mode", payload.startup_prewarm_mode)
         self._save_web_capture_download_mode_pref(payload.web_capture_download_mode)
         self._save_web_capture_download_dir_pref(payload.web_capture_download_dir)
+        self.state.set_ui_pref(
+            "icon_rebuild_create_backups",
+            "1" if payload.icon_rebuild_create_backups else "0",
+        )
+        mode = str(payload.icon_rebuild_mode or "guided").strip().casefold()
+        self.state.set_ui_pref(
+            "icon_rebuild_mode",
+            mode if mode in {"guided", "automatic"} else "guided",
+        )
         QMessageBox.information(
             self,
             "Performance Settings",
             "Settings saved. Scan/cache settings apply on next refresh/operation. "
             "Startup preload mode applies on next app startup.",
         )
+
+    def _on_clean_backup_icons_from_options(self) -> None:
+        decision = QMessageBox.question(
+            self,
+            "Clean Backup Icons",
+            (
+                "Delete all backup icon files matching *.gm_backup_*.ico "
+                "under configured roots?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+        report = self.state.clean_backup_icons()
+        lines = [
+            f"Deleted: {report.succeeded}",
+            f"Failed: {report.failed}",
+            f"Skipped roots: {report.skipped}",
+        ]
+        if report.details:
+            lines.append("")
+            lines.extend(report.details[:12])
+        QMessageBox.information(self, "Clean Backup Icons", "\n".join(lines))
 
     def _test_icon_provider_settings(self, payload: IconProviderSettingsResult) -> str:
         settings = IconSearchSettings(

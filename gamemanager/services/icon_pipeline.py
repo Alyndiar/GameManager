@@ -131,19 +131,573 @@ def _crop_square(image: Image.Image) -> Image.Image:
     return image.crop((left, top, left + side, top + side))
 
 
-def _apply_size_profile(image: Image.Image, size: int) -> Image.Image:
-    # Stronger local punch for tiny sizes where details collapse.
+def _default_size_improvement_for(size: int) -> dict[str, object]:
     if size <= 24:
         contrast, saturation, sharpness, brightness = 1.28, 1.12, 1.45, 1.05
     elif size <= 48:
         contrast, saturation, sharpness, brightness = 1.18, 1.08, 1.25, 1.02
     else:
         contrast, saturation, sharpness, brightness = 1.08, 1.04, 1.12, 1.0
-    image = ImageEnhance.Contrast(image).enhance(contrast)
-    image = ImageEnhance.Color(image).enhance(saturation)
-    image = ImageEnhance.Sharpness(image).enhance(sharpness)
-    image = ImageEnhance.Brightness(image).enhance(brightness)
+
+    if size <= 16:
+        tiny = {
+            "tiny_enabled": True,
+            "tiny_unsharp_radius": 0.7,
+            "tiny_unsharp_percent": 85,
+            "tiny_unsharp_threshold": 2,
+            "tiny_micro_contrast": 1.05,
+            "tiny_alpha_floor": 16,
+            "tiny_prune_min_pixels": 3,
+            "tiny_prune_alpha_threshold": 18,
+        }
+    elif size <= 24:
+        tiny = {
+            "tiny_enabled": True,
+            "tiny_unsharp_radius": 0.9,
+            "tiny_unsharp_percent": 70,
+            "tiny_unsharp_threshold": 2,
+            "tiny_micro_contrast": 1.03,
+            "tiny_alpha_floor": 12,
+            "tiny_prune_min_pixels": 3,
+            "tiny_prune_alpha_threshold": 16,
+        }
+    elif size <= 32:
+        tiny = {
+            "tiny_enabled": True,
+            "tiny_unsharp_radius": 0.9,
+            "tiny_unsharp_percent": 70,
+            "tiny_unsharp_threshold": 2,
+            "tiny_micro_contrast": 1.03,
+            "tiny_alpha_floor": 9,
+            "tiny_prune_min_pixels": 2,
+            "tiny_prune_alpha_threshold": 14,
+        }
+    else:
+        tiny = {
+            "tiny_enabled": False,
+            "tiny_unsharp_radius": 0.9,
+            "tiny_unsharp_percent": 70,
+            "tiny_unsharp_threshold": 2,
+            "tiny_micro_contrast": 1.0,
+            "tiny_alpha_floor": 0,
+            "tiny_prune_min_pixels": 2,
+            "tiny_prune_alpha_threshold": 12,
+        }
+
+    if size <= 24:
+        silhouette = {
+            "silhouette_enabled": True,
+            "silhouette_target_min": 0.18,
+            "silhouette_target_max": 0.58,
+            "silhouette_alpha_threshold": 10,
+            "silhouette_max_upscale": 1.8,
+            "silhouette_min_scale": 0.65,
+            "silhouette_allow_downscale": False,
+        }
+    elif size <= 48:
+        silhouette = {
+            "silhouette_enabled": True,
+            "silhouette_target_min": 0.16,
+            "silhouette_target_max": 0.62,
+            "silhouette_alpha_threshold": 10,
+            "silhouette_max_upscale": 1.6,
+            "silhouette_min_scale": 0.70,
+            "silhouette_allow_downscale": False,
+        }
+    else:
+        silhouette = {
+            "silhouette_enabled": False,
+            "silhouette_target_min": 0.14,
+            "silhouette_target_max": 0.72,
+            "silhouette_alpha_threshold": 8,
+            "silhouette_max_upscale": 1.5,
+            "silhouette_min_scale": 0.72,
+            "silhouette_allow_downscale": False,
+        }
+
+    return {
+        "pre_enabled": bool(size <= 48),
+        "pre_working_scale": 2.4 if size <= 24 else (2.0 if size <= 48 else 1.0),
+        "pre_simplify_enabled": bool(size <= 48),
+        "pre_simplify_strength": 0.52 if size <= 24 else (0.42 if size <= 48 else 0.0),
+        "pre_prune_enabled": bool(size <= 48),
+        "pre_prune_min_pixels": 3 if size <= 24 else (2 if size <= 48 else 1),
+        "pre_prune_alpha_threshold": 18 if size <= 24 else (14 if size <= 48 else 12),
+        "pre_stroke_boost_enabled": bool(size <= 32),
+        "pre_stroke_boost_px": 1 if size <= 32 else 0,
+        "contrast_enabled": True,
+        "contrast": float(contrast),
+        "saturation_enabled": True,
+        "saturation": float(saturation),
+        "sharpness_enabled": True,
+        "sharpness": float(sharpness),
+        "brightness_enabled": True,
+        "brightness": float(brightness),
+        **tiny,
+        **silhouette,
+        "tiny_unsharp_enabled": True,
+        "tiny_micro_contrast_enabled": True,
+        "tiny_alpha_cleanup_enabled": True,
+        "tiny_prune_enabled": True,
+    }
+
+
+def _clamp_float(value: object, default: float, low: float, high: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = float(default)
+    return max(low, min(high, parsed))
+
+
+def _clamp_int(value: object, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default)
+    return max(low, min(high, parsed))
+
+
+def default_icon_size_improvements(
+    sizes: list[int] | tuple[int, ...] = tuple(ICO_SIZES),
+) -> dict[int, dict[str, object]]:
+    result: dict[int, dict[str, object]] = {}
+    for value in sizes:
+        key = int(value)
+        result[key] = _default_size_improvement_for(key)
+    return result
+
+
+def normalize_icon_size_improvements(
+    size_improvements: dict[int, dict[str, object]] | None,
+    sizes: list[int] | tuple[int, ...] = tuple(ICO_SIZES),
+) -> dict[int, dict[str, object]]:
+    normalized = default_icon_size_improvements(sizes)
+    if not isinstance(size_improvements, dict):
+        return normalized
+    for size in sizes:
+        size_key = int(size)
+        raw = size_improvements.get(size_key)
+        if not isinstance(raw, dict):
+            raw = size_improvements.get(str(size_key))
+        if not isinstance(raw, dict):
+            continue
+        defaults = _default_size_improvement_for(size_key)
+        normalized[size_key] = {
+            "contrast_enabled": bool(raw.get("contrast_enabled", defaults["contrast_enabled"])),
+            "pre_enabled": bool(raw.get("pre_enabled", defaults["pre_enabled"])),
+            "pre_working_scale": _clamp_float(
+                raw.get("pre_working_scale"),
+                float(defaults["pre_working_scale"]),
+                1.0,
+                4.0,
+            ),
+            "pre_simplify_enabled": bool(
+                raw.get("pre_simplify_enabled", defaults["pre_simplify_enabled"])
+            ),
+            "pre_simplify_strength": _clamp_float(
+                raw.get("pre_simplify_strength"),
+                float(defaults["pre_simplify_strength"]),
+                0.0,
+                1.0,
+            ),
+            "pre_prune_enabled": bool(
+                raw.get("pre_prune_enabled", defaults["pre_prune_enabled"])
+            ),
+            "pre_prune_min_pixels": _clamp_int(
+                raw.get("pre_prune_min_pixels"),
+                int(defaults["pre_prune_min_pixels"]),
+                1,
+                128,
+            ),
+            "pre_prune_alpha_threshold": _clamp_int(
+                raw.get("pre_prune_alpha_threshold"),
+                int(defaults["pre_prune_alpha_threshold"]),
+                1,
+                255,
+            ),
+            "pre_stroke_boost_enabled": bool(
+                raw.get("pre_stroke_boost_enabled", defaults["pre_stroke_boost_enabled"])
+            ),
+            "pre_stroke_boost_px": _clamp_int(
+                raw.get("pre_stroke_boost_px"),
+                int(defaults["pre_stroke_boost_px"]),
+                0,
+                4,
+            ),
+            "contrast": _clamp_float(raw.get("contrast"), float(defaults["contrast"]), 0.5, 2.5),
+            "saturation_enabled": bool(raw.get("saturation_enabled", defaults["saturation_enabled"])),
+            "saturation": _clamp_float(raw.get("saturation"), float(defaults["saturation"]), 0.0, 2.5),
+            "sharpness_enabled": bool(raw.get("sharpness_enabled", defaults["sharpness_enabled"])),
+            "sharpness": _clamp_float(raw.get("sharpness"), float(defaults["sharpness"]), 0.0, 4.0),
+            "brightness_enabled": bool(raw.get("brightness_enabled", defaults["brightness_enabled"])),
+            "brightness": _clamp_float(raw.get("brightness"), float(defaults["brightness"]), 0.5, 1.8),
+            "tiny_enabled": bool(raw.get("tiny_enabled", defaults["tiny_enabled"])),
+            "tiny_unsharp_enabled": bool(
+                raw.get("tiny_unsharp_enabled", defaults["tiny_unsharp_enabled"])
+            ),
+            "tiny_unsharp_radius": _clamp_float(
+                raw.get("tiny_unsharp_radius"),
+                float(defaults["tiny_unsharp_radius"]),
+                0.0,
+                4.0,
+            ),
+            "tiny_unsharp_percent": _clamp_int(
+                raw.get("tiny_unsharp_percent"),
+                int(defaults["tiny_unsharp_percent"]),
+                0,
+                300,
+            ),
+            "tiny_unsharp_threshold": _clamp_int(
+                raw.get("tiny_unsharp_threshold"),
+                int(defaults["tiny_unsharp_threshold"]),
+                0,
+                64,
+            ),
+            "tiny_micro_contrast_enabled": bool(
+                raw.get(
+                    "tiny_micro_contrast_enabled",
+                    defaults["tiny_micro_contrast_enabled"],
+                )
+            ),
+            "tiny_micro_contrast": _clamp_float(
+                raw.get("tiny_micro_contrast"),
+                float(defaults["tiny_micro_contrast"]),
+                0.5,
+                1.8,
+            ),
+            "tiny_alpha_cleanup_enabled": bool(
+                raw.get(
+                    "tiny_alpha_cleanup_enabled",
+                    defaults["tiny_alpha_cleanup_enabled"],
+                )
+            ),
+            "tiny_alpha_floor": _clamp_int(
+                raw.get("tiny_alpha_floor"),
+                int(defaults["tiny_alpha_floor"]),
+                0,
+                255,
+            ),
+            "tiny_prune_enabled": bool(
+                raw.get(
+                    "tiny_prune_enabled",
+                    defaults["tiny_prune_enabled"],
+                )
+            ),
+            "tiny_prune_min_pixels": _clamp_int(
+                raw.get("tiny_prune_min_pixels"),
+                int(defaults["tiny_prune_min_pixels"]),
+                1,
+                128,
+            ),
+            "tiny_prune_alpha_threshold": _clamp_int(
+                raw.get("tiny_prune_alpha_threshold"),
+                int(defaults["tiny_prune_alpha_threshold"]),
+                1,
+                255,
+            ),
+            "silhouette_enabled": bool(
+                raw.get("silhouette_enabled", defaults["silhouette_enabled"])
+            ),
+            "silhouette_target_min": _clamp_float(
+                raw.get("silhouette_target_min"),
+                float(defaults["silhouette_target_min"]),
+                0.03,
+                0.90,
+            ),
+            "silhouette_target_max": _clamp_float(
+                raw.get("silhouette_target_max"),
+                float(defaults["silhouette_target_max"]),
+                0.05,
+                0.96,
+            ),
+            "silhouette_alpha_threshold": _clamp_int(
+                raw.get("silhouette_alpha_threshold"),
+                int(defaults["silhouette_alpha_threshold"]),
+                1,
+                255,
+            ),
+            "silhouette_max_upscale": _clamp_float(
+                raw.get("silhouette_max_upscale"),
+                float(defaults["silhouette_max_upscale"]),
+                1.0,
+                4.0,
+            ),
+            "silhouette_min_scale": _clamp_float(
+                raw.get("silhouette_min_scale"),
+                float(defaults["silhouette_min_scale"]),
+                0.20,
+                1.0,
+            ),
+            "silhouette_allow_downscale": bool(
+                raw.get("silhouette_allow_downscale", defaults["silhouette_allow_downscale"])
+            ),
+        }
+        if normalized[size_key]["silhouette_target_min"] > normalized[size_key]["silhouette_target_max"]:
+            midpoint = (
+                float(normalized[size_key]["silhouette_target_min"])
+                + float(normalized[size_key]["silhouette_target_max"])
+            ) / 2.0
+            normalized[size_key]["silhouette_target_min"] = midpoint
+            normalized[size_key]["silhouette_target_max"] = midpoint
+    return normalized
+
+
+def _improvement_for_size(
+    size: int,
+    size_improvements: dict[int, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if isinstance(size_improvements, dict):
+        direct = size_improvements.get(int(size))
+        if isinstance(direct, dict):
+            return direct
+        from_text = size_improvements.get(str(int(size)))
+        if isinstance(from_text, dict):
+            return from_text
+    return _default_size_improvement_for(int(size))
+
+
+def _apply_size_profile(
+    image: Image.Image,
+    size: int,
+    size_improvements: dict[int, dict[str, object]] | None = None,
+) -> Image.Image:
+    profile = _improvement_for_size(int(size), size_improvements)
+    if bool(profile.get("contrast_enabled", True)):
+        contrast = float(profile.get("contrast", 1.0))
+        image = ImageEnhance.Contrast(image).enhance(contrast)
+    if bool(profile.get("saturation_enabled", True)):
+        saturation = float(profile.get("saturation", 1.0))
+        image = ImageEnhance.Color(image).enhance(saturation)
+    if bool(profile.get("sharpness_enabled", True)):
+        sharpness = float(profile.get("sharpness", 1.0))
+        image = ImageEnhance.Sharpness(image).enhance(sharpness)
+    if bool(profile.get("brightness_enabled", True)):
+        brightness = float(profile.get("brightness", 1.0))
+        image = ImageEnhance.Brightness(image).enhance(brightness)
     return image
+
+
+def _alpha_coverage_for_threshold(alpha: Image.Image, threshold: int) -> float:
+    alpha_data = alpha.tobytes()
+    covered = sum(1 for value in alpha_data if int(value) > int(threshold))
+    total = max(1, len(alpha_data))
+    return float(covered) / float(total)
+
+
+def _normalize_silhouette(
+    image: Image.Image,
+    size: int,
+    size_improvements: dict[int, dict[str, object]] | None = None,
+) -> Image.Image:
+    profile = _improvement_for_size(int(size), size_improvements)
+    if not bool(profile.get("silhouette_enabled", False)):
+        return image
+
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    threshold = int(profile.get("silhouette_alpha_threshold", 8))
+    coverage = _alpha_coverage_for_threshold(alpha, threshold)
+    target_min = float(profile.get("silhouette_target_min", 0.12))
+    target_max = float(profile.get("silhouette_target_max", 0.70))
+    if coverage <= 0.0 or (target_min <= coverage <= target_max):
+        return image
+    allow_downscale = bool(profile.get("silhouette_allow_downscale", False))
+    if coverage > target_max and not allow_downscale:
+        return image
+
+    binary = alpha.point(lambda value: 255 if int(value) > threshold else 0, mode="L")
+    bbox = binary.getbbox()
+    if bbox is None:
+        return image
+
+    target_coverage = (target_min + target_max) / 2.0
+    desired_scale = (target_coverage / max(0.000001, coverage)) ** 0.5
+    max_upscale = float(profile.get("silhouette_max_upscale", 1.5))
+    min_scale = float(profile.get("silhouette_min_scale", 0.7))
+    scale = max(min_scale, min(max_upscale, desired_scale))
+    if abs(scale - 1.0) < 0.01:
+        return image
+
+    subject = rgba.crop(bbox)
+    new_w = max(1, min(int(size), int(round(subject.width * scale))))
+    new_h = max(1, min(int(size), int(round(subject.height * scale))))
+    if new_w <= 0 or new_h <= 0:
+        return image
+    resized = subject.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (int(size), int(size)), (0, 0, 0, 0))
+    offset_x = (int(size) - new_w) // 2
+    offset_y = (int(size) - new_h) // 2
+    canvas.paste(resized, (offset_x, offset_y), resized)
+    return canvas
+
+
+def _pre_downscale_prepare_source(
+    source: Image.Image,
+    target_size: int,
+    size_improvements: dict[int, dict[str, object]] | None = None,
+) -> Image.Image:
+    profile = _improvement_for_size(int(target_size), size_improvements)
+    if not bool(profile.get("pre_enabled", False)):
+        return source
+
+    working_scale = float(profile.get("pre_working_scale", 1.0))
+    if working_scale <= 1.0:
+        return source
+
+    working_size = max(
+        int(target_size),
+        min(1024, int(round(float(target_size) * working_scale))),
+    )
+    if working_size <= 0:
+        return source
+    out = source.convert("RGBA").resize(
+        (working_size, working_size),
+        Image.Resampling.LANCZOS,
+    )
+    rgb = out.convert("RGB")
+    alpha = out.getchannel("A")
+
+    if bool(profile.get("pre_simplify_enabled", False)):
+        strength = float(profile.get("pre_simplify_strength", 0.0))
+        if strength > 0.0:
+            median_size = 3
+            if strength >= 0.80:
+                median_size = 7
+            elif strength >= 0.45:
+                median_size = 5
+            rgb = rgb.filter(ImageFilter.MedianFilter(size=median_size))
+            blur_radius = max(0.0, (0.12 + strength * 0.78))
+            if blur_radius > 0.001:
+                rgb = rgb.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            sharpen_percent = int(20 + (40 * strength))
+            if sharpen_percent > 0:
+                rgb = rgb.filter(
+                    ImageFilter.UnsharpMask(
+                        radius=0.55,
+                        percent=sharpen_percent,
+                        threshold=2,
+                    )
+                )
+
+    if bool(profile.get("pre_prune_enabled", False)):
+        prune_min = int(profile.get("pre_prune_min_pixels", 1))
+        prune_threshold = int(profile.get("pre_prune_alpha_threshold", 12))
+        if prune_min > 1:
+            scale_ratio = float(working_size) / float(max(1, int(target_size)))
+            scaled_min = max(1, int(round(float(prune_min) * scale_ratio)))
+            alpha = _prune_tiny_alpha_islands(alpha, scaled_min, prune_threshold)
+
+    if bool(profile.get("pre_stroke_boost_enabled", False)):
+        boost_px = int(profile.get("pre_stroke_boost_px", 0))
+        for _ in range(max(0, min(4, boost_px))):
+            alpha = alpha.filter(ImageFilter.MaxFilter(size=3))
+
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    return out
+
+
+def _prune_tiny_alpha_islands(alpha: Image.Image, min_pixels: int, threshold: int) -> Image.Image:
+    width, height = alpha.size
+    alpha_data = bytearray(alpha.tobytes())
+    visited = bytearray(width * height)
+
+    def _index(x: int, y: int) -> int:
+        return y * width + x
+
+    for y in range(height):
+        for x in range(width):
+            start_idx = _index(x, y)
+            if visited[start_idx]:
+                continue
+            visited[start_idx] = 1
+            if int(alpha_data[start_idx]) < int(threshold):
+                continue
+
+            stack = [(x, y)]
+            component: list[int] = [start_idx]
+            while stack:
+                cx, cy = stack.pop()
+                for ny in range(max(0, cy - 1), min(height - 1, cy + 1) + 1):
+                    for nx in range(max(0, cx - 1), min(width - 1, cx + 1) + 1):
+                        n_idx = _index(nx, ny)
+                        if visited[n_idx]:
+                            continue
+                        visited[n_idx] = 1
+                        if int(alpha_data[n_idx]) < int(threshold):
+                            continue
+                        component.append(n_idx)
+                        stack.append((nx, ny))
+
+            if len(component) < int(min_pixels):
+                for idx in component:
+                    alpha_data[idx] = 0
+
+    return Image.frombytes("L", (width, height), bytes(alpha_data))
+
+
+def _tiny_icon_legibility_pass(
+    image: Image.Image,
+    size: int,
+    size_improvements: dict[int, dict[str, object]] | None = None,
+) -> Image.Image:
+    """Apply subtle detail recovery for tiny icon sizes.
+
+    This pass keeps processing deterministic and Pillow-only:
+    - luminance-aware unsharp blend
+    - micro-contrast bump
+    - alpha floor cleanup to remove soft fuzz pixels
+    """
+
+    profile = _improvement_for_size(int(size), size_improvements)
+    if not bool(profile.get("tiny_enabled", False)):
+        return image
+    rgba = image.convert("RGBA")
+    rgb = rgba.convert("RGB")
+    alpha = rgba.getchannel("A")
+
+    if bool(profile.get("tiny_prune_enabled", True)):
+        prune_min = int(profile.get("tiny_prune_min_pixels", 2))
+        prune_threshold = int(profile.get("tiny_prune_alpha_threshold", 12))
+        if prune_min > 1 and prune_threshold > 0:
+            alpha = _prune_tiny_alpha_islands(alpha, prune_min, prune_threshold)
+
+    # Luminance-aware: stronger blend on midtones, reduced on extreme shadows/highlights.
+    lum = ImageOps.grayscale(rgb)
+    blend_mask = lum.point(
+        lambda value: max(0, 255 - min(255, abs((int(value) * 2) - 255))),
+        mode="L",
+    )
+    unsharp_radius = float(profile.get("tiny_unsharp_radius", 0.0))
+    unsharp_percent = int(profile.get("tiny_unsharp_percent", 0))
+    unsharp_threshold = int(profile.get("tiny_unsharp_threshold", 2))
+    if (
+        bool(profile.get("tiny_unsharp_enabled", True))
+        and unsharp_radius > 0.0
+        and unsharp_percent > 0
+    ):
+        unsharp = rgb.filter(
+            ImageFilter.UnsharpMask(
+                radius=unsharp_radius,
+                percent=unsharp_percent,
+                threshold=unsharp_threshold,
+            )
+        )
+        rgb = Image.composite(unsharp, rgb, blend_mask)
+    micro_contrast = float(profile.get("tiny_micro_contrast", 1.0))
+    if bool(profile.get("tiny_micro_contrast_enabled", True)) and abs(micro_contrast - 1.0) > 0.001:
+        rgb = ImageEnhance.Contrast(rgb).enhance(micro_contrast)
+
+    alpha_floor = int(profile.get("tiny_alpha_floor", 0))
+    if bool(profile.get("tiny_alpha_cleanup_enabled", True)) and alpha_floor > 0:
+        alpha = alpha.point(
+            lambda value: 0 if int(value) < alpha_floor else int(value),
+            mode="L",
+        )
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    return out
 
 
 def _apply_circle_and_ring(image: Image.Image, size: int) -> Image.Image:
@@ -2008,6 +2562,7 @@ def build_multi_size_ico(
     bg_removal_params: dict[str, object] | None = None,
     text_preserve_config: TextPreserveConfig | dict[str, object] | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
+    size_improvements: dict[int, dict[str, object]] | None = None,
 ) -> bytes:
     template = resolve_icon_template(icon_style, circular_ring)
     effective_engine, effective_text_cfg = _effective_overlay_modes(
@@ -2022,17 +2577,46 @@ def build_multi_size_ico(
         bg_removal_params=bg_removal_params,
         text_preserve_config=effective_text_cfg,
     )
-    base = _build_composited_icon(
-        master,
-        512,
-        template,
-        foreground=foreground,
-        border_shader=border_shader,
+    normalized_size_improvements = normalize_icon_size_improvements(
+        size_improvements,
+        tuple(ICO_SIZES),
     )
-    base = _apply_size_profile(base, 256)
+    frames: list[Image.Image] = []
+    for size in ICO_SIZES:
+        prepared_master = _pre_downscale_prepare_source(
+            master,
+            int(size),
+            normalized_size_improvements,
+        )
+        prepared_foreground = (
+            _pre_downscale_prepare_source(
+                foreground,
+                int(size),
+                normalized_size_improvements,
+            )
+            if foreground is not None
+            else None
+        )
+        frame = _build_composited_icon(
+            prepared_master,
+            int(size),
+            template,
+            foreground=prepared_foreground,
+            border_shader=border_shader,
+        )
+        frame = _normalize_silhouette(frame, int(size), normalized_size_improvements)
+        frame = _apply_size_profile(frame, int(size), normalized_size_improvements)
+        frame = _tiny_icon_legibility_pass(frame, int(size), normalized_size_improvements)
+        frames.append(frame)
 
     out = BytesIO()
-    base.save(out, format="ICO", sizes=[(s, s) for s in ICO_SIZES])
+    primary = frames[0]
+    primary.save(
+        out,
+        format="ICO",
+        sizes=[(s, s) for s in ICO_SIZES],
+        append_images=frames[1:],
+    )
     return out.getvalue()
 
 
@@ -2045,6 +2629,7 @@ def build_preview_png(
     bg_removal_params: dict[str, object] | None = None,
     text_preserve_config: TextPreserveConfig | dict[str, object] | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
+    size_improvements: dict[int, dict[str, object]] | None = None,
 ) -> bytes:
     template = resolve_icon_template(icon_style, circular_ring)
     effective_engine, effective_text_cfg = _effective_overlay_modes(
@@ -2059,14 +2644,28 @@ def build_preview_png(
         bg_removal_params=bg_removal_params,
         text_preserve_config=effective_text_cfg,
     )
+    normalized_size_improvements = normalize_icon_size_improvements(
+        size_improvements,
+        (int(size),),
+    )
     image = _build_composited_icon(
-        master,
+        _pre_downscale_prepare_source(master, size, normalized_size_improvements),
         size,
         template,
-        foreground=foreground,
+        foreground=(
+            _pre_downscale_prepare_source(
+                foreground,
+                size,
+                normalized_size_improvements,
+            )
+            if foreground is not None
+            else None
+        ),
         border_shader=border_shader,
     )
-    image = _apply_size_profile(image, size)
+    image = _normalize_silhouette(image, size, normalized_size_improvements)
+    image = _apply_size_profile(image, size, normalized_size_improvements)
+    image = _tiny_icon_legibility_pass(image, size, normalized_size_improvements)
     out = BytesIO()
     image.save(out, format="PNG")
     return out.getvalue()

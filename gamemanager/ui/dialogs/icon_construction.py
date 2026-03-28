@@ -49,6 +49,7 @@ from gamemanager.services.icon_pipeline import (
     build_text_extraction_alpha_mask,
     build_text_extraction_overlay,
     build_multi_size_ico,
+    build_preview_png,
     build_template_overlay_preview,
     icon_style_options,
     normalize_border_shader_config,
@@ -79,6 +80,7 @@ from .icon_construction_cutout_state import (
 )
 from .icon_construction_processing_ops import IconFramingProcessingOpsMixin
 from .icon_construction_workers import FramingProcessingWorker, SeedColorButton
+from .icon_size_preview import ICON_SIZE_PREVIEW_ORDER, IconSizePreviewDialog
 from .shared import (
     bind_dialog_shortcut as _bind_dialog_shortcut,
     icon_style_gallery_entries as _icon_style_gallery_entries,
@@ -1643,6 +1645,7 @@ class IconFramingDialog(
         initial_bg_removal_params: dict[str, object] | None = None,
         initial_text_preserve_config: dict[str, object] | None = None,
         border_shader: dict[str, object] | None = None,
+        size_improvements: dict[int, dict[str, object]] | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -1653,6 +1656,7 @@ class IconFramingDialog(
         self._processing_in_progress = False
         self._pending_processing = False
         self._apply_after_processing = False
+        self._size_improvements = dict(size_improvements or {})
         self._spinner_apply_timer = QTimer(self)
         self._spinner_apply_timer.setSingleShot(True)
         self._spinner_apply_timer.setInterval(1500)
@@ -2159,6 +2163,12 @@ class IconFramingDialog(
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        self.preview_sizes_btn = QPushButton("Preview Sizes", self)
+        self.preview_sizes_btn.setToolTip(
+            "Preview all icon sizes side-by-side\nShortcut: Ctrl+Shift+P"
+        )
+        self.preview_sizes_btn.clicked.connect(self._on_preview_sizes)
+        buttons.addButton(self.preview_sizes_btn, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.accepted.connect(self._on_apply)
         buttons.rejected.connect(self.reject)
         self._button_bar_container = QWidget(self)
@@ -2180,6 +2190,7 @@ class IconFramingDialog(
         QTimer.singleShot(0, self._sync_bottom_row_widths)
         self._apply_available_screen_bounds()
         self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+        _bind_dialog_shortcut(self, "Ctrl+Shift+P", self._on_preview_sizes)
 
     def _sync_bottom_row_widths(self) -> None:
         side_width = max(300, int(self._side_scroll.width()))
@@ -2967,6 +2978,39 @@ class IconFramingDialog(
         self._canvas.reset_view()
         self._set_zoom(1.0)
 
+    def _on_preview_sizes(self) -> None:
+        if self._processing_in_progress:
+            self._set_processing_status("Wait for background processing to finish.")
+            return
+        if self._spinner_apply_timer.isActive():
+            self._spinner_apply_timer.stop()
+            self._apply_processing_settings()
+            if self._processing_in_progress:
+                self._set_processing_status("Processing layers before size preview...")
+                return
+        try:
+            framed = self._canvas.export_composited_png_bytes(512)
+            payloads: dict[int, bytes] = {}
+            for size in ICON_SIZE_PREVIEW_ORDER:
+                payloads[int(size)] = build_preview_png(
+                    framed,
+                    size=int(size),
+                    size_improvements=self._size_improvements,
+                )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Size Preview Failed",
+                f"Could not generate size previews:\n{exc}",
+            )
+            return
+        dialog = IconSizePreviewDialog(
+            payloads,
+            parent=self,
+            title="Adjust Framing - Size Preview",
+        )
+        dialog.exec()
+
     def _on_apply(self) -> None:
         if self._processing_in_progress:
             self._apply_after_processing = True
@@ -3188,6 +3232,8 @@ class IconConverterDialog(QDialog):
         bg_removal_engine_saver: Callable[[str], None] | None = None,
         initial_border_shader: dict[str, object] | None = None,
         border_shader_saver: Callable[[dict[str, object]], None] | None = None,
+        processing_controls_visible: bool = True,
+        size_improvements: dict[int, dict[str, object]] | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -3197,6 +3243,8 @@ class IconConverterDialog(QDialog):
         self._icon_style_saver = icon_style_saver
         self._bg_removal_engine_saver = bg_removal_engine_saver
         self._border_shader_saver = border_shader_saver
+        self._processing_controls_visible = bool(processing_controls_visible)
+        self._size_improvements = dict(size_improvements or {})
         self._border_shader = border_shader_to_dict(initial_border_shader)
         self._bg_removal_params = normalize_background_removal_params(
             dict(DEFAULT_BG_REMOVAL_PARAMS)
@@ -3234,7 +3282,8 @@ class IconConverterDialog(QDialog):
         layout.addLayout(output_row)
 
         style_row = QHBoxLayout()
-        style_row.addWidget(QLabel("Icon type:", self))
+        self.icon_type_label = QLabel("Icon type:", self)
+        style_row.addWidget(self.icon_type_label)
         self.icon_style_combo = QComboBox(self)
         for label, value in icon_style_options():
             self.icon_style_combo.addItem(label, value)
@@ -3255,7 +3304,8 @@ class IconConverterDialog(QDialog):
         self.border_shader_btn.setToolTip("Border Shader Controls")
         self.border_shader_btn.clicked.connect(self._on_open_border_shader)
         style_row.addWidget(self.border_shader_btn)
-        style_row.addWidget(QLabel("Background cutout:", self))
+        self.cutout_label = QLabel("Background cutout:", self)
+        style_row.addWidget(self.cutout_label)
         self.bg_removal_combo = QComboBox(self)
         for label, value in BACKGROUND_REMOVAL_OPTIONS:
             self.bg_removal_combo.addItem(label, value)
@@ -3265,7 +3315,8 @@ class IconConverterDialog(QDialog):
             self.bg_removal_combo.setCurrentIndex(bg_idx)
         self.bg_removal_combo.currentIndexChanged.connect(self._on_bg_engine_changed)
         style_row.addWidget(self.bg_removal_combo)
-        style_row.addWidget(QLabel("Text:", self))
+        self.text_label = QLabel("Text:", self)
+        style_row.addWidget(self.text_label)
         self.text_extract_combo = QComboBox(self)
         for label, value in TEXT_EXTRACTION_METHOD_OPTIONS:
             self.text_extract_combo.addItem(label, value)
@@ -3286,6 +3337,31 @@ class IconConverterDialog(QDialog):
         style_row.addWidget(self.adjust_btn)
         layout.addLayout(style_row)
         self._refresh_border_shader_button()
+        if not self._processing_controls_visible:
+            none_idx = self.icon_style_combo.findData("none")
+            if none_idx >= 0:
+                self.icon_style_combo.setCurrentIndex(none_idx)
+            bg_none_idx = self.bg_removal_combo.findData("none")
+            if bg_none_idx >= 0:
+                self.bg_removal_combo.setCurrentIndex(bg_none_idx)
+            text_none_idx = self.text_extract_combo.findData("none")
+            if text_none_idx >= 0:
+                self.text_extract_combo.setCurrentIndex(text_none_idx)
+            self._text_preserve_config = text_preserve_to_dict(
+                {"enabled": False, "method": "none"}
+            )
+            self._border_shader = border_shader_to_dict({"enabled": False})
+            for widget in (
+                self.icon_type_label,
+                self.icon_style_combo,
+                self.icon_style_gallery_btn,
+                self.border_shader_btn,
+                self.cutout_label,
+                self.bg_removal_combo,
+                self.text_label,
+                self.text_extract_combo,
+            ):
+                widget.setVisible(False)
 
         self.status_label = QLabel("", self)
         self.status_label.setWordWrap(True)
@@ -3305,8 +3381,9 @@ class IconConverterDialog(QDialog):
         self._sync_template_dependents()
         _bind_dialog_shortcut(self, "Ctrl+O", self._on_browse_source)
         _bind_dialog_shortcut(self, "Ctrl+Shift+S", self._on_browse_output)
-        _bind_dialog_shortcut(self, "Alt+G", self._on_pick_icon_style_from_gallery)
         _bind_dialog_shortcut(self, "Alt+F", self._on_adjust_framing)
+        if self._processing_controls_visible:
+            _bind_dialog_shortcut(self, "Alt+G", self._on_pick_icon_style_from_gallery)
         _bind_dialog_shortcut(self, "Ctrl+Return", self._on_convert)
         _bind_dialog_shortcut(self, "Ctrl+Enter", self._on_convert)
         _bind_dialog_shortcut(self, "F1", self._show_shortcuts)
@@ -3315,21 +3392,17 @@ class IconConverterDialog(QDialog):
         return str(self.icon_style_combo.currentData() or "none")
 
     def _show_shortcuts(self) -> None:
-        QMessageBox.information(
-            self,
-            "Icon Converter Shortcuts",
-            "\n".join(
-                [
-                    "Ctrl+O - Browse source image",
-                    "Ctrl+Shift+S - Pick output path",
-                    "Alt+G - Open template gallery",
-                    "Alt+F - Adjust framing",
-                    "Ctrl+Enter - Convert",
-                    "Esc - Close",
-                    "F1 - Show Shortcuts",
-                ]
-            ),
-        )
+        lines = [
+            "Ctrl+O - Browse source image",
+            "Ctrl+Shift+S - Pick output path",
+            "Alt+F - Adjust framing",
+            "Ctrl+Enter - Convert",
+            "Esc - Close",
+            "F1 - Show shortcuts",
+        ]
+        if self._processing_controls_visible:
+            lines.insert(2, "Alt+G - Open template gallery")
+        QMessageBox.information(self, "Icon Converter Shortcuts", "\n".join(lines))
 
     def _template_enabled(self) -> bool:
         return self._current_icon_style() != "none"
@@ -3523,6 +3596,7 @@ class IconConverterDialog(QDialog):
             initial_bg_removal_params=dict(self._bg_removal_params),
             initial_text_preserve_config=dict(self._text_preserve_config),
             border_shader=self._border_shader,
+            size_improvements=self._size_improvements,
             parent=self,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -3573,8 +3647,13 @@ class IconConverterDialog(QDialog):
                 return
 
         try:
-            if self._prepared_is_final_composite and self._prepared_image_bytes is not None:
-                ico_payload = build_multi_size_ico(source_bytes)
+            if (not self._processing_controls_visible) or (
+                self._prepared_is_final_composite and self._prepared_image_bytes is not None
+            ):
+                ico_payload = build_multi_size_ico(
+                    source_bytes,
+                    size_improvements=self._size_improvements,
+                )
             else:
                 ico_payload = build_multi_size_ico(
                     source_bytes,
@@ -3583,6 +3662,7 @@ class IconConverterDialog(QDialog):
                     bg_removal_params=self._bg_removal_params,
                     text_preserve_config=self._text_preserve_config,
                     border_shader=self._border_shader_config(),
+                    size_improvements=self._size_improvements,
                 )
         except Exception as exc:
             QMessageBox.warning(self, "Conversion Failed", f"Could not build icon:\n{exc}")
