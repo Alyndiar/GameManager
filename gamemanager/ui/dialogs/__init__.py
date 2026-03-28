@@ -17,6 +17,10 @@ from .icon_construction import (
     SeedColorButton,
 )
 from .icon_library import IconPickerDialog
+from .icon_rebuild_preview import (
+    IconRebuildPreviewDialog,
+    IconRebuildPreviewItem,
+)
 from .operations import (
     CleanupPreviewDialog,
     DeleteGroupDialog,
@@ -46,6 +50,8 @@ __all__ = [
     "IconPickerResult",
     "IconProviderSettingsDialog",
     "IconProviderSettingsResult",
+    "IconRebuildPreviewDialog",
+    "IconRebuildPreviewItem",
     "MovePreviewDialog",
     "PerformanceSettingsDialog",
     "PerformanceSettingsResult",

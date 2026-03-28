@@ -22,17 +22,120 @@ def _sanitize_icon_name(raw_name: str) -> str:
 
 
 def _read_desktop_ini_parser(desktop_ini: Path) -> ConfigParser | None:
-    parser = ConfigParser(strict=False)
     try:
         raw = desktop_ini.read_bytes()
     except OSError:
         return None
+    decoded: str | None = None
     for encoding in ("utf-8-sig", "utf-16", "cp1252"):
         try:
-            parser.read_string(raw.decode(encoding))
-            return parser
+            decoded = raw.decode(encoding)
+            break
         except Exception:
             continue
+    if decoded is None:
+        return None
+
+    parser = ConfigParser(strict=False)
+    try:
+        parser.read_string(decoded)
+        return parser
+    except Exception:
+        pass
+
+    # Tolerate malformed desktop.ini values (for example multiline InfoTip text
+    # that is not continuation-indented) by keeping only section and key=value lines.
+    sanitized_lines: list[str] = []
+    for line in decoded.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            sanitized_lines.append(stripped)
+            continue
+        if "=" in line:
+            sanitized_lines.append(line)
+    if not sanitized_lines:
+        return None
+    parser = ConfigParser(strict=False)
+    try:
+        parser.read_string("\n".join(sanitized_lines))
+        return parser
+    except Exception:
+        return None
+
+
+def _sanitize_info_tip_value(raw_tip: str | None) -> str:
+    token = str(raw_tip or "")
+    # desktop.ini expects single-line INI values.
+    token = token.replace("\r", " ").replace("\n", " ")
+    token = re.sub(r"\s+", " ", token).strip()
+    return token
+
+
+def _read_existing_info_tip(parser: ConfigParser) -> str:
+    return _sanitize_info_tip_value(
+        parser.get(".ShellClassInfo", "InfoTip", fallback="")
+    )
+
+
+def _read_existing_flags(parser: ConfigParser) -> str:
+    flags = parser.get(".ShellClassInfo", "Flags", fallback="0").strip() or "0"
+    return flags
+
+
+def _read_existing_rebuilt(parser: ConfigParser) -> bool:
+    token = str(parser.get(".ShellClassInfo", "Rebuilt", fallback="false")).strip().casefold()
+    return token in {"1", "true", "yes", "on"}
+
+
+def _normalize_icon_resource(icon_resource: str) -> str:
+    return str(icon_resource or "").strip()
+
+
+def _write_shellclassinfo(
+    desktop_ini: Path,
+    folder_path: Path,
+    *,
+    icon_resource: str,
+    info_tip: str | None = None,
+    flags: str = "0",
+    rebuilt: bool = False,
+) -> None:
+    lines = [
+        "[.ShellClassInfo]",
+        f"IconResource={_normalize_icon_resource(icon_resource)}",
+    ]
+    tip = _sanitize_info_tip_value(info_tip)
+    if tip:
+        lines.append(f"InfoTip={tip}")
+    lines.append(f"Flags={flags or '0'}")
+    lines.append(f"Rebuilt={'true' if rebuilt else 'false'}")
+    _prepare_file_for_overwrite(desktop_ini)
+    desktop_ini.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    _run_attrib(["+s", "+h", str(desktop_ini)])
+    _run_attrib(["+s", str(folder_path)])
+    _shell_refresh(folder_path)
+
+
+def _resolve_icon_path(folder_path: Path, icon_spec: str) -> Path:
+    spec = str(icon_spec or "").strip().strip('"')
+    if spec.casefold().endswith(".ico.0"):
+        spec = spec[:-2]
+    if spec.startswith(".\\"):
+        spec = spec[2:]
+    path_token = Path(spec)
+    if path_token.is_absolute():
+        return path_token.resolve()
+    return (folder_path / spec).resolve()
+
+
+def _extract_icon_resource(parser: ConfigParser) -> str:
+    return str(parser.get(".ShellClassInfo", "IconResource", fallback="")).strip()
+
+
+def _icon_spec_from_resource(icon_resource: str) -> str:
+    return str(icon_resource or "").split(",", 1)[0].strip().strip('"')
     return None
 
 
@@ -48,16 +151,12 @@ def detect_folder_icon_state(folder_path: Path) -> tuple[str, str | None, str | 
         return "broken", None, str(desktop_ini), ""
     if not parser.has_section(".ShellClassInfo"):
         return "broken", None, str(desktop_ini), ""
-    icon_resource = parser.get(".ShellClassInfo", "IconResource", fallback="").strip()
-    info_tip = parser.get(".ShellClassInfo", "InfoTip", fallback="").strip()
+    icon_resource = _extract_icon_resource(parser)
+    info_tip = _read_existing_info_tip(parser)
     if not icon_resource:
         return "broken", None, str(desktop_ini), info_tip
-    icon_spec = icon_resource.split(",", 1)[0].strip().strip('"')
-    if icon_spec.casefold().endswith(".ico.0"):
-        icon_spec = icon_spec[:-2]
-    if icon_spec.startswith(".\\"):
-        icon_spec = icon_spec[2:]
-    icon_path = (folder_path / icon_spec).resolve()
+    icon_spec = _icon_spec_from_resource(icon_resource)
+    icon_path = _resolve_icon_path(folder_path, icon_spec)
     if not icon_path.exists():
         return "broken", str(icon_path), str(desktop_ini), info_tip
     return "valid", str(icon_path), str(desktop_ini), info_tip
@@ -105,11 +204,11 @@ def read_folder_info_tip(folder_path: Path) -> str:
     parser = _read_desktop_ini_parser(desktop_ini)
     if parser is None or not parser.has_section(".ShellClassInfo"):
         return ""
-    return parser.get(".ShellClassInfo", "InfoTip", fallback="").strip()
+    return _read_existing_info_tip(parser)
 
 
 def set_folder_info_tip(folder_path: Path, info_tip: str) -> bool:
-    cleaned_tip = info_tip.strip()
+    cleaned_tip = _sanitize_info_tip_value(info_tip)
     if not cleaned_tip:
         return False
     if not folder_path.exists() or not folder_path.is_dir():
@@ -120,25 +219,64 @@ def set_folder_info_tip(folder_path: Path, info_tip: str) -> bool:
     parser = _read_desktop_ini_parser(desktop_ini)
     if parser is None or not parser.has_section(".ShellClassInfo"):
         return False
-    icon_resource = parser.get(".ShellClassInfo", "IconResource", fallback="").strip()
+    icon_resource = _extract_icon_resource(parser)
     if not icon_resource:
         return False
-    current_tip = parser.get(".ShellClassInfo", "InfoTip", fallback="").strip()
+    current_tip = _read_existing_info_tip(parser)
     if current_tip == cleaned_tip:
         return False
-    flags = parser.get(".ShellClassInfo", "Flags", fallback="0").strip() or "0"
-    lines = [
-        "[.ShellClassInfo]",
-        f"IconResource={icon_resource}",
-        f"InfoTip={cleaned_tip}",
-        f"Flags={flags}",
-    ]
+    flags = _read_existing_flags(parser)
+    rebuilt = _read_existing_rebuilt(parser)
     try:
-        _prepare_file_for_overwrite(desktop_ini)
-        desktop_ini.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
-        _run_attrib(["+s", "+h", str(desktop_ini)])
-        _run_attrib(["+s", str(folder_path)])
-        _shell_refresh(folder_path)
+        _write_shellclassinfo(
+            desktop_ini,
+            folder_path,
+            icon_resource=icon_resource,
+            info_tip=cleaned_tip,
+            flags=flags,
+            rebuilt=rebuilt,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def read_folder_rebuilt_flag(folder_path: Path) -> bool:
+    desktop_ini = folder_path / "desktop.ini"
+    if not desktop_ini.exists():
+        return False
+    parser = _read_desktop_ini_parser(desktop_ini)
+    if parser is None or not parser.has_section(".ShellClassInfo"):
+        return False
+    return _read_existing_rebuilt(parser)
+
+
+def set_folder_rebuilt_flag(folder_path: Path, rebuilt: bool) -> bool:
+    if not folder_path.exists() or not folder_path.is_dir():
+        return False
+    desktop_ini = folder_path / "desktop.ini"
+    if not desktop_ini.exists():
+        return False
+    parser = _read_desktop_ini_parser(desktop_ini)
+    if parser is None or not parser.has_section(".ShellClassInfo"):
+        return False
+    icon_resource = _extract_icon_resource(parser)
+    if not icon_resource:
+        return False
+    current_rebuilt = _read_existing_rebuilt(parser)
+    if current_rebuilt == bool(rebuilt):
+        return False
+    info_tip = _read_existing_info_tip(parser)
+    flags = _read_existing_flags(parser)
+    try:
+        _write_shellclassinfo(
+            desktop_ini,
+            folder_path,
+            icon_resource=icon_resource,
+            info_tip=info_tip,
+            flags=flags,
+            rebuilt=bool(rebuilt),
+        )
     except OSError:
         return False
     return True
@@ -161,20 +299,15 @@ def apply_folder_icon(
     desktop_ini = folder_path / "desktop.ini"
     try:
         _prepare_file_for_overwrite(icon_path)
-        _prepare_file_for_overwrite(desktop_ini)
         icon_path.write_bytes(icon_bytes)
-        lines = [
-            "[.ShellClassInfo]",
-            f"IconResource=.\\{icon_path.name},0",
-        ]
-        if info_tip and info_tip.strip():
-            lines.append(f"InfoTip={info_tip.strip()}")
-        lines.append("Flags=0")
-        desktop_ini.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
-
-        _run_attrib(["+s", str(folder_path)])
-        _run_attrib(["+s", "+h", str(desktop_ini)])
-        _shell_refresh(folder_path)
+        _write_shellclassinfo(
+            desktop_ini,
+            folder_path,
+            icon_resource=f".\\{icon_path.name},0",
+            info_tip=info_tip,
+            flags="0",
+            rebuilt=True,
+        )
     except OSError as exc:
         return IconApplyResult(
             folder_path=str(folder_path),

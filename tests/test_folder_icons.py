@@ -66,6 +66,7 @@ def test_apply_folder_icon_writes_ini_and_icon(tmp_path: Path, monkeypatch) -> N
     assert "[.ShellClassInfo]" in desktop
     assert "IconResource=.\\Test Game.ico,0" in desktop
     assert "InfoTip=My tip" in desktop
+    assert "Rebuilt=true" in desktop
 
 
 def test_set_folder_info_tip_updates_existing_desktop_ini(tmp_path: Path, monkeypatch) -> None:
@@ -82,6 +83,43 @@ def test_set_folder_info_tip_updates_existing_desktop_ini(tmp_path: Path, monkey
     changed = folder_icons.set_folder_info_tip(folder, "Description line.")
     assert changed is True
     assert folder_icons.read_folder_info_tip(folder) == "Description line."
+
+
+def test_set_folder_info_tip_preserves_rebuilt_flag(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "Game"
+    folder.mkdir()
+    (folder / "Game.ico").write_bytes(b"ICO")
+    (folder / "desktop.ini").write_text(
+        "[.ShellClassInfo]\n"
+        "IconResource=.\\Game.ico,0\n"
+        "InfoTip=Old\n"
+        "Flags=0\n"
+        "Rebuilt=true\n",
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setattr(folder_icons, "_run_attrib", lambda args: None)
+    monkeypatch.setattr(folder_icons, "_shell_refresh", lambda path: None)
+
+    changed = folder_icons.set_folder_info_tip(folder, "New tip")
+    assert changed is True
+    desktop = (folder / "desktop.ini").read_text(encoding="utf-8-sig")
+    assert "Rebuilt=true" in desktop
+
+
+def test_set_folder_rebuilt_flag_updates_value(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "Game"
+    folder.mkdir()
+    (folder / "Game.ico").write_bytes(b"ICO")
+    (folder / "desktop.ini").write_text(
+        "[.ShellClassInfo]\nIconResource=.\\Game.ico,0\nFlags=0\nRebuilt=false\n",
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setattr(folder_icons, "_run_attrib", lambda args: None)
+    monkeypatch.setattr(folder_icons, "_shell_refresh", lambda path: None)
+
+    changed = folder_icons.set_folder_rebuilt_flag(folder, True)
+    assert changed is True
+    assert folder_icons.read_folder_rebuilt_flag(folder) is True
 
 
 def test_apply_folder_icon_clears_attrs_before_overwrite(tmp_path: Path, monkeypatch) -> None:

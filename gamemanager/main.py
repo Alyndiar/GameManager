@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 from gamemanager.runtime import (
     DEFAULT_ICONMAKER_GAMEMANAGER_MUTEX,
     AppInstanceLock,
+    apply_gamemanager_app_icon,
     show_already_running_message,
 )
 from gamemanager.services.paths import project_data_dir
@@ -167,6 +168,7 @@ def run() -> int:
     db_path = _default_db_path()
     _enable_crash_logging(db_path.parent)
     app = QApplication(sys.argv)
+    apply_gamemanager_app_icon(app)
     app.aboutToQuit.connect(shutdown_persistent_icon_workers)
     try:
         from gamemanager.app_state import AppState

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -26,10 +27,12 @@ class PerformanceSettingsDialog(QDialog):
     def __init__(
         self,
         initial: PerformanceSettingsResult,
+        cleanup_backups_callback: Callable[[], None] | None = None,
         parent: QDialog | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Performance Settings")
+        self._cleanup_backups_callback = cleanup_backups_callback
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -77,6 +80,29 @@ class PerformanceSettingsDialog(QDialog):
         cache_row.addWidget(self.cache_enabled)
         cache_row.addStretch(1)
         layout.addLayout(cache_row)
+
+        rebuild_backup_row = QHBoxLayout()
+        self.rebuild_backup_enabled = QCheckBox(
+            "Create backups during icon rebuild",
+            self,
+        )
+        self.rebuild_backup_enabled.setChecked(bool(initial.icon_rebuild_create_backups))
+        rebuild_backup_row.addWidget(self.rebuild_backup_enabled)
+        rebuild_backup_row.addStretch(1)
+        layout.addLayout(rebuild_backup_row)
+
+        rebuild_mode_row = QHBoxLayout()
+        rebuild_mode_row.addWidget(QLabel("Icon rebuild mode:", self))
+        self.rebuild_mode_combo = QComboBox(self)
+        self.rebuild_mode_combo.addItem("Guided (Preview + Tuning)", "guided")
+        self.rebuild_mode_combo.addItem("Automatic (Use Saved Defaults)", "automatic")
+        mode = str(initial.icon_rebuild_mode or "guided").strip().casefold()
+        idx = self.rebuild_mode_combo.findData(mode if mode in {"guided", "automatic"} else "guided")
+        if idx >= 0:
+            self.rebuild_mode_combo.setCurrentIndex(idx)
+        rebuild_mode_row.addWidget(self.rebuild_mode_combo)
+        rebuild_mode_row.addStretch(1)
+        layout.addLayout(rebuild_mode_row)
 
         max_row = QHBoxLayout()
         max_row.addWidget(QLabel("Cache max entries:", self))
@@ -130,6 +156,15 @@ class PerformanceSettingsDialog(QDialog):
         )
         self._sync_web_capture_dir_controls()
 
+        maintenance_row = QHBoxLayout()
+        self.clean_backups_btn = QPushButton("Clean Backup Icons...", self)
+        self.clean_backups_btn.setToolTip("Delete all *.gm_backup_*.ico files under configured roots")
+        self.clean_backups_btn.clicked.connect(self._on_clean_backups_clicked)
+        self.clean_backups_btn.setEnabled(self._cleanup_backups_callback is not None)
+        maintenance_row.addWidget(self.clean_backups_btn)
+        maintenance_row.addStretch(1)
+        layout.addLayout(maintenance_row)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -157,7 +192,26 @@ class PerformanceSettingsDialog(QDialog):
                 self.web_capture_mode_combo.currentData() or "auto"
             ),
             web_capture_download_dir=self.web_capture_dir_edit.text().strip(),
+            icon_rebuild_create_backups=self.rebuild_backup_enabled.isChecked(),
+            icon_rebuild_mode=str(self.rebuild_mode_combo.currentData() or "guided"),
         )
+
+    def _on_clean_backups_clicked(self) -> None:
+        if self._cleanup_backups_callback is None:
+            QMessageBox.information(
+                self,
+                "Clean Backup Icons",
+                "Cleanup is not available in this context.",
+            )
+            return
+        try:
+            self._cleanup_backups_callback()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Clean Backup Icons",
+                f"Cleanup failed:\n{exc}",
+            )
 
     def _on_browse_web_capture_dir(self) -> None:
         current = self.web_capture_dir_edit.text().strip()
