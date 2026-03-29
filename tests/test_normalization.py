@@ -28,3 +28,10 @@ def test_cleaned_name_removes_approved_tags_and_versions_and_extension() -> None
 def test_cleaned_name_strips_trailing_version_suffix_delimited_by_dash() -> None:
     assert cleaned_name_from_full("Game-v1.2.zip", is_file=True, approved_tags=set()) == "Game"
     assert cleaned_name_from_full("Game-1.2.3.iso", is_file=True, approved_tags=set()) == "Game"
+
+
+def test_cleaned_name_strips_internal_dashes() -> None:
+    assert (
+        cleaned_name_from_full("A-Sceptics-Guide-to-Magic.zip", is_file=True, approved_tags=set())
+        == "A Sceptics Guide to Magic"
+    )

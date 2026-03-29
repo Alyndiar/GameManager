@@ -22,6 +22,7 @@ from gamemanager.services.background_removal import (
 from gamemanager.services import icon_pipeline_runtime as _pipeline_runtime
 from gamemanager.services import icon_pipeline_templates as _template_domain
 from gamemanager.services.paths import project_data_dir, project_root
+from gamemanager.services.pillow_image import load_image_rgba_bytes
 
 # Keep PaddleX/PaddleOCR local-only by default, no startup host probing.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -2466,10 +2467,7 @@ def _apply_border_shader(
 
 
 def _build_master(image_bytes: bytes) -> Image.Image:
-    image = Image.open(BytesIO(image_bytes))
-    image.load()
-    image = ImageOps.exif_transpose(image)
-    image = image.convert("RGBA")
+    image = load_image_rgba_bytes(image_bytes, preferred_ico_size=256)
     return _crop_square(image)
 
 

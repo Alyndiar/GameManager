@@ -122,6 +122,61 @@ def test_set_folder_rebuilt_flag_updates_value(tmp_path: Path, monkeypatch) -> N
     assert folder_icons.read_folder_rebuilt_flag(folder) is True
 
 
+def test_set_folder_icon_metadata_roundtrip(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "Game"
+    folder.mkdir()
+    (folder / "Game.ico").write_bytes(b"ICO")
+    (folder / "desktop.ini").write_text(
+        "[.ShellClassInfo]\nIconResource=.\\Game.ico,0\nFlags=0\nRebuilt=true\n",
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setattr(folder_icons, "_run_attrib", lambda args: None)
+    monkeypatch.setattr(folder_icons, "_shell_refresh", lambda path: None)
+
+    changed = folder_icons.set_folder_icon_metadata(
+        folder,
+        {
+            "SourceKind": "sgdb_raw",
+            "SourceProvider": "SteamGridDB",
+            "SourceCandidateId": "icons:123",
+            "SourceGameId": "9876",
+            "SourceFingerprint256": "abc123",
+            "SourceConfidence": "1.0000",
+        },
+    )
+    assert changed is True
+    metadata = folder_icons.read_folder_icon_metadata(folder)
+    assert metadata.get("SourceKind") == "sgdb_raw"
+    assert metadata.get("SourceProvider") == "SteamGridDB"
+    desktop = (folder / "desktop.ini").read_text(encoding="utf-8-sig")
+    assert "[GameManager.Icon]" in desktop
+    assert "SourceGameId=9876" in desktop
+
+
+def test_set_folder_info_tip_preserves_icon_metadata(tmp_path: Path, monkeypatch) -> None:
+    folder = tmp_path / "Game"
+    folder.mkdir()
+    (folder / "Game.ico").write_bytes(b"ICO")
+    (folder / "desktop.ini").write_text(
+        "[.ShellClassInfo]\n"
+        "IconResource=.\\Game.ico,0\n"
+        "Flags=0\n"
+        "Rebuilt=true\n\n"
+        "[GameManager.Icon]\n"
+        "SourceKind=sgdb_raw\n"
+        "SourceProvider=SteamGridDB\n",
+        encoding="utf-8-sig",
+    )
+    monkeypatch.setattr(folder_icons, "_run_attrib", lambda args: None)
+    monkeypatch.setattr(folder_icons, "_shell_refresh", lambda path: None)
+
+    changed = folder_icons.set_folder_info_tip(folder, "Updated tip")
+    assert changed is True
+    metadata = folder_icons.read_folder_icon_metadata(folder)
+    assert metadata.get("SourceKind") == "sgdb_raw"
+    assert metadata.get("SourceProvider") == "SteamGridDB"
+
+
 def test_apply_folder_icon_clears_attrs_before_overwrite(tmp_path: Path, monkeypatch) -> None:
     folder = tmp_path / "Game"
     folder.mkdir()

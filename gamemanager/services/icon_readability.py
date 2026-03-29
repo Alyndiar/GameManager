@@ -216,6 +216,7 @@ def rebuild_existing_local_icons(
     create_backups: bool = True,
     progress_cb=None,
     should_cancel=None,
+    on_rebuilt=None,
 ) -> OperationReport:
     report = OperationReport(total=len(entries))
     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -258,6 +259,11 @@ def rebuild_existing_local_icons(
             icon_path.write_bytes(rebuilt)
             set_folder_rebuilt_flag(folder_path, True)
             _shell_refresh(folder_path)
+            if on_rebuilt is not None:
+                try:
+                    on_rebuilt(str(folder_path), str(icon_path))
+                except Exception:
+                    pass
             report.succeeded += 1
             if create_backups and backup_path is not None:
                 report.details.append(
