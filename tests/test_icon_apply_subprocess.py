@@ -27,6 +27,7 @@ def test_apply_folder_icon_in_subprocess_parses_worker_json(
         bg_removal_params=None,
         text_preserve_config=None,
         border_shader=None,
+        size_improvements=None,
         temp_dir=tmp_path,
     )
     assert result.status == "applied"
@@ -52,6 +53,7 @@ def test_apply_folder_icon_in_subprocess_handles_launch_error(
         bg_removal_params=None,
         text_preserve_config=None,
         border_shader=None,
+        size_improvements=None,
         temp_dir=tmp_path,
     )
     assert result.status == "failed"

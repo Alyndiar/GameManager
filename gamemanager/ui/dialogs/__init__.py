@@ -17,6 +17,10 @@ from .icon_construction import (
     SeedColorButton,
 )
 from .icon_library import IconPickerDialog
+from .icon_rebuild_preview import (
+    IconRebuildPreviewDialog,
+    IconRebuildPreviewItem,
+)
 from .operations import (
     CleanupPreviewDialog,
     DeleteGroupDialog,
@@ -27,6 +31,7 @@ from .settings import (
     IconProviderSettingsDialog,
     PerformanceSettingsDialog,
 )
+from .steamgriddb_target_picker import SgdbTargetPickerDialog
 from .template_management import (
     TemplateGalleryDialog,
     TemplatePrepDialog,
@@ -46,10 +51,13 @@ __all__ = [
     "IconPickerResult",
     "IconProviderSettingsDialog",
     "IconProviderSettingsResult",
+    "IconRebuildPreviewDialog",
+    "IconRebuildPreviewItem",
     "MovePreviewDialog",
     "PerformanceSettingsDialog",
     "PerformanceSettingsResult",
     "SeedColorButton",
+    "SgdbTargetPickerDialog",
     "TagReviewDialog",
     "TagReviewResult",
     "TemplateGalleryDialog",

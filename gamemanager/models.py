@@ -116,3 +116,60 @@ class IconApplyResult:
     message: str
     ico_path: str | None = None
     desktop_ini_path: str | None = None
+
+
+@dataclass(slots=True)
+class IconRebuildEntry:
+    folder_path: str
+    icon_path: str
+    already_rebuilt: bool
+    summary: str
+
+
+@dataclass(slots=True)
+class SgdbGameCandidate:
+    game_id: int
+    title: str
+    confidence: float
+    evidence: list[str]
+    steam_appid: str | None = None
+
+
+@dataclass(slots=True)
+class SgdbGameBinding:
+    folder_path: str
+    game_id: int
+    game_name: str
+    last_confidence: float
+    evidence_json: str
+    confirmed_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class SgdbIconAsset:
+    icon_id: int
+    url: str
+    thumb_url: str
+    author_name: str
+    author_steam64: str
+
+
+@dataclass(slots=True)
+class SgdbTargetResolution:
+    selected: SgdbGameCandidate | None
+    candidates: list[SgdbGameCandidate]
+    saved_binding: SgdbGameBinding | None
+    drift_reasons: list[str]
+    requires_confirmation: bool
+    exact_appid_game_id: int | None = None
+
+
+@dataclass(slots=True)
+class SgdbOriginStatus:
+    source_kind: str
+    source_provider: str
+    is_sgdb_origin: bool
+    confidence: float
+    matched_icon_id: int | None
+    reason: str

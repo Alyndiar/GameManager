@@ -18,6 +18,7 @@ _WRAPPED_TAG_RE = re.compile(r"\s*[\(\[\{]\s*([^\]\)\}]+?)\s*[\)\]\}]\s*$")
 # A space right after "-" (e.g. "- GOG") is intentionally ignored.
 _DELIM_TAG_RE = re.compile(r"\s*[-_]([A-Za-z0-9][A-Za-z0-9 .&+']*)\s*$")
 _TRAILING_DELIMS_RE = re.compile(r"[-_\s]+$")
+_CLEANED_DASH_RE = re.compile(r"[-]+")
 
 
 def collapse_whitespace(value: str) -> str:
@@ -178,4 +179,5 @@ def cleaned_name_from_full(
     normalized = normalize_separators(base)
     no_tags = remove_approved_suffix_tags(normalized, approved_tags)
     no_version = strip_trailing_versions(no_tags)
-    return collapse_whitespace(no_version)
+    no_dash = _CLEANED_DASH_RE.sub(" ", no_version)
+    return collapse_whitespace(no_dash)

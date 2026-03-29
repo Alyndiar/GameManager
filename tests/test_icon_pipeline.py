@@ -32,12 +32,153 @@ def test_build_multi_size_ico_generates_valid_ico() -> None:
     assert (256, 256) in sizes or image.size == (256, 256)
 
 
+def test_build_multi_size_ico_authors_explicit_frames_per_size(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def _fake_build(_master, size, _template, foreground=None, border_shader=None):
+        calls.append(int(size))
+        return Image.new("RGBA", (int(size), int(size)), (int(size) % 256, 0, 0, 255))
+
+    monkeypatch.setattr(icon_pipeline, "_build_composited_icon", _fake_build)
+    monkeypatch.setattr(icon_pipeline, "_apply_size_profile", lambda image, size, *_args: image)
+    monkeypatch.setattr(
+        icon_pipeline,
+        "_tiny_icon_legibility_pass",
+        lambda image, size, *_args: image,
+    )
+
+    ico_data = build_multi_size_ico(
+        _sample_png_bytes(),
+        circular_ring=False,
+        icon_style="none",
+        size_improvements={
+            int(size): {"pre_enabled": False, "silhouette_enabled": False, "tiny_enabled": False}
+            for size in ICO_SIZES
+        },
+    )
+    assert calls == [int(size) for size in ICO_SIZES]
+
+    for size in ICO_SIZES:
+        opened = Image.open(BytesIO(ico_data))
+        opened.size = (int(size), int(size))
+        opened.load()
+        frame = opened.convert("RGBA")
+        assert frame.getpixel((0, 0))[0] == int(size) % 256
+
+
 def test_build_preview_png_outputs_png_bytes() -> None:
     preview = build_preview_png(_sample_png_bytes(), size=96, circular_ring=False)
     opened = Image.open(BytesIO(preview))
     assert opened.format == "PNG"
     assert opened.size == (96, 96)
     assert len(ICO_SIZES) >= 5
+
+
+def test_tiny_icon_legibility_pass_skips_large_sizes() -> None:
+    src = Image.new("RGBA", (64, 64), (80, 120, 200, 255))
+    out = icon_pipeline._tiny_icon_legibility_pass(src, 48)
+    assert out.tobytes() == src.tobytes()
+
+
+def test_tiny_icon_legibility_pass_cleans_soft_alpha_in_tiny_sizes() -> None:
+    src = Image.new("RGBA", (16, 16), (120, 110, 90, 255))
+    src.putpixel((1, 1), (240, 240, 240, 6))
+    src.putpixel((2, 1), (240, 240, 240, 18))
+    out = icon_pipeline._tiny_icon_legibility_pass(src, 16)
+    alpha = out.getchannel("A")
+    assert alpha.getpixel((1, 1)) == 0
+    assert alpha.getpixel((2, 1)) > 0
+
+
+def test_tiny_icon_legibility_pass_prunes_isolated_tiny_islands() -> None:
+    src = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+    src.putpixel((1, 1), (255, 255, 255, 255))
+    for x in range(10, 13):
+        for y in range(10, 13):
+            src.putpixel((x, y), (255, 255, 255, 255))
+    out = icon_pipeline._tiny_icon_legibility_pass(
+        src,
+        16,
+        {
+            16: {
+                "tiny_enabled": True,
+                "tiny_unsharp_enabled": False,
+                "tiny_micro_contrast_enabled": False,
+                "tiny_alpha_cleanup_enabled": False,
+                "tiny_prune_enabled": True,
+                "tiny_prune_min_pixels": 3,
+                "tiny_prune_alpha_threshold": 10,
+            }
+        },
+    )
+    alpha = out.getchannel("A")
+    assert alpha.getpixel((1, 1)) == 0
+    assert alpha.getpixel((11, 11)) > 0
+
+
+def test_normalize_silhouette_boosts_tiny_subject_coverage() -> None:
+    src = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(src)
+    draw.rectangle((10, 10, 12, 12), fill=(255, 200, 100, 255))
+    before_coverage = sum(1 for value in src.getchannel("A").tobytes() if int(value) > 8) / float(
+        24 * 24
+    )
+    out = icon_pipeline._normalize_silhouette(
+        src,
+        24,
+        {
+            24: {
+                "silhouette_enabled": True,
+                "silhouette_target_min": 0.20,
+                "silhouette_target_max": 0.60,
+                "silhouette_alpha_threshold": 8,
+                "silhouette_max_upscale": 3.0,
+                "silhouette_min_scale": 0.5,
+            }
+        },
+    )
+    after_coverage = sum(
+        1 for value in out.getchannel("A").tobytes() if int(value) > 8
+    ) / float(24 * 24)
+    assert after_coverage > before_coverage
+
+
+def test_pre_downscale_prepare_source_uses_working_scale() -> None:
+    src = Image.new("RGBA", (64, 64), (120, 80, 30, 255))
+    out = icon_pipeline._pre_downscale_prepare_source(
+        src,
+        24,
+        {
+            24: {
+                "pre_enabled": True,
+                "pre_working_scale": 2.5,
+                "pre_simplify_enabled": False,
+                "pre_prune_enabled": False,
+                "pre_stroke_boost_enabled": False,
+            }
+        },
+    )
+    assert out.size == (60, 60)
+
+
+def test_normalize_silhouette_does_not_shrink_when_downscale_disabled() -> None:
+    src = Image.new("RGBA", (24, 24), (180, 120, 60, 255))
+    out = icon_pipeline._normalize_silhouette(
+        src,
+        24,
+        {
+            24: {
+                "silhouette_enabled": True,
+                "silhouette_target_min": 0.10,
+                "silhouette_target_max": 0.30,
+                "silhouette_alpha_threshold": 8,
+                "silhouette_max_upscale": 2.0,
+                "silhouette_min_scale": 0.5,
+                "silhouette_allow_downscale": False,
+            }
+        },
+    )
+    assert out.tobytes() == src.tobytes()
 
 
 def test_bordered_preview_keeps_outside_transparent() -> None:

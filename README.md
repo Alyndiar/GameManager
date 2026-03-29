@@ -74,6 +74,12 @@ python -m iconmaker_gui
 This always runs tests in the `GameManager` conda environment (`conda run -n GameManager`),
 independent of your currently active shell environment.
 
+For all project commands (not only tests), use the `GameManager` environment:
+
+```powershell
+conda run -n GameManager <command>
+```
+
 ## Data, Cache, and Secret Storage
 
 - Default app data root: `.gamemanager_data` (project-local).

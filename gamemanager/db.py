@@ -60,6 +60,31 @@ class Database:
                     source TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS sgdb_game_bindings (
+                    folder_path TEXT PRIMARY KEY,
+                    game_id INTEGER NOT NULL,
+                    game_name TEXT NOT NULL,
+                    last_confidence REAL NOT NULL DEFAULT 0.0,
+                    evidence_json TEXT NOT NULL DEFAULT '',
+                    confirmed_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sgdb_upload_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    folder_path TEXT NOT NULL,
+                    game_id INTEGER NOT NULL,
+                    icon_fingerprint256 TEXT NOT NULL,
+                    uploaded_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sgdb_upload_history_folder
+                    ON sgdb_upload_history(folder_path);
+                CREATE INDEX IF NOT EXISTS idx_sgdb_upload_history_lookup
+                    ON sgdb_upload_history(folder_path, game_id, icon_fingerprint256, status);
                 """
             )
 
@@ -204,3 +229,127 @@ class Database:
                     utc_now_iso(),
                 ),
             )
+
+    def get_sgdb_binding(self, folder_path: str) -> sqlite3.Row | None:
+        folder = folder_path.strip()
+        if not folder:
+            return None
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT folder_path, game_id, game_name, last_confidence,
+                       evidence_json, confirmed_at, updated_at
+                FROM sgdb_game_bindings
+                WHERE folder_path = ?
+                """,
+                (folder,),
+            ).fetchone()
+
+    def upsert_sgdb_binding(
+        self,
+        folder_path: str,
+        game_id: int,
+        game_name: str,
+        last_confidence: float,
+        evidence_json: str,
+    ) -> None:
+        folder = folder_path.strip()
+        if not folder:
+            return
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sgdb_game_bindings(
+                    folder_path, game_id, game_name, last_confidence,
+                    evidence_json, confirmed_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(folder_path) DO UPDATE SET
+                    game_id=excluded.game_id,
+                    game_name=excluded.game_name,
+                    last_confidence=excluded.last_confidence,
+                    evidence_json=excluded.evidence_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    folder,
+                    int(game_id),
+                    game_name.strip(),
+                    float(last_confidence),
+                    evidence_json.strip(),
+                    now,
+                    now,
+                ),
+            )
+
+    def add_sgdb_upload_history(
+        self,
+        folder_path: str,
+        game_id: int,
+        icon_fingerprint256: str,
+        status: str,
+        note: str = "",
+    ) -> None:
+        folder = folder_path.strip()
+        fingerprint = icon_fingerprint256.strip().casefold()
+        if not folder or not fingerprint:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sgdb_upload_history(
+                    folder_path, game_id, icon_fingerprint256, uploaded_at, status, note
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    folder,
+                    int(game_id),
+                    fingerprint,
+                    utc_now_iso(),
+                    status.strip() or "unknown",
+                    note.strip(),
+                ),
+            )
+
+    def was_sgdb_icon_uploaded(
+        self,
+        folder_path: str,
+        game_id: int,
+        icon_fingerprint256: str,
+    ) -> bool:
+        folder = folder_path.strip()
+        fingerprint = icon_fingerprint256.strip().casefold()
+        if not folder or not fingerprint:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM sgdb_upload_history
+                WHERE folder_path = ?
+                  AND game_id = ?
+                  AND icon_fingerprint256 = ?
+                  AND status = 'uploaded'
+                LIMIT 1
+                """,
+                (folder, int(game_id), fingerprint),
+            ).fetchone()
+        return row is not None
+
+    def latest_sgdb_upload_for_folder(self, folder_path: str) -> sqlite3.Row | None:
+        folder = folder_path.strip()
+        if not folder:
+            return None
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, folder_path, game_id, icon_fingerprint256, uploaded_at, status, note
+                FROM sgdb_upload_history
+                WHERE folder_path = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (folder,),
+            ).fetchone()

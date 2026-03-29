@@ -45,6 +45,8 @@ class PerformanceSettingsResult:
     startup_prewarm_mode: str
     web_capture_download_mode: str = "auto"
     web_capture_download_dir: str = ""
+    icon_rebuild_create_backups: bool = True
+    icon_rebuild_mode: str = "guided"
 
 
 __all__ = ["IconPickerResult", "IconProviderSettingsResult", "PerformanceSettingsResult", "TagReviewResult"]
