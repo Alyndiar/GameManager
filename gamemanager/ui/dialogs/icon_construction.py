@@ -383,6 +383,7 @@ class IconFrameCanvas(QWidget):
         self._text_mark_mode = "none"
         self._manual_add_points: list[tuple[float, float]] = []
         self._manual_remove_points: list[tuple[float, float]] = []
+        self._show_manual_text_markers = True
         self._template_pixmaps: dict[str, QPixmap] = {}
         self._tinted_template_pixmaps: dict[tuple[str, str], QPixmap] = {}
         self._template_interior_path_cache: dict[tuple[str, int, int], QPainterPath | None] = {}
@@ -492,6 +493,13 @@ class IconFrameCanvas(QWidget):
         self._manual_add_points = normalized_add
         self._manual_remove_points = normalized_remove
         self.update()
+
+    def set_manual_text_markers_visible(self, visible: bool) -> None:
+        self._show_manual_text_markers = bool(visible)
+        self.update()
+
+    def manual_text_markers_visible(self) -> bool:
+        return self._show_manual_text_markers
 
     def set_text_roi(self, roi: tuple[float, float, float, float] | list[float] | None) -> None:
         normalized: tuple[float, float, float, float] | None
@@ -1402,7 +1410,7 @@ class IconFrameCanvas(QWidget):
             painter.setPen(QPen(QColor(255, 210, 80, 220), 2, Qt.PenStyle.DashLine))
             painter.fillRect(roi_rect, QColor(255, 210, 80, 35))
             painter.drawRect(roi_rect)
-        if self._manual_add_points:
+        if self._show_manual_text_markers and self._manual_add_points:
             painter.setPen(QPen(QColor(74, 220, 112, 220), 1))
             painter.setBrush(QColor(74, 220, 112, 160))
             for x_norm, y_norm in self._manual_add_points:
@@ -1410,7 +1418,7 @@ class IconFrameCanvas(QWidget):
                     QPointF(x_norm * self._pixmap.width(), y_norm * self._pixmap.height())
                 )
                 painter.drawEllipse(point, 4.0, 4.0)
-        if self._manual_remove_points:
+        if self._show_manual_text_markers and self._manual_remove_points:
             painter.setPen(QPen(QColor(225, 96, 88, 220), 1))
             painter.setBrush(QColor(225, 96, 88, 160))
             for x_norm, y_norm in self._manual_remove_points:
@@ -2066,6 +2074,12 @@ class IconFramingDialog(
         manual_mark_row.addWidget(self.manual_mark_remove_btn)
         manual_mark_row.addWidget(self.manual_mark_stop_btn)
         side.addWidget(self.manual_mark_controls_container)
+        self.manual_mark_show_dots_check = QCheckBox("Show add/remove dots", self)
+        self.manual_mark_show_dots_check.setChecked(True)
+        self.manual_mark_show_dots_check.toggled.connect(
+            self._on_manual_mark_visibility_toggled
+        )
+        side.addWidget(self.manual_mark_show_dots_check)
         self.manual_mark_count_label = QLabel("", self)
         side.addWidget(self.manual_mark_count_label)
 
@@ -2762,6 +2776,10 @@ class IconFramingDialog(
     def _on_manual_mark_stop_mode(self) -> None:
         self._set_manual_mark_mode("none")
 
+    def _on_manual_mark_visibility_toggled(self, enabled: bool) -> None:
+        self._canvas.set_manual_text_markers_visible(bool(enabled))
+        self._refresh_cutout_status()
+
     def _manual_points_snapshot(
         self,
     ) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...]]:
@@ -3140,6 +3158,7 @@ class IconFramingDialog(
         self.seed_controls_container.setVisible(text_enabled)
         self.manual_mark_label.setVisible(text_enabled)
         self.manual_mark_controls_container.setVisible(text_enabled)
+        self.manual_mark_show_dots_check.setVisible(text_enabled)
         self.manual_mark_count_label.setVisible(text_enabled)
         self.roi_controls_container.setVisible(roi_enabled)
         self.debug_text_alpha_check.setVisible(text_enabled)
@@ -3155,6 +3174,7 @@ class IconFramingDialog(
         self._refresh_manual_mark_count_label()
         self._update_roi_label()
         self._update_manual_history_buttons()
+        self.manual_mark_show_dots_check.setEnabled(text_enabled)
 
     def selected_bg_removal_engine(self) -> str:
         if not self._template_enabled():

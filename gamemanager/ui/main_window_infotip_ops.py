@@ -185,6 +185,17 @@ class MainWindowInfoTipOpsMixin:
             f"Path: {entry.full_path}",
             f"Source: {row_source}",
         ]
+        if entry.is_dir:
+            metadata = self.state.read_folder_icon_metadata(entry.full_path)
+            source_kind = str(metadata.get("SourceKind", "")).strip()
+            source_provider = str(metadata.get("SourceProvider", "")).strip()
+            source_game_id = str(metadata.get("SourceGameId", "")).strip()
+            if source_kind:
+                lines.append(f"Icon Source Kind: {source_kind}")
+            if source_provider:
+                lines.append(f"Icon Source Provider: {source_provider}")
+            if source_game_id:
+                lines.append(f"Icon Source Game ID: {source_game_id}")
         tip = (entry.info_tip or "").strip()
         if tip:
             lines.append(f"InfoTip: {tip}")

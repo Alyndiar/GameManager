@@ -31,6 +31,7 @@ from .settings import (
     IconProviderSettingsDialog,
     PerformanceSettingsDialog,
 )
+from .steamgriddb_target_picker import SgdbTargetPickerDialog
 from .template_management import (
     TemplateGalleryDialog,
     TemplatePrepDialog,
@@ -56,6 +57,7 @@ __all__ = [
     "PerformanceSettingsDialog",
     "PerformanceSettingsResult",
     "SeedColorButton",
+    "SgdbTargetPickerDialog",
     "TagReviewDialog",
     "TagReviewResult",
     "TemplateGalleryDialog",
