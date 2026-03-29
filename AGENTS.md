@@ -24,3 +24,10 @@ Preferred test entrypoint:
 ```
 
 This script already enforces `conda run -n GameManager`.
+
+## Git Workflow Invariant (Critical)
+
+All work must happen on a feature branch.
+
+- Do not develop directly on `main`/`master`.
+- Create or switch to a feature branch before making changes.
