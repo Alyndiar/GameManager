@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import copy
 from datetime import datetime
 import json
@@ -27,9 +28,13 @@ from gamemanager.models import (
 )
 from gamemanager.services.cancellation import OperationCancelled
 from gamemanager.services.background_removal import normalize_background_removal_engine
+from gamemanager.services.storefronts.priority import normalize_store_name, sort_stores
+from gamemanager.services.steamgriddb_targeting import normalize_name_for_compare
 from gamemanager.services.icon_pipeline import (
     border_shader_to_dict,
+    normalize_background_fill_params,
     default_icon_size_improvements,
+    normalize_background_fill_mode,
     normalize_border_shader_config,
     normalize_icon_size_improvements,
     normalize_icon_style,
@@ -420,7 +425,10 @@ class MainWindowIconOpsMixin:
                 if report.details:
                     lines.append("")
                     lines.extend(report.details[:12])
-                QMessageBox.information(self, "Rebuild Existing Icons", "\n".join(lines))
+                if int(report.failed) > 0:
+                    QMessageBox.warning(self, "Rebuild Existing Icons", "\n".join(lines))
+                else:
+                    self._show_success_popup("Rebuild Existing Icons", "\n".join(lines))
 
         self._start_report_operation(
             "Rebuild Existing Icons",
@@ -479,7 +487,10 @@ class MainWindowIconOpsMixin:
             if report.details:
                 lines.append("")
                 lines.extend(report.details[:12])
-            QMessageBox.information(self, "Backfill Missing Icon Sources", "\n".join(lines))
+            if int(report.failed) > 0:
+                QMessageBox.warning(self, "Backfill Missing Icon Sources", "\n".join(lines))
+            else:
+                self._show_success_popup("Backfill Missing Icon Sources", "\n".join(lines))
 
         self._start_report_operation("Backfill Missing Icon Sources", _run, _done)
 
@@ -513,25 +524,1103 @@ class MainWindowIconOpsMixin:
         )
         return False
 
+    @staticmethod
+    def _perfect_confidence_candidates(
+        candidates: list[SgdbGameCandidate],
+    ) -> list[SgdbGameCandidate]:
+        return [
+            c
+            for c in list(candidates or [])
+            if abs(float(c.confidence) - 1.0) <= 1e-9
+        ]
+
+    def _on_assign_steam_appid_selected(self) -> None:
+        self._start_assign_steam_appids_flow(all_visible=False)
+
+    def _on_assign_steam_appid_all_visible(self) -> None:
+        self._start_assign_steam_appids_flow(all_visible=True)
+
+    def _confirm_single_steamid_reselection(self, entry: InventoryItem) -> tuple[bool, bool]:
+        existing = self.state.read_assigned_steam_appid(entry.full_path).strip()
+        if not existing:
+            return True, False
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Assign SteamID")
+        box.setText(
+            f"Current SteamID for '{entry.cleaned_name or entry.full_name}' is {existing}."
+        )
+        box.setInformativeText(
+            "Reselect now, keep automatic selection, or cancel."
+        )
+        reselect_btn = box.addButton("Reselect...", QMessageBox.ButtonRole.YesRole)
+        auto_btn = box.addButton("Auto", QMessageBox.ButtonRole.NoRole)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(auto_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == cancel_btn:
+            return False, False
+        if clicked == reselect_btn:
+            return True, True
+        return True, False
+
+    @staticmethod
+    def _resolve_candidate_with_steam_appid(
+        state,
+        candidate: SgdbGameCandidate,
+    ) -> tuple[SgdbGameCandidate, str]:
+        selected = candidate
+        appid = str(candidate.steam_appid or "").strip()
+        if not appid:
+            identity_store = normalize_store_name(str(candidate.identity_store or ""))
+            identity_store_id = str(candidate.identity_store_id or "").strip()
+            if identity_store == "Steam" and identity_store_id.isdigit():
+                appid = identity_store_id
+        if not appid:
+            store_ids = dict(getattr(candidate, "store_ids", {}) or {})
+            steam_from_map = str(store_ids.get("Steam", "")).strip()
+            if steam_from_map.isdigit():
+                appid = steam_from_map
+        if appid.isdigit():
+            return selected, appid
+        if int(getattr(candidate, "game_id", 0) or 0) <= 0:
+            return selected, ""
+        details = state.resolve_sgdb_game_by_id(int(candidate.game_id))
+        selected = details
+        appid = str(details.steam_appid or "").strip()
+        if appid.isdigit():
+            return selected, appid
+        return selected, ""
+
+    @staticmethod
+    def _is_exact_normalized_name_match(
+        entry: InventoryItem,
+        candidate: SgdbGameCandidate,
+    ) -> bool:
+        left = normalize_name_for_compare(entry.cleaned_name or entry.full_name)
+        right = normalize_name_for_compare(candidate.title)
+        return bool(left and right and left == right)
+
+    def _unique_exact_normalized_full_confidence_candidate(
+        self,
+        entry: InventoryItem,
+        candidates: list[SgdbGameCandidate],
+    ) -> SgdbGameCandidate | None:
+        exact = [
+            c
+            for c in list(candidates or [])
+            if abs(float(c.confidence) - 1.0) <= 1e-9
+            and self._is_exact_normalized_name_match(entry, c)
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        return None
+
+    def _apply_candidate_identity(
+        self,
+        *,
+        entry: InventoryItem,
+        selected_candidate: SgdbGameCandidate,
+        steam_appid: str,
+    ) -> tuple[bool, list[str]]:
+        identity_store = normalize_store_name(str(selected_candidate.identity_store or ""))
+        identity_store_id = str(selected_candidate.identity_store_id or "").strip()
+        discovered_store_ids: dict[str, str] = {}
+        try:
+            discovered_store_ids = self.state.discover_store_ids_for_title(
+                selected_candidate.title
+            )
+        except Exception:
+            discovered_store_ids = {}
+        merged_store_ids: dict[str, str] = {}
+        for raw_store, raw_id in dict(getattr(selected_candidate, "store_ids", {}) or {}).items():
+            canonical = normalize_store_name(str(raw_store or "").strip())
+            token = str(raw_id or "").strip()
+            if canonical and token:
+                merged_store_ids[canonical] = token
+        for raw_store, raw_id in dict(discovered_store_ids or {}).items():
+            canonical = normalize_store_name(str(raw_store or "").strip())
+            token = str(raw_id or "").strip()
+            if canonical and token and canonical not in merged_store_ids:
+                merged_store_ids[canonical] = token
+        if identity_store and identity_store_id:
+            merged_store_ids[identity_store] = identity_store_id
+        if steam_appid:
+            merged_store_ids["Steam"] = steam_appid
+        changed = False
+        applied: list[str] = []
+        self.state.clear_owned_store_info_for_inventory(entry.full_path)
+        for store_name in sort_stores(list(merged_store_ids.keys())):
+            store_id = str(merged_store_ids.get(store_name, "")).strip()
+            if not store_id:
+                continue
+            changed = (
+                self.state.assign_store_id_hint(
+                    folder_path=entry.full_path,
+                    store_name=store_name,
+                    store_id=store_id,
+                )
+                or changed
+            )
+            applied.append(f"{store_name}={store_id}")
+        game_id = int(getattr(selected_candidate, "game_id", 0) or 0)
+        if game_id > 0:
+            self.state.save_sgdb_binding(
+                entry.full_path,
+                game_id,
+                selected_candidate.title,
+                float(selected_candidate.confidence),
+                list(selected_candidate.evidence),
+            )
+            self.state.upsert_folder_icon_metadata(
+                entry.full_path,
+                {"SourceGameId": str(game_id)},
+            )
+        else:
+            self.state.upsert_folder_icon_metadata(
+                entry.full_path,
+                {"SourceGameId": None},
+            )
+        return changed, applied
+
+    def _resolve_manual_target_id(self, source: str, raw_id: str) -> SgdbGameCandidate:
+        source_token = normalize_store_name(str(source or "").strip())
+        id_token = str(raw_id or "").strip()
+        if not source_token or not id_token:
+            raise ValueError("Manual source and ID are required.")
+        if source_token == "SGDB":
+            if not id_token.isdigit():
+                raise ValueError("SGDB Game ID must be numeric.")
+            return self._run_ui_pumped_call(
+                "Resolve manual SGDB ID",
+                lambda: self.state.resolve_sgdb_game_by_id(int(id_token)),
+            )
+        return self._run_ui_pumped_call(
+            f"Resolve manual {source_token} ID",
+            lambda: self.state.resolve_sgdb_game_by_store_id(source_token, id_token),
+        )
+
+    @staticmethod
+    def _manual_store_options_for_entry(entry: InventoryItem) -> list[str]:
+        options = ["Steam"]
+        options.extend(list(entry.owned_stores or []))
+        return sort_stores(options)
+
+    def _owned_store_targets_for_entry(self, entry: InventoryItem) -> list[dict[str, str]]:
+        title = entry.cleaned_name or entry.full_name
+        return self.state.store_targets_for_inventory(entry.full_path, game_title=title)
+
+    def _active_sgdb_picker_flow_state(self) -> dict[str, object] | None:
+        state = getattr(self, "_sgdb_picker_flow_state", None)
+        if isinstance(state, dict):
+            return state
+        return None
+
+    def _confirm_interrupt_active_sgdb_picker_flow(self, next_flow_title: str) -> bool:
+        active = self._active_sgdb_picker_flow_state()
+        if active is None:
+            return True
+        current_title = str(active.get("flow_title") or "Current flow").strip() or "Current flow"
+        requested_title = str(next_flow_title or "New flow").strip() or "New flow"
+        answer = QMessageBox.question(
+            self,
+            "Flow Already Running",
+            "\n".join(
+                [
+                    f"'{current_title}' is currently open/minimized.",
+                    "",
+                    f"Starting '{requested_title}' will cancel the remaining items in '{current_title}'.",
+                    "Do you want to continue?",
+                ]
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self._interrupt_active_sgdb_picker_flow()
+        return True
+
+    def _interrupt_active_sgdb_picker_flow(self) -> None:
+        active = self._active_sgdb_picker_flow_state()
+        if active is None:
+            return
+        self._finish_modeless_sgdb_picker_flow(
+            active,
+            canceled=True,
+            interrupted=True,
+        )
+
+    def _dialog_payload_for_manual_job(
+        self,
+        job: dict[str, object],
+    ) -> tuple[str, str, list[SgdbGameCandidate], list[str], str, list[str], list[dict[str, str]]]:
+        entry_obj = job.get("entry")
+        entry = entry_obj if isinstance(entry_obj, InventoryItem) else None
+        folder_name = str(job.get("folder_name") or "").strip()
+        if not folder_name and entry is not None:
+            folder_name = entry.cleaned_name or entry.full_name
+        folder_path = str(job.get("folder_path") or "").strip()
+        if not folder_path and entry is not None:
+            folder_path = entry.full_path
+        icon_path = str(job.get("icon_path") or "").strip()
+        if not icon_path and entry is not None:
+            icon_path = str(entry.folder_icon_path or "").strip()
+        candidates = [
+            candidate
+            for candidate in list(job.get("candidates") or [])
+            if isinstance(candidate, SgdbGameCandidate)
+        ]
+        drift_reasons = [
+            str(value).strip()
+            for value in list(job.get("drift_reasons") or [])
+            if str(value).strip()
+        ]
+        manual_store_options = [
+            str(value).strip()
+            for value in list(job.get("manual_store_options") or [])
+            if str(value).strip()
+        ]
+        if not manual_store_options and entry is not None:
+            manual_store_options = self._manual_store_options_for_entry(entry)
+        owned_store_targets = [
+            row
+            for row in list(job.get("owned_store_targets") or [])
+            if isinstance(row, dict)
+        ]
+        if not owned_store_targets and entry is not None:
+            owned_store_targets = self._owned_store_targets_for_entry(entry)
+        return (
+            folder_name,
+            folder_path,
+            candidates,
+            drift_reasons,
+            icon_path,
+            manual_store_options,
+            owned_store_targets,
+        )
+
+    def _start_modeless_sgdb_picker_flow(
+        self,
+        *,
+        flow_title: str,
+        jobs: list[dict[str, object]],
+        on_job_result: Callable[
+            [dict[str, object], SgdbGameCandidate | None, bool, bool],
+            None,
+        ],
+        on_complete: Callable[[bool, bool], None],
+    ) -> None:
+        if not jobs:
+            on_complete(False, False)
+            return
+        state: dict[str, object] = {
+            "flow_title": str(flow_title or "Select target").strip() or "Select target",
+            "jobs": list(jobs),
+            "index": 0,
+            "dialog": None,
+            "on_job_result": on_job_result,
+            "on_complete": on_complete,
+        }
+        self._sgdb_picker_flow_state = state
+        self._begin_interactive_operation(str(state["flow_title"]), len(jobs))
+        QTimer.singleShot(
+            0,
+            lambda _state=state: self._continue_modeless_sgdb_picker_flow(_state),
+        )
+
+    def _continue_modeless_sgdb_picker_flow(self, state: dict[str, object]) -> None:
+        if self._active_sgdb_picker_flow_state() is not state:
+            return
+        jobs = list(state.get("jobs") or [])
+        total = len(jobs)
+        index = int(state.get("index", 0))
+        flow_title = str(state.get("flow_title") or "Select target").strip() or "Select target"
+        if index >= total:
+            self._finish_modeless_sgdb_picker_flow(
+                state,
+                canceled=False,
+                interrupted=False,
+            )
+            return
+        if self._step_interactive_operation(flow_title, index, max(1, total)):
+            self._finish_modeless_sgdb_picker_flow(
+                state,
+                canceled=True,
+                interrupted=False,
+            )
+            return
+        job = jobs[index]
+        (
+            folder_name,
+            folder_path,
+            candidates,
+            drift_reasons,
+            icon_path,
+            manual_store_options,
+            owned_store_targets,
+        ) = self._dialog_payload_for_manual_job(job)
+        dialog = SgdbTargetPickerDialog(
+            folder_name=folder_name,
+            folder_path=folder_path,
+            candidates=candidates,
+            drift_reasons=drift_reasons,
+            icon_path=icon_path,
+            manual_store_options=manual_store_options,
+            owned_store_targets=owned_store_targets,
+            manual_id_resolver=self._resolve_manual_target_id,
+            parent=self,
+        )
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        state["dialog"] = dialog
+        dialog.finished.connect(
+            lambda result, _state=state, _dialog=dialog: self._on_modeless_sgdb_picker_finished(
+                _state,
+                _dialog,
+                int(result),
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_modeless_sgdb_picker_finished(
+        self,
+        state: dict[str, object],
+        dialog: SgdbTargetPickerDialog,
+        result: int,
+    ) -> None:
+        if self._active_sgdb_picker_flow_state() is not state:
+            return
+        state["dialog"] = None
+        jobs = list(state.get("jobs") or [])
+        index = int(state.get("index", 0))
+        if index < 0 or index >= len(jobs):
+            self._finish_modeless_sgdb_picker_flow(
+                state,
+                canceled=True,
+                interrupted=False,
+            )
+            return
+        job = jobs[index]
+        accepted = result == int(QDialog.DialogCode.Accepted)
+        cancel_all_requested = bool(getattr(dialog, "cancel_all_requested", False))
+        candidate = dialog.selected_candidate() if accepted else None
+        on_job_result = state.get("on_job_result")
+        if callable(on_job_result):
+            on_job_result(
+                job,
+                candidate,
+                cancel_all_requested,
+                accepted,
+            )
+        if cancel_all_requested:
+            self._finish_modeless_sgdb_picker_flow(
+                state,
+                canceled=True,
+                interrupted=False,
+            )
+            return
+        state["index"] = index + 1
+        QTimer.singleShot(
+            0,
+            lambda _state=state: self._continue_modeless_sgdb_picker_flow(_state),
+        )
+
+    def _finish_modeless_sgdb_picker_flow(
+        self,
+        state: dict[str, object],
+        *,
+        canceled: bool,
+        interrupted: bool,
+    ) -> None:
+        if self._active_sgdb_picker_flow_state() is not state:
+            return
+        dialog_obj = state.get("dialog")
+        state["dialog"] = None
+        self._sgdb_picker_flow_state = None
+        if isinstance(dialog_obj, QDialog):
+            dialog_obj.close()
+            dialog_obj.deleteLater()
+        self._end_interactive_operation()
+        on_complete = state.get("on_complete")
+        if callable(on_complete):
+            on_complete(canceled, interrupted)
+
+    def _start_assign_steam_appids_flow(self, *, all_visible: bool) -> None:
+        title = "Assign SteamID"
+        if not self._ensure_sgdb_configured(title):
+            return
+        if all_visible:
+            targets = [entry for entry in self._visible_right_items if entry.is_dir]
+            scope_label = "all visible"
+        else:
+            targets = [entry for entry in self._selected_right_entries() if entry.is_dir]
+            scope_label = "selected"
+        if not targets:
+            QMessageBox.information(
+                self,
+                title,
+                "No game folders found in the chosen scope.",
+            )
+            return
+        single_target = len(targets) == 1
+        active_flow_exists = self._active_sgdb_picker_flow_state() is not None
+        parallel_single_mode = active_flow_exists and single_target
+        if active_flow_exists and (not parallel_single_mode):
+            if not self._confirm_interrupt_active_sgdb_picker_flow(title):
+                return
+
+        force_manual_paths: set[str] = set()
+        if single_target:
+            proceed, force_manual = self._confirm_single_steamid_reselection(targets[0])
+            if not proceed:
+                return
+            if force_manual:
+                force_manual_paths.add(os.path.normpath(targets[0].full_path))
+        else:
+            decision = QMessageBox.question(
+                self,
+                title,
+                "\n".join(
+                    [
+                        f"Scope: {scope_label}",
+                        f"Games: {len(targets)}",
+                        "",
+                        "Rules:",
+                        "- Exactly one exact normalized 1.00 candidate: auto-assign",
+                        "- Otherwise: selection popup",
+                        "",
+                        "Proceed?",
+                    ]
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if decision != QMessageBox.StandardButton.Yes:
+                return
+
+        auto_jobs: list[dict[str, object]] = []
+        manual_jobs: list[dict[str, object]] = []
+
+        def _resolve_run(progress_cb, should_cancel):
+            report = OperationReport(total=len(targets))
+            total = len(targets)
+            progress_cb("Resolve SteamID targets", 0, max(1, total))
+            for idx, entry in enumerate(targets, start=1):
+                if should_cancel():
+                    raise OperationCancelled("SteamID assignment canceled.")
+                progress_cb("Resolve SteamID targets", idx - 1, max(1, total))
+                try:
+                    resolution = self.state.resolve_sgdb_target(
+                        entry.full_path,
+                        entry.cleaned_name or entry.full_name,
+                        entry.full_name,
+                    )
+                except Exception as exc:
+                    report.failed += 1
+                    report.details.append(
+                        f"{entry.full_name}: target resolution failed ({exc})"
+                    )
+                    progress_cb("Resolve SteamID targets", idx, max(1, total))
+                    continue
+                exact_auto = self._unique_exact_normalized_full_confidence_candidate(
+                    entry,
+                    resolution.candidates,
+                )
+                force_manual = os.path.normpath(entry.full_path) in force_manual_paths
+                if not force_manual and exact_auto is not None:
+                    auto_jobs.append(
+                        {
+                            "entry": entry,
+                            "candidate": exact_auto,
+                            "reason": "exact normalized 1.00 match",
+                        }
+                    )
+                else:
+                    reason = "manual reselection"
+                    if not force_manual:
+                        reason = "no unique exact normalized 1.00 match"
+                    manual_jobs.append(
+                        {
+                            "entry": entry,
+                            "candidates": resolution.candidates,
+                            "drift_reasons": resolution.drift_reasons,
+                            "reason": reason,
+                        }
+                    )
+                progress_cb("Resolve SteamID targets", idx, max(1, total))
+            progress_cb("Resolve SteamID targets", max(1, total), max(1, total))
+            return report
+
+        def _resolve_done(resolve_report: OperationReport):
+            selected_jobs: list[dict[str, object]] = list(auto_jobs)
+            manual_skipped = 0
+            combined_details: list[str] = list(resolve_report.details)
+
+            def _start_apply_phase() -> None:
+                def _apply_run(progress_cb, should_cancel):
+                    report = OperationReport(total=len(selected_jobs))
+                    total = len(selected_jobs)
+                    progress_cb("Assign SteamIDs", 0, max(1, total))
+                    for idx, job in enumerate(selected_jobs, start=1):
+                        if should_cancel():
+                            raise OperationCancelled("SteamID assignment canceled.")
+                        progress_cb("Assign SteamIDs", idx - 1, max(1, total))
+                        entry = job.get("entry")
+                        candidate = job.get("candidate")
+                        if not isinstance(entry, InventoryItem) or not isinstance(candidate, SgdbGameCandidate):
+                            report.failed += 1
+                            report.details.append("Skipped invalid assignment payload.")
+                            progress_cb("Assign SteamIDs", idx, max(1, total))
+                            continue
+                        try:
+                            selected_candidate, steam_appid = self._resolve_candidate_with_steam_appid(
+                                self.state,
+                                candidate,
+                            )
+                        except Exception as exc:
+                            report.failed += 1
+                            report.details.append(f"{entry.full_name}: lookup failed ({exc})")
+                            progress_cb("Assign SteamIDs", idx, max(1, total))
+                            continue
+                        changed, applied = self._apply_candidate_identity(
+                            entry=entry,
+                            selected_candidate=selected_candidate,
+                            steam_appid=steam_appid,
+                        )
+                        if not applied:
+                            report.skipped += 1
+                            report.details.append(
+                                f"{entry.full_name}: no resolvable store IDs for selected match."
+                            )
+                            progress_cb("Assign SteamIDs", idx, max(1, total))
+                            continue
+                        report.succeeded += 1
+                        if changed:
+                            report.details.append(
+                                f"{entry.full_name}: IDs set ({', '.join(applied)})"
+                            )
+                        else:
+                            report.details.append(
+                                f"{entry.full_name}: IDs unchanged ({', '.join(applied)})"
+                            )
+                        progress_cb("Assign SteamIDs", idx, max(1, total))
+                    linked = self.state.rebuild_store_links_from_inventory(list(self.inventory))
+                    report.details.append(f"Ownership links rebuilt: {linked}")
+                    progress_cb("Assign SteamIDs", max(1, total), max(1, total))
+                    return report
+
+                def _apply_done(apply_report: OperationReport):
+                    succeeded = int(apply_report.succeeded)
+                    failed = int(resolve_report.failed) + int(apply_report.failed)
+                    skipped = int(resolve_report.skipped) + int(manual_skipped) + int(apply_report.skipped)
+                    final_details = combined_details + list(apply_report.details)
+                    lines = [
+                        f"Succeeded: {succeeded}",
+                        f"Skipped: {skipped}",
+                        f"Failed: {failed}",
+                    ]
+                    if final_details:
+                        lines.append("")
+                        lines.extend(final_details[:12])
+                    if not (single_target and succeeded > 0 and failed == 0 and skipped == 0):
+                        if failed > 0:
+                            QMessageBox.warning(self, title, "\n".join(lines))
+                        elif skipped > 0:
+                            QMessageBox.information(self, title, "\n".join(lines))
+                        else:
+                            self._show_success_popup(title, "\n".join(lines))
+                    QTimer.singleShot(0, self.refresh_all)
+
+                started = self._start_report_operation(
+                    title,
+                    _apply_run,
+                    _apply_done,
+                )
+                if not started:
+                    QTimer.singleShot(50, _start_apply_phase)
+
+            def _finish_manual_phase(canceled: bool, interrupted: bool) -> None:
+                if canceled:
+                    if not interrupted:
+                        QMessageBox.information(self, title, "Operation canceled for remaining items.")
+                    return
+                if not selected_jobs:
+                    failed = int(resolve_report.failed)
+                    skipped = int(resolve_report.skipped) + int(manual_skipped)
+                    lines = [
+                        "Succeeded: 0",
+                        f"Skipped: {skipped}",
+                        f"Failed: {failed}",
+                    ]
+                    if combined_details:
+                        lines.append("")
+                        lines.extend(combined_details[:12])
+                    if failed > 0:
+                        QMessageBox.warning(self, title, "\n".join(lines))
+                    elif skipped > 0:
+                        QMessageBox.information(self, title, "\n".join(lines))
+                    else:
+                        self._show_success_popup(title, "\n".join(lines))
+                    return
+                QTimer.singleShot(0, _start_apply_phase)
+
+            if not manual_jobs:
+                _finish_manual_phase(False, False)
+                return
+
+            if parallel_single_mode:
+                cancel_all_requested = False
+                for job in manual_jobs:
+                    entry = job.get("entry")
+                    if not isinstance(entry, InventoryItem):
+                        manual_skipped += 1
+                        continue
+                    dialog = SgdbTargetPickerDialog(
+                        folder_name=entry.cleaned_name or entry.full_name,
+                        folder_path=entry.full_path,
+                        candidates=list(job.get("candidates") or []),
+                        drift_reasons=list(job.get("drift_reasons") or []),
+                        icon_path=str(entry.folder_icon_path or ""),
+                        manual_store_options=self._manual_store_options_for_entry(entry),
+                        owned_store_targets=self._owned_store_targets_for_entry(entry),
+                        manual_id_resolver=self._resolve_manual_target_id,
+                        parent=self,
+                    )
+                    if dialog.exec() != QDialog.DialogCode.Accepted:
+                        if getattr(dialog, "cancel_all_requested", False):
+                            cancel_all_requested = True
+                            break
+                        manual_skipped += 1
+                        combined_details.append(f"{entry.full_name}: skipped by user")
+                        continue
+                    candidate = dialog.selected_candidate()
+                    if candidate is None:
+                        manual_skipped += 1
+                        combined_details.append(f"{entry.full_name}: skipped (no game selected)")
+                        continue
+                    selected_jobs.append({"entry": entry, "candidate": candidate, "reason": "manual"})
+                _finish_manual_phase(cancel_all_requested, False)
+                return
+
+            def _on_manual_result(
+                job: dict[str, object],
+                candidate: SgdbGameCandidate | None,
+                cancel_all_requested: bool,
+                accepted: bool,
+            ) -> None:
+                nonlocal manual_skipped
+                entry = job.get("entry")
+                if not isinstance(entry, InventoryItem):
+                    manual_skipped += 1
+                    return
+                if cancel_all_requested:
+                    return
+                if candidate is None:
+                    manual_skipped += 1
+                    if accepted:
+                        combined_details.append(f"{entry.full_name}: skipped (no game selected)")
+                    else:
+                        combined_details.append(f"{entry.full_name}: skipped by user")
+                    return
+                selected_jobs.append({"entry": entry, "candidate": candidate, "reason": "manual"})
+
+            for job in manual_jobs:
+                entry = job.get("entry")
+                if not isinstance(entry, InventoryItem):
+                    continue
+                reasons = [str(job.get("reason") or "").strip()]
+                reasons.extend(
+                    [
+                        str(value).strip()
+                        for value in list(job.get("drift_reasons") or [])
+                        if str(value).strip()
+                    ]
+                )
+                job["drift_reasons"] = [value for value in reasons if value]
+
+            self._start_modeless_sgdb_picker_flow(
+                flow_title=title,
+                jobs=manual_jobs,
+                on_job_result=_on_manual_result,
+                on_complete=_finish_manual_phase,
+            )
+
+        self._start_report_operation(title, _resolve_run, _resolve_done)
+
+    def _on_recheck_ids_and_stores_selected(self) -> None:
+        self._start_recheck_ids_and_stores_flow(all_visible=False)
+
+    def _on_recheck_ids_and_stores_all_visible(self) -> None:
+        self._start_recheck_ids_and_stores_flow(all_visible=True)
+
+    def _current_identity_for_entry(self, entry: InventoryItem) -> tuple[int, str]:
+        binding = self.state.get_sgdb_binding(entry.full_path)
+        game_id = int(binding.game_id) if binding is not None else 0
+        steam_appid = str(self.state.read_assigned_steam_appid(entry.full_path) or "").strip()
+        return game_id, steam_appid
+
+    def _start_recheck_ids_and_stores_flow(self, *, all_visible: bool) -> None:
+        title = "Recheck IDs and Stores"
+        if not self._ensure_sgdb_configured(title):
+            return
+        if all_visible:
+            targets = [entry for entry in self._visible_right_items if entry.is_dir]
+            scope_label = "all visible"
+        else:
+            targets = [entry for entry in self._selected_right_entries() if entry.is_dir]
+            scope_label = "selected"
+        if not targets:
+            QMessageBox.information(
+                self,
+                title,
+                "No game folders found in the chosen scope.",
+            )
+            return
+        single_target = len(targets) == 1
+        active_flow_exists = self._active_sgdb_picker_flow_state() is not None
+        parallel_single_mode = active_flow_exists and single_target
+        if active_flow_exists and (not parallel_single_mode):
+            if not self._confirm_interrupt_active_sgdb_picker_flow(title):
+                return
+        decision = QMessageBox.question(
+            self,
+            title,
+            "\n".join(
+                [
+                    f"Scope: {scope_label}",
+                    f"Games: {len(targets)}",
+                    "",
+                    "Rules:",
+                    "- Re-evaluate IDs from scratch (ignores assigned ID hints).",
+                    "- If IDs differ, picker opens unless new result is exact normalized name + confidence 1.00.",
+                    "",
+                    "Proceed?",
+                ]
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+
+        auto_jobs: list[dict[str, object]] = []
+        manual_jobs: list[dict[str, object]] = []
+
+        def _resolve_run(progress_cb, should_cancel):
+            report = OperationReport(total=len(targets))
+            total = len(targets)
+            progress_cb("Recheck IDs", 0, max(1, total))
+            for idx, entry in enumerate(targets, start=1):
+                if should_cancel():
+                    raise OperationCancelled("Recheck IDs and stores canceled.")
+                progress_cb("Recheck IDs", idx - 1, max(1, total))
+                current_game_id, current_steam = self._current_identity_for_entry(entry)
+                try:
+                    resolution = self.state.resolve_sgdb_target(
+                        entry.full_path,
+                        entry.cleaned_name or entry.full_name,
+                        entry.full_name,
+                        include_assigned_hints=False,
+                    )
+                except Exception as exc:
+                    report.failed += 1
+                    report.details.append(
+                        f"{entry.full_name}: target recheck failed ({exc})"
+                    )
+                    progress_cb("Recheck IDs", idx, max(1, total))
+                    continue
+                exact_auto = self._unique_exact_normalized_full_confidence_candidate(
+                    entry,
+                    resolution.candidates,
+                )
+                top = exact_auto or (resolution.candidates[0] if resolution.candidates else None)
+                if top is None:
+                    if current_game_id > 0 or current_steam:
+                        manual_jobs.append(
+                            {
+                                "entry": entry,
+                                "candidates": [],
+                                "drift_reasons": ["No candidate found from scratch; manual review required."],
+                                "reason": "no candidate",
+                            }
+                        )
+                    else:
+                        report.skipped += 1
+                        report.details.append(f"{entry.full_name}: unchanged (no current IDs, no candidate)")
+                    progress_cb("Recheck IDs", idx, max(1, total))
+                    continue
+                try:
+                    proposed_candidate, proposed_steam = self._resolve_candidate_with_steam_appid(
+                        self.state,
+                        top,
+                    )
+                except Exception:
+                    proposed_candidate = top
+                    proposed_steam = str(top.steam_appid or "").strip()
+                proposed_game_id = int(getattr(proposed_candidate, "game_id", 0) or 0)
+                differs = (proposed_game_id != current_game_id) or (proposed_steam != current_steam)
+                if not differs:
+                    report.skipped += 1
+                    report.details.append(f"{entry.full_name}: unchanged")
+                    progress_cb("Recheck IDs", idx, max(1, total))
+                    continue
+                exact_confident = exact_auto is not None
+                if exact_confident:
+                    auto_jobs.append(
+                        {
+                            "entry": entry,
+                            "candidate": proposed_candidate,
+                            "reason": "exact normalized 1.00",
+                        }
+                    )
+                else:
+                    manual_jobs.append(
+                        {
+                            "entry": entry,
+                            "candidates": resolution.candidates,
+                            "drift_reasons": resolution.drift_reasons,
+                            "reason": (
+                                f"IDs changed (current SGDB={current_game_id or '-'}, Steam={current_steam or '-'}; "
+                                f"new SGDB={proposed_game_id or '-'}, Steam={proposed_steam or '-'})"
+                            ),
+                        }
+                    )
+                progress_cb("Recheck IDs", idx, max(1, total))
+            progress_cb("Recheck IDs", max(1, total), max(1, total))
+            return report
+
+        def _resolve_done(resolve_report: OperationReport):
+            selected_jobs: list[dict[str, object]] = list(auto_jobs)
+            manual_skipped = 0
+            combined_details: list[str] = list(resolve_report.details)
+
+            def _start_apply_phase() -> None:
+                def _apply_run(progress_cb, should_cancel):
+                    report = OperationReport(total=len(selected_jobs))
+                    total = len(selected_jobs)
+                    progress_cb("Apply rechecked IDs", 0, max(1, total))
+                    for idx, job in enumerate(selected_jobs, start=1):
+                        if should_cancel():
+                            raise OperationCancelled("Recheck IDs and stores canceled.")
+                        progress_cb("Apply rechecked IDs", idx - 1, max(1, total))
+                        entry = job.get("entry")
+                        candidate = job.get("candidate")
+                        if not isinstance(entry, InventoryItem) or not isinstance(candidate, SgdbGameCandidate):
+                            report.failed += 1
+                            report.details.append("Skipped invalid recheck payload.")
+                            progress_cb("Apply rechecked IDs", idx, max(1, total))
+                            continue
+                        try:
+                            selected_candidate, steam_appid = self._resolve_candidate_with_steam_appid(
+                                self.state,
+                                candidate,
+                            )
+                        except Exception as exc:
+                            report.failed += 1
+                            report.details.append(f"{entry.full_name}: lookup failed ({exc})")
+                            progress_cb("Apply rechecked IDs", idx, max(1, total))
+                            continue
+                        changed, applied = self._apply_candidate_identity(
+                            entry=entry,
+                            selected_candidate=selected_candidate,
+                            steam_appid=steam_appid,
+                        )
+                        if not applied:
+                            report.skipped += 1
+                            report.details.append(f"{entry.full_name}: no resolvable IDs from selection.")
+                            progress_cb("Apply rechecked IDs", idx, max(1, total))
+                            continue
+                        report.succeeded += 1
+                        if changed:
+                            report.details.append(f"{entry.full_name}: IDs updated ({', '.join(applied)})")
+                        else:
+                            report.details.append(f"{entry.full_name}: IDs unchanged ({', '.join(applied)})")
+                        progress_cb("Apply rechecked IDs", idx, max(1, total))
+                    linked = self.state.rebuild_store_links_from_inventory(list(self.inventory))
+                    report.details.append(f"Ownership links rebuilt: {linked}")
+                    progress_cb("Apply rechecked IDs", max(1, total), max(1, total))
+                    return report
+
+                def _apply_done(apply_report: OperationReport):
+                    succeeded = int(apply_report.succeeded)
+                    failed = int(resolve_report.failed) + int(apply_report.failed)
+                    skipped = int(resolve_report.skipped) + int(manual_skipped) + int(apply_report.skipped)
+                    final_details = combined_details + list(apply_report.details)
+                    lines = [
+                        f"Succeeded: {succeeded}",
+                        f"Skipped: {skipped}",
+                        f"Failed: {failed}",
+                    ]
+                    if final_details:
+                        lines.append("")
+                        lines.extend(final_details[:12])
+                    if not (single_target and succeeded > 0 and failed == 0 and skipped == 0):
+                        if failed > 0:
+                            QMessageBox.warning(self, title, "\n".join(lines))
+                        elif skipped > 0:
+                            QMessageBox.information(self, title, "\n".join(lines))
+                        else:
+                            self._show_success_popup(title, "\n".join(lines))
+                    QTimer.singleShot(0, self.refresh_all)
+
+                started = self._start_report_operation(
+                    title,
+                    _apply_run,
+                    _apply_done,
+                )
+                if not started:
+                    QTimer.singleShot(50, _start_apply_phase)
+
+            def _finish_manual_phase(canceled: bool, interrupted: bool) -> None:
+                if canceled:
+                    if not interrupted:
+                        QMessageBox.information(self, title, "Operation canceled for remaining items.")
+                    return
+                if not selected_jobs:
+                    failed = int(resolve_report.failed)
+                    skipped = int(resolve_report.skipped) + int(manual_skipped)
+                    lines = [
+                        "Succeeded: 0",
+                        f"Skipped: {skipped}",
+                        f"Failed: {failed}",
+                    ]
+                    if combined_details:
+                        lines.append("")
+                        lines.extend(combined_details[:12])
+                    if not (single_target and failed == 0 and skipped == 0):
+                        if failed > 0:
+                            QMessageBox.warning(self, title, "\n".join(lines))
+                        elif skipped > 0:
+                            QMessageBox.information(self, title, "\n".join(lines))
+                        else:
+                            self._show_success_popup(title, "\n".join(lines))
+                    return
+                QTimer.singleShot(0, _start_apply_phase)
+
+            if not manual_jobs:
+                _finish_manual_phase(False, False)
+                return
+
+            if parallel_single_mode:
+                cancel_all_requested = False
+                for job in manual_jobs:
+                    entry = job.get("entry")
+                    if not isinstance(entry, InventoryItem):
+                        manual_skipped += 1
+                        continue
+                    dialog = SgdbTargetPickerDialog(
+                        folder_name=entry.cleaned_name or entry.full_name,
+                        folder_path=entry.full_path,
+                        candidates=list(job.get("candidates") or []),
+                        drift_reasons=list(job.get("drift_reasons") or []),
+                        icon_path=str(entry.folder_icon_path or ""),
+                        manual_store_options=self._manual_store_options_for_entry(entry),
+                        owned_store_targets=self._owned_store_targets_for_entry(entry),
+                        manual_id_resolver=self._resolve_manual_target_id,
+                        parent=self,
+                    )
+                    if dialog.exec() != QDialog.DialogCode.Accepted:
+                        if getattr(dialog, "cancel_all_requested", False):
+                            cancel_all_requested = True
+                            break
+                        manual_skipped += 1
+                        combined_details.append(f"{entry.full_name}: skipped by user")
+                        continue
+                    candidate = dialog.selected_candidate()
+                    if candidate is None:
+                        manual_skipped += 1
+                        combined_details.append(f"{entry.full_name}: skipped (no game selected)")
+                        continue
+                    selected_jobs.append({"entry": entry, "candidate": candidate, "reason": "manual"})
+                _finish_manual_phase(cancel_all_requested, False)
+                return
+
+            def _on_manual_result(
+                job: dict[str, object],
+                candidate: SgdbGameCandidate | None,
+                cancel_all_requested: bool,
+                accepted: bool,
+            ) -> None:
+                nonlocal manual_skipped
+                entry = job.get("entry")
+                if not isinstance(entry, InventoryItem):
+                    manual_skipped += 1
+                    return
+                if cancel_all_requested:
+                    return
+                if candidate is None:
+                    manual_skipped += 1
+                    if accepted:
+                        combined_details.append(f"{entry.full_name}: skipped (no game selected)")
+                    else:
+                        combined_details.append(f"{entry.full_name}: skipped by user")
+                    return
+                selected_jobs.append({"entry": entry, "candidate": candidate, "reason": "manual"})
+
+            for job in manual_jobs:
+                entry = job.get("entry")
+                if not isinstance(entry, InventoryItem):
+                    continue
+                reasons = [str(job.get("reason") or "").strip()]
+                reasons.extend(
+                    [
+                        str(value).strip()
+                        for value in list(job.get("drift_reasons") or [])
+                        if str(value).strip()
+                    ]
+                )
+                job["drift_reasons"] = [value for value in reasons if value]
+
+            self._start_modeless_sgdb_picker_flow(
+                flow_title=title,
+                jobs=manual_jobs,
+                on_job_result=_on_manual_result,
+                on_complete=_finish_manual_phase,
+            )
+
+        self._start_report_operation(title, _resolve_run, _resolve_done)
+
     def _resolve_upload_target_for_entry(
         self,
         entry: InventoryItem,
         icon_path: str,
     ) -> SgdbGameCandidate | None:
-        resolution = self.state.resolve_sgdb_target(
-            entry.full_path,
-            entry.cleaned_name or entry.full_name,
-            entry.full_name,
+        try:
+            resolution = self._run_ui_pumped_call(
+                "Resolve SGDB target",
+                lambda: self.state.resolve_sgdb_target(
+                    entry.full_path,
+                    entry.cleaned_name or entry.full_name,
+                    entry.full_name,
+                ),
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Upload Icon to SteamGridDB",
+                f"Could not resolve SGDB target:\n{exc}",
+            )
+            return None
+        auto = self._unique_exact_normalized_full_confidence_candidate(
+            entry,
+            resolution.candidates,
         )
-        auto = self._unique_full_confidence_candidate(resolution.candidates)
         if auto is not None:
             return auto
 
         dialog = SgdbTargetPickerDialog(
             folder_name=entry.cleaned_name or entry.full_name,
+            folder_path=entry.full_path,
             candidates=resolution.candidates,
             drift_reasons=resolution.drift_reasons,
             icon_path=icon_path,
+            manual_store_options=self._manual_store_options_for_entry(entry),
+            owned_store_targets=self._owned_store_targets_for_entry(entry),
+            manual_id_resolver=self._resolve_manual_target_id,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -626,7 +1715,7 @@ class MainWindowIconOpsMixin:
             if report.failed > 0:
                 QMessageBox.warning(self, title, "\n".join(report.details[:12]))
                 return
-            QMessageBox.information(self, title, "\n".join(report.details[:12]))
+            self._show_success_popup(title, "\n".join(report.details[:12]))
 
         self._start_report_operation("SteamGridDB Status", _run, _done)
 
@@ -698,7 +1787,10 @@ class MainWindowIconOpsMixin:
                     self._refresh_visible_entry_tooltip(entry.full_path)
                 if report.succeeded > 0 and report.failed == 0 and report.skipped == 0:
                     return
-                QMessageBox.information(self, title, "\n".join(lines))
+                if int(report.failed) > 0:
+                    QMessageBox.warning(self, title, "\n".join(lines))
+                else:
+                    QMessageBox.information(self, title, "\n".join(lines))
 
             self._start_report_operation(title, _run, _done)
 
@@ -721,6 +1813,12 @@ class MainWindowIconOpsMixin:
                 "No folders with valid local icons were found.",
             )
             return
+        single_target = len(targets) == 1
+        active_flow_exists = self._active_sgdb_picker_flow_state() is not None
+        parallel_single_mode = active_flow_exists and single_target
+        if active_flow_exists and (not parallel_single_mode):
+            if not self._confirm_interrupt_active_sgdb_picker_flow(title):
+                return
         decision = QMessageBox.question(
             self,
             title,
@@ -779,7 +1877,10 @@ class MainWindowIconOpsMixin:
                         f"{entry.full_name}: target resolution failed ({exc})"
                     )
                     continue
-                auto = self._unique_full_confidence_candidate(resolution.candidates)
+                auto = self._unique_exact_normalized_full_confidence_candidate(
+                    entry,
+                    resolution.candidates,
+                )
                 if auto is not None:
                     auto_jobs.append(
                         {
@@ -808,44 +1909,204 @@ class MainWindowIconOpsMixin:
             selected_jobs = list(auto_jobs)
             manual_skipped = 0
             combined_details: list[str] = list(resolve_report.details)
-            for job in manual_jobs:
-                dialog = SgdbTargetPickerDialog(
-                    folder_name=str(job.get("folder_name") or ""),
-                    candidates=list(job.get("candidates") or []),
-                    drift_reasons=list(job.get("drift_reasons") or []),
-                    icon_path=str(job.get("icon_path") or ""),
-                    parent=self,
+
+            def _start_upload_phase() -> None:
+                def _upload_run(progress_cb, should_cancel):
+                    report = OperationReport(total=len(selected_jobs))
+                    total = len(selected_jobs)
+                    progress_cb("Upload missing SGDB icons", 0, max(1, total))
+                    for idx, job in enumerate(selected_jobs, start=1):
+                        if should_cancel():
+                            raise OperationCancelled("Bulk SGDB upload canceled.")
+                        progress_cb("Upload missing SGDB icons", idx - 1, max(1, total))
+                        game = job.get("game")
+                        if not isinstance(game, SgdbGameCandidate):
+                            report.failed += 1
+                            report.details.append(f"{job.get('name')}: upload skipped (invalid target)")
+                            progress_cb("Upload missing SGDB icons", idx, max(1, total))
+                            continue
+                        result = self.state.upload_folder_icon_to_sgdb(
+                            folder_path=str(job.get("folder_path") or ""),
+                            icon_path=str(job.get("icon_path") or ""),
+                            game=game,
+                        )
+                        report.succeeded += int(result.succeeded)
+                        report.skipped += int(result.skipped)
+                        report.failed += int(result.failed)
+                        if result.details:
+                            report.details.append(f"{job.get('name')}: {result.details[0]}")
+                        progress_cb("Upload missing SGDB icons", idx, max(1, total))
+                    progress_cb("Upload missing SGDB icons", max(1, total), max(1, total))
+                    return report
+
+                def _upload_done(upload_report: OperationReport):
+                    for entry in self._visible_right_items:
+                        if os.path.normpath(entry.full_path) in target_paths:
+                            self._refresh_visible_entry_tooltip(entry.full_path)
+                    succeeded = int(upload_report.succeeded)
+                    failed = int(resolve_report.failed) + int(upload_report.failed)
+                    skipped = int(resolve_report.skipped) + int(manual_skipped) + int(upload_report.skipped)
+                    final_details = combined_details + list(upload_report.details)
+                    if succeeded > 0 and failed == 0 and skipped == 0:
+                        return
+                    lines = [
+                        f"Succeeded: {succeeded}",
+                        f"Skipped: {skipped}",
+                        f"Failed: {failed}",
+                    ]
+                    if final_details:
+                        lines.append("")
+                        lines.extend(final_details[:12])
+                    if failed > 0:
+                        QMessageBox.warning(self, title, "\n".join(lines))
+                    elif skipped > 0:
+                        QMessageBox.information(self, title, "\n".join(lines))
+                    else:
+                        self._show_success_popup(title, "\n".join(lines))
+
+                started = self._start_report_operation(
+                    title,
+                    _upload_run,
+                    _upload_done,
                 )
-                if dialog.exec() != QDialog.DialogCode.Accepted:
-                    manual_skipped += 1
-                    combined_details.append(f"{job.get('name')}: skipped by user")
-                    continue
-                candidate = dialog.selected_candidate()
+                if not started:
+                    QTimer.singleShot(50, _start_upload_phase)
+
+            def _finish_manual_phase(canceled: bool, interrupted: bool) -> None:
+                if canceled:
+                    if not interrupted:
+                        QMessageBox.information(self, title, "Operation canceled for remaining items.")
+                    return
+                if not selected_jobs:
+                    succeeded = 0
+                    failed = int(resolve_report.failed)
+                    skipped = int(resolve_report.skipped) + int(manual_skipped)
+                    if succeeded > 0 and failed == 0 and skipped == 0:
+                        return
+                    lines = [
+                        f"Succeeded: {succeeded}",
+                        f"Skipped: {skipped}",
+                        f"Failed: {failed}",
+                    ]
+                    if combined_details:
+                        lines.append("")
+                        lines.extend(combined_details[:12])
+                    if failed > 0:
+                        QMessageBox.warning(self, title, "\n".join(lines))
+                    elif skipped > 0:
+                        QMessageBox.information(self, title, "\n".join(lines))
+                    else:
+                        self._show_success_popup(title, "\n".join(lines))
+                    return
+                QTimer.singleShot(0, _start_upload_phase)
+
+            if not manual_jobs:
+                _finish_manual_phase(False, False)
+                return
+
+            if parallel_single_mode:
+                cancel_all_requested = False
+                for job in manual_jobs:
+                    dialog = SgdbTargetPickerDialog(
+                        folder_name=str(job.get("folder_name") or ""),
+                        folder_path=str(job.get("folder_path") or ""),
+                        candidates=list(job.get("candidates") or []),
+                        drift_reasons=list(job.get("drift_reasons") or []),
+                        icon_path=str(job.get("icon_path") or ""),
+                        manual_store_options=list(job.get("manual_store_options") or []),
+                        owned_store_targets=list(job.get("owned_store_targets") or []),
+                        manual_id_resolver=self._resolve_manual_target_id,
+                        parent=self,
+                    )
+                    if dialog.exec() != QDialog.DialogCode.Accepted:
+                        if getattr(dialog, "cancel_all_requested", False):
+                            cancel_all_requested = True
+                            break
+                        manual_skipped += 1
+                        combined_details.append(f"{job.get('name')}: skipped by user")
+                        continue
+                    candidate = dialog.selected_candidate()
+                    if candidate is None:
+                        manual_skipped += 1
+                        combined_details.append(f"{job.get('name')}: skipped (no game selected)")
+                        continue
+                    name = str(job.get("name") or job.get("folder_name") or "Game")
+                    try:
+                        present, confidence, matched_icon_id = self._run_ui_pumped_call(
+                            "Check SGDB duplicate",
+                            lambda: self.state.is_icon_present_on_sgdb_for_game(
+                                icon_path=str(job.get("icon_path") or ""),
+                                game_id=int(candidate.game_id),
+                                threshold=0.95,
+                            ),
+                        )
+                    except Exception as exc:
+                        manual_skipped += 1
+                        combined_details.append(f"{name}: skipped (presence check failed: {exc})")
+                        continue
+                    if present:
+                        manual_skipped += 1
+                        if matched_icon_id is not None:
+                            combined_details.append(
+                                f"{name}: skipped (already on SGDB, icon ID {int(matched_icon_id)}, conf {confidence:.2f})"
+                            )
+                        else:
+                            combined_details.append(
+                                f"{name}: skipped (already on SGDB, conf {confidence:.2f})"
+                            )
+                        continue
+                    selected_jobs.append(
+                        {
+                            "name": str(job.get("name") or ""),
+                            "folder_path": str(job.get("folder_path") or ""),
+                            "icon_path": str(job.get("icon_path") or ""),
+                            "game": candidate,
+                        }
+                    )
+                _finish_manual_phase(cancel_all_requested, False)
+                return
+
+            def _on_manual_result(
+                job: dict[str, object],
+                candidate: SgdbGameCandidate | None,
+                cancel_all_requested: bool,
+                accepted: bool,
+            ) -> None:
+                nonlocal manual_skipped
+                name = str(job.get("name") or job.get("folder_name") or "Game")
+                if cancel_all_requested:
+                    return
                 if candidate is None:
                     manual_skipped += 1
-                    combined_details.append(f"{job.get('name')}: skipped (no game selected)")
-                    continue
+                    if accepted:
+                        combined_details.append(f"{name}: skipped (no game selected)")
+                    else:
+                        combined_details.append(f"{name}: skipped by user")
+                    return
                 try:
-                    present, confidence, matched_icon_id = self.state.is_icon_present_on_sgdb_for_game(
-                        icon_path=str(job.get("icon_path") or ""),
-                        game_id=int(candidate.game_id),
-                        threshold=0.95,
+                    present, confidence, matched_icon_id = self._run_ui_pumped_call(
+                        "Check SGDB duplicate",
+                        lambda: self.state.is_icon_present_on_sgdb_for_game(
+                            icon_path=str(job.get("icon_path") or ""),
+                            game_id=int(candidate.game_id),
+                            threshold=0.95,
+                        ),
                     )
                 except Exception as exc:
                     manual_skipped += 1
-                    combined_details.append(f"{job.get('name')}: skipped (presence check failed: {exc})")
-                    continue
+                    combined_details.append(f"{name}: skipped (presence check failed: {exc})")
+                    return
                 if present:
                     manual_skipped += 1
                     if matched_icon_id is not None:
                         combined_details.append(
-                            f"{job.get('name')}: skipped (already on SGDB, icon ID {int(matched_icon_id)}, conf {confidence:.2f})"
+                            f"{name}: skipped (already on SGDB, icon ID {int(matched_icon_id)}, conf {confidence:.2f})"
                         )
                     else:
                         combined_details.append(
-                            f"{job.get('name')}: skipped (already on SGDB, conf {confidence:.2f})"
+                            f"{name}: skipped (already on SGDB, conf {confidence:.2f})"
                         )
-                    continue
+                    return
                 selected_jobs.append(
                     {
                         "name": str(job.get("name") or ""),
@@ -855,81 +2116,25 @@ class MainWindowIconOpsMixin:
                     }
                 )
 
-            if not selected_jobs:
-                succeeded = 0
-                failed = int(resolve_report.failed)
-                skipped = int(resolve_report.skipped) + int(manual_skipped)
-                if succeeded > 0 and failed == 0 and skipped == 0:
-                    return
-                lines = [
-                    f"Succeeded: {succeeded}",
-                    f"Skipped: {skipped}",
-                    f"Failed: {failed}",
-                ]
-                if combined_details:
-                    lines.append("")
-                    lines.extend(combined_details[:12])
-                QMessageBox.information(self, title, "\n".join(lines))
-                return
-
-            def _upload_run(progress_cb, should_cancel):
-                report = OperationReport(total=len(selected_jobs))
-                total = len(selected_jobs)
-                progress_cb("Upload missing SGDB icons", 0, max(1, total))
-                for idx, job in enumerate(selected_jobs, start=1):
-                    if should_cancel():
-                        raise OperationCancelled("Bulk SGDB upload canceled.")
-                    progress_cb("Upload missing SGDB icons", idx - 1, max(1, total))
-                    game = job.get("game")
-                    if not isinstance(game, SgdbGameCandidate):
-                        report.failed += 1
-                        report.details.append(f"{job.get('name')}: upload skipped (invalid target)")
-                        progress_cb("Upload missing SGDB icons", idx, max(1, total))
-                        continue
-                    result = self.state.upload_folder_icon_to_sgdb(
-                        folder_path=str(job.get("folder_path") or ""),
-                        icon_path=str(job.get("icon_path") or ""),
-                        game=game,
-                    )
-                    report.succeeded += int(result.succeeded)
-                    report.skipped += int(result.skipped)
-                    report.failed += int(result.failed)
-                    if result.details:
-                        report.details.append(f"{job.get('name')}: {result.details[0]}")
-                    progress_cb("Upload missing SGDB icons", idx, max(1, total))
-                progress_cb("Upload missing SGDB icons", max(1, total), max(1, total))
-                return report
-
-            def _upload_done(upload_report: OperationReport):
-                for entry in self._visible_right_items:
-                    if os.path.normpath(entry.full_path) in target_paths:
-                        self._refresh_visible_entry_tooltip(entry.full_path)
-                succeeded = int(upload_report.succeeded)
-                failed = int(resolve_report.failed) + int(upload_report.failed)
-                skipped = int(resolve_report.skipped) + int(manual_skipped) + int(upload_report.skipped)
-                final_details = combined_details + list(upload_report.details)
-                if succeeded > 0 and failed == 0 and skipped == 0:
-                    return
-                lines = [
-                    f"Succeeded: {succeeded}",
-                    f"Skipped: {skipped}",
-                    f"Failed: {failed}",
-                ]
-                if final_details:
-                    lines.append("")
-                    lines.extend(final_details[:12])
-                QMessageBox.information(self, title, "\n".join(lines))
-
-            def _start_upload_phase():
-                started = self._start_report_operation(
-                    title,
-                    _upload_run,
-                    _upload_done,
+            for job in manual_jobs:
+                folder_path = str(job.get("folder_path") or "")
+                folder_name = str(job.get("folder_name") or "")
+                store_targets = self.state.store_targets_for_inventory(
+                    folder_path,
+                    game_title=folder_name,
                 )
-                if not started:
-                    QTimer.singleShot(50, _start_upload_phase)
+                job["manual_store_options"] = sort_stores(
+                    ["Steam"]
+                    + [str(row.get("store_name") or "").strip() for row in store_targets]
+                )
+                job["owned_store_targets"] = store_targets
 
-            QTimer.singleShot(0, _start_upload_phase)
+            self._start_modeless_sgdb_picker_flow(
+                flow_title=title,
+                jobs=manual_jobs,
+                on_job_result=_on_manual_result,
+                on_complete=_finish_manual_phase,
+            )
 
         self._start_report_operation(title, _resolve_run, _resolve_done)
 
@@ -1064,6 +2269,36 @@ class MainWindowIconOpsMixin:
         self.state.set_ui_pref("icon_bg_removal_engine", normalized)
         self._request_gpu_status_update()
 
+    def _load_background_fill_mode_pref(self) -> str:
+        return normalize_background_fill_mode(
+            self.state.get_ui_pref("icon_background_fill_mode", "black")
+        )
+
+    def _save_background_fill_mode_pref(self, value: str) -> None:
+        self.state.set_ui_pref(
+            "icon_background_fill_mode",
+            normalize_background_fill_mode(value),
+        )
+
+    def _load_background_fill_params_pref(self) -> dict[str, int]:
+        raw = self.state.get_ui_pref("icon_background_fill_params", "").strip()
+        if not raw:
+            return normalize_background_fill_params(None)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return normalize_background_fill_params(None)
+        if not isinstance(parsed, dict):
+            return normalize_background_fill_params(None)
+        return normalize_background_fill_params(parsed)
+
+    def _save_background_fill_params_pref(self, payload: dict[str, object]) -> None:
+        normalized = normalize_background_fill_params(payload)
+        self.state.set_ui_pref(
+            "icon_background_fill_params",
+            json.dumps(normalized, ensure_ascii=False, sort_keys=True),
+        )
+
     def _load_web_capture_download_dir_pref(self) -> str:
         return self.state.get_ui_pref("web_capture_download_dir", "").strip()
 
@@ -1162,10 +2397,17 @@ class MainWindowIconOpsMixin:
                     self.state.get_ui_pref("icon_bg_removal_engine", "none")
                 )
                 border_shader_pref = self._load_border_shader_pref()
+                background_fill_mode_pref = self._load_background_fill_mode_pref()
+                background_fill_params_pref = self._load_background_fill_params_pref()
 
                 try:
-                    candidates = self.state.search_icon_candidates(
-                        query_name, query_name, sgdb_resources=requested_resources
+                    candidates = self._run_ui_pumped_call(
+                        f"Search icon candidates ({idx}/{selected_count})",
+                        lambda q=query_name, r=requested_resources: self.state.search_icon_candidates(
+                            q,
+                            q,
+                            sgdb_resources=r,
+                        ),
                     )
                 except Exception as exc:
                     candidates = []
@@ -1192,6 +2434,9 @@ class MainWindowIconOpsMixin:
                     icon_style_saver=self._save_icon_style_pref,
                     initial_bg_removal_engine=bg_engine_pref,
                     bg_removal_engine_saver=self._save_bg_engine_pref,
+                    initial_background_fill_mode=background_fill_mode_pref,
+                    background_fill_mode_saver=self._save_background_fill_mode_pref,
+                    initial_background_fill_params=background_fill_params_pref,
                     initial_border_shader=border_shader_pref,
                     border_shader_saver=self._save_border_shader_pref,
                     initial_web_download_dir=self._load_web_capture_download_dir_pref(),
@@ -1209,6 +2454,7 @@ class MainWindowIconOpsMixin:
                         break
                     continue
                 payload = dialog.result_payload()
+                self._save_background_fill_params_pref(payload.background_fill_params)
                 image_bytes: bytes
                 selected_candidate = payload.candidate
                 candidate_provider = (
@@ -1235,12 +2481,23 @@ class MainWindowIconOpsMixin:
                 bg_removal_params: dict[str, object] = {}
                 text_preserve_config: dict[str, object] = {"enabled": False, "method": "none"}
                 border_shader: dict[str, object] = {"enabled": False}
+                background_fill_mode = "black"
+                background_fill_params: dict[str, object] = {}
                 if payload.prepared_is_final_composite:
                     icon_style = "none"
                     bg_removal_engine = "none"
                     bg_removal_params = {}
                     text_preserve_config = {"enabled": False, "method": "none"}
                     border_shader = {"enabled": False}
+                    background_fill_mode = "black"
+                    background_fill_params = {}
+                else:
+                    background_fill_mode = normalize_background_fill_mode(
+                        payload.background_fill_mode
+                    )
+                    background_fill_params = normalize_background_fill_params(
+                        payload.background_fill_params
+                    )
                 text_method_pref = str(text_preserve_config.get("method", "none") or "none")
                 self.state.set_ui_pref("icon_text_extraction_method", text_method_pref)
                 if payload.prepared_image_bytes is not None:
@@ -1265,8 +2522,11 @@ class MainWindowIconOpsMixin:
                 info_tip_value = (payload.info_tip or "").strip()
                 if not info_tip_value:
                     try:
-                        auto_tip = self.state.get_or_fetch_game_infotip(
-                            entry.cleaned_name or entry.full_name
+                        auto_tip = self._run_ui_pumped_call(
+                            f"Fetch InfoTip ({idx}/{selected_count})",
+                            lambda: self.state.get_or_fetch_game_infotip(
+                                entry.cleaned_name or entry.full_name
+                            ),
                         )
                     except Exception:
                         auto_tip = None
@@ -1274,17 +2534,22 @@ class MainWindowIconOpsMixin:
                         info_tip_value = auto_tip
 
                 try:
-                    result = self.state.apply_folder_icon(
-                        folder_path=entry.full_path,
-                        source_image=image_bytes,
-                        icon_name_hint=entry.cleaned_name or entry.full_name,
-                        info_tip=info_tip_value,
-                        icon_style=icon_style,
-                        bg_removal_engine=bg_removal_engine,
-                        bg_removal_params=bg_removal_params,
-                        text_preserve_config=text_preserve_config,
-                        border_shader=border_shader,
-                        size_improvements=creation_size_improvements,
+                    result = self._run_ui_pumped_call(
+                        f"Apply icon ({idx}/{selected_count})",
+                        lambda: self.state.apply_folder_icon(
+                            folder_path=entry.full_path,
+                            source_image=image_bytes,
+                            icon_name_hint=entry.cleaned_name or entry.full_name,
+                            info_tip=info_tip_value,
+                            icon_style=icon_style,
+                            bg_removal_engine=bg_removal_engine,
+                            bg_removal_params=bg_removal_params,
+                            text_preserve_config=text_preserve_config,
+                            border_shader=border_shader,
+                            background_fill_mode=background_fill_mode,
+                            background_fill_params=background_fill_params,
+                            size_improvements=creation_size_improvements,
+                        ),
                     )
                 except Exception as exc:
                     failed.append(f"{entry.full_name}: apply failed ({exc})")
@@ -1391,7 +2656,14 @@ class MainWindowIconOpsMixin:
             lines.append(f"Failed: {len(failed)}")
             lines.append("")
             lines.extend(failed[:8])
-        QMessageBox.information(self, "Assign Folder Icon", "\n".join(lines))
+        if failed:
+            QMessageBox.warning(self, "Assign Folder Icon", "\n".join(lines))
+            return
+        only_success = applied > 0 and replaced == 0 and skipped == 0 and cancelled == 0 and not cancel_all_requested
+        if only_success:
+            self._show_success_popup("Assign Folder Icon", "\n".join(lines))
+        else:
+            QMessageBox.information(self, "Assign Folder Icon", "\n".join(lines))
 
     def _on_open_icon_converter(self) -> None:
         if self._icon_converter_dialog is not None:
@@ -1407,11 +2679,16 @@ class MainWindowIconOpsMixin:
             self.state.get_ui_pref("icon_bg_removal_engine", "none")
         )
         border_shader_pref = self._load_border_shader_pref()
+        background_fill_mode_pref = self._load_background_fill_mode_pref()
+        background_fill_params_pref = self._load_background_fill_params_pref()
         dialog = IconConverterDialog(
             initial_icon_style=icon_style_pref,
             icon_style_saver=self._save_icon_style_pref,
             initial_bg_removal_engine=bg_engine_pref,
             bg_removal_engine_saver=self._save_bg_engine_pref,
+            initial_background_fill_mode=background_fill_mode_pref,
+            background_fill_mode_saver=self._save_background_fill_mode_pref,
+            initial_background_fill_params=background_fill_params_pref,
             initial_border_shader=border_shader_pref,
             border_shader_saver=self._save_border_shader_pref,
             processing_controls_visible=False,
@@ -1470,7 +2747,10 @@ class MainWindowIconOpsMixin:
         if report.details:
             lines.append("")
             lines.extend(report.details[:12])
-        QMessageBox.information(self, "Repair Icon Paths", "\n".join(lines))
+        if int(report.failed) > 0:
+            QMessageBox.warning(self, "Repair Icon Paths", "\n".join(lines))
+        else:
+            self._show_success_popup("Repair Icon Paths", "\n".join(lines))
 
     def _load_border_shader_pref(self) -> dict[str, object]:
         raw = self.state.get_ui_pref("icon_border_shader", "").strip()

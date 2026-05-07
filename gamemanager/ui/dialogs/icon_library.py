@@ -48,10 +48,13 @@ from gamemanager.services.browser_downloads import (
     detect_browser_download_dir,
 )
 from gamemanager.services.icon_pipeline import (
+    BACKGROUND_FILL_MODE_OPTIONS,
     TEXT_EXTRACTION_METHOD_OPTIONS,
     border_shader_to_dict,
     build_preview_png,
     icon_style_options,
+    normalize_background_fill_params,
+    normalize_background_fill_mode,
     normalize_border_shader_config,
     normalize_icon_style,
     normalize_text_extraction_method,
@@ -977,6 +980,9 @@ class IconPickerDialog(QDialog):
         icon_style_saver=None,
         initial_bg_removal_engine: str = "none",
         bg_removal_engine_saver=None,
+        initial_background_fill_mode: str = "black",
+        initial_background_fill_params: dict[str, object] | None = None,
+        background_fill_mode_saver=None,
         initial_border_shader: dict[str, object] | None = None,
         border_shader_saver=None,
         initial_web_download_dir: str | None = None,
@@ -998,6 +1004,7 @@ class IconPickerDialog(QDialog):
         self._resource_prefs_saver = resource_prefs_saver
         self._icon_style_saver = icon_style_saver
         self._bg_removal_engine_saver = bg_removal_engine_saver
+        self._background_fill_mode_saver = background_fill_mode_saver
         self._border_shader_saver = border_shader_saver
         self._web_download_dir = str(initial_web_download_dir or "").strip()
         self._web_download_dir_saver = web_download_dir_saver
@@ -1018,6 +1025,9 @@ class IconPickerDialog(QDialog):
         self._preview_pix_cache: dict[tuple[int, int, str], QPixmap] = {}
         self._hover_row: int | None = None
         self._border_shader = border_shader_to_dict(initial_border_shader)
+        self._background_fill_params = normalize_background_fill_params(
+            initial_background_fill_params
+        )
         self._bg_removal_params = normalize_background_removal_params(
             dict(DEFAULT_BG_REMOVAL_PARAMS)
         )
@@ -1124,6 +1134,20 @@ class IconPickerDialog(QDialog):
             self.bg_removal_combo.setCurrentIndex(bg_idx)
         self.bg_removal_combo.currentIndexChanged.connect(self._on_bg_engine_changed)
         options_row.addWidget(self.bg_removal_combo)
+        self.fill_label = QLabel("Fill:", self)
+        options_row.addWidget(self.fill_label)
+        self.background_fill_combo = QComboBox(self)
+        for label, value in BACKGROUND_FILL_MODE_OPTIONS:
+            self.background_fill_combo.addItem(label, value)
+        fill_idx = self.background_fill_combo.findData(
+            normalize_background_fill_mode(initial_background_fill_mode)
+        )
+        if fill_idx >= 0:
+            self.background_fill_combo.setCurrentIndex(fill_idx)
+        self.background_fill_combo.currentIndexChanged.connect(
+            self._on_background_fill_mode_changed
+        )
+        options_row.addWidget(self.background_fill_combo)
         self.text_label = QLabel("Text:", self)
         options_row.addWidget(self.text_label)
         self.text_extract_combo = QComboBox(self)
@@ -1200,6 +1224,8 @@ class IconPickerDialog(QDialog):
                 self.border_shader_btn,
                 self.cutout_label,
                 self.bg_removal_combo,
+                self.fill_label,
+                self.background_fill_combo,
                 self.text_label,
                 self.text_extract_combo,
             ):
@@ -1445,10 +1471,16 @@ class IconPickerDialog(QDialog):
                 blocked = self.text_extract_combo.blockSignals(True)
                 self.text_extract_combo.setCurrentIndex(text_idx)
                 self.text_extract_combo.blockSignals(blocked)
+            fill_idx = self.background_fill_combo.findData("black")
+            if fill_idx >= 0 and self.background_fill_combo.currentIndex() != fill_idx:
+                blocked = self.background_fill_combo.blockSignals(True)
+                self.background_fill_combo.setCurrentIndex(fill_idx)
+                self.background_fill_combo.blockSignals(blocked)
             cfg = dict(self._text_preserve_config)
             cfg.update({"enabled": False, "method": "none"})
             self._text_preserve_config = text_preserve_to_dict(cfg)
         self.bg_removal_combo.setEnabled(template_enabled)
+        self.background_fill_combo.setEnabled(template_enabled)
         self.text_extract_combo.setEnabled(template_enabled)
         self.border_shader_btn.setEnabled(template_enabled)
 
@@ -1458,6 +1490,15 @@ class IconPickerDialog(QDialog):
         if not self._template_enabled():
             return "none"
         return str(self.bg_removal_combo.currentData() or "none")
+
+    def _current_background_fill_mode(self) -> str:
+        if not hasattr(self, "background_fill_combo"):
+            return "black"
+        if not self._template_enabled():
+            return "black"
+        return normalize_background_fill_mode(
+            str(self.background_fill_combo.currentData() or "black")
+        )
 
     def _is_heavy_bg_engine(self) -> bool:
         return self._current_bg_removal_engine() in {"rembg", "bria_rmbg"}
@@ -1506,6 +1547,18 @@ class IconPickerDialog(QDialog):
         if self._bg_removal_engine_saver is not None:
             try:
                 self._bg_removal_engine_saver(self._current_bg_removal_engine())
+            except Exception:
+                pass
+
+    def _on_background_fill_mode_changed(self, *_args) -> None:
+        if self._prepared_is_final_composite:
+            self._prepared_image_bytes = None
+            self._prepared_is_final_composite = False
+        self._preview_pix_cache.clear()
+        self._refresh_preview_icons()
+        if self._background_fill_mode_saver is not None:
+            try:
+                self._background_fill_mode_saver(self._current_background_fill_mode())
             except Exception:
                 pass
 
@@ -1578,20 +1631,32 @@ class IconPickerDialog(QDialog):
             return None
         icon_style = self._current_icon_style()
         bg_engine = self._preview_bg_engine()
+        fill_mode = self._current_background_fill_mode()
         shader_key = json.dumps(self._border_shader_config(), sort_keys=True)
-        cache_key = (row, size, f"{icon_style}|{bg_engine}|{shader_key}")
+        cache_key = (row, size, f"{icon_style}|{bg_engine}|{fill_mode}|{shader_key}")
         cached = self._preview_pix_cache.get(cache_key)
         if cached is not None:
             return cached
         candidate = self.candidates[row]
         try:
-            preview_png = self._preview_loader(
-                candidate,
-                icon_style,
-                size,
-                bg_engine,
-                self._border_shader_config(),
-            )
+            try:
+                preview_png = self._preview_loader(
+                    candidate,
+                    icon_style,
+                    size,
+                    bg_engine,
+                    self._border_shader_config(),
+                    fill_mode,
+                    dict(self._background_fill_params),
+                )
+            except TypeError:
+                preview_png = self._preview_loader(
+                    candidate,
+                    icon_style,
+                    size,
+                    bg_engine,
+                    self._border_shader_config(),
+                )
             pix = QPixmap()
             if not pix.loadFromData(preview_png):
                 return None
@@ -1628,6 +1693,8 @@ class IconPickerDialog(QDialog):
                 bg_removal_engine=self._preview_bg_engine(),
                 text_preserve_config=self._text_preserve_config,
                 border_shader=self._border_shader_config(),
+                background_fill_mode=self._current_background_fill_mode(),
+                background_fill_params=dict(self._background_fill_params),
             )
             pix = QPixmap()
             if pix.loadFromData(preview_png):
@@ -1857,6 +1924,8 @@ class IconPickerDialog(QDialog):
             initial_bg_removal_engine=self._current_bg_removal_engine(),
             initial_bg_removal_params=dict(self._bg_removal_params),
             initial_text_preserve_config=dict(self._text_preserve_config),
+            initial_background_fill_mode=self._current_background_fill_mode(),
+            initial_background_fill_params=dict(self._background_fill_params),
             border_shader=self._border_shader_config(),
             size_improvements=self._size_improvements,
             parent=self,
@@ -1869,6 +1938,10 @@ class IconPickerDialog(QDialog):
         bg_idx = self.bg_removal_combo.findData(dialog.selected_bg_removal_engine())
         if bg_idx >= 0:
             self.bg_removal_combo.setCurrentIndex(bg_idx)
+        fill_idx = self.background_fill_combo.findData(dialog.selected_background_fill_mode())
+        if fill_idx >= 0:
+            self.background_fill_combo.setCurrentIndex(fill_idx)
+        self._background_fill_params = dialog.selected_background_fill_params()
         self._bg_removal_params = dialog.selected_bg_removal_params()
         self._text_preserve_config = dialog.selected_text_preserve_config()
         text_idx = self.text_extract_combo.findData(
@@ -1948,6 +2021,8 @@ class IconPickerDialog(QDialog):
             bg_removal_params=dict(self._bg_removal_params),
             text_preserve_config=dict(self._text_preserve_config),
             border_shader=self._border_shader_config(),
+            background_fill_mode=self._current_background_fill_mode(),
+            background_fill_params=dict(self._background_fill_params),
         )
 
 

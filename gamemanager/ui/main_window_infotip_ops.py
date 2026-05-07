@@ -64,7 +64,10 @@ class MainWindowInfoTipOpsMixin:
                 if report.details:
                     lines.append("")
                     lines.extend(report.details[:8])
-                QMessageBox.information(self, "InfoTip Refresh", "\n".join(lines))
+                if int(report.failed) > 0:
+                    QMessageBox.warning(self, "InfoTip Refresh", "\n".join(lines))
+                else:
+                    self._show_success_popup("InfoTip Refresh", "\n".join(lines))
             self.refresh_all()
 
         return self._start_report_operation(title, _run, _done)
@@ -185,6 +188,8 @@ class MainWindowInfoTipOpsMixin:
             f"Path: {entry.full_path}",
             f"Source: {row_source}",
         ]
+        if entry.owned_stores:
+            lines.append(f"Owned Stores: {', '.join(entry.owned_stores)}")
         if entry.is_dir:
             metadata = self.state.read_folder_icon_metadata(entry.full_path)
             source_kind = str(metadata.get("SourceKind", "")).strip()

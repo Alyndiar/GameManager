@@ -35,7 +35,15 @@ def test_build_multi_size_ico_generates_valid_ico() -> None:
 def test_build_multi_size_ico_authors_explicit_frames_per_size(monkeypatch) -> None:
     calls: list[int] = []
 
-    def _fake_build(_master, size, _template, foreground=None, border_shader=None):
+    def _fake_build(
+        _master,
+        size,
+        _template,
+        foreground=None,
+        border_shader=None,
+        background_fill_mode=None,
+        background_fill_params=None,
+    ):
         calls.append(int(size))
         return Image.new("RGBA", (int(size), int(size)), (int(size) % 256, 0, 0, 255))
 

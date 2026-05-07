@@ -135,7 +135,7 @@ class MainWindowTransferOpsMixin:
                     f"Moved: {report.succeeded}\nFailed: {report.failed}\n\n{details}",
                 )
                 return
-            QMessageBox.information(self, "Move Completed", f"Moved: {report.succeeded}")
+            self._show_success_popup("Move Completed", f"Moved: {report.succeeded}")
 
         self._start_report_operation("Move selected games", _run, _done)
 
@@ -374,9 +374,7 @@ class MainWindowTransferOpsMixin:
                 f"Moved: {succeeded}\nFailed: {failed}\n\n{detail_text}",
             )
             return
-        QMessageBox.information(
-            self, self._teracopy_completion_title, f"Moved: {succeeded}"
-        )
+        self._show_success_popup(self._teracopy_completion_title, f"Moved: {succeeded}")
 
     def _cancel_teracopy_session(self) -> None:
         if not self._teracopy_session_active:
@@ -437,7 +435,11 @@ class MainWindowTransferOpsMixin:
         if report.details:
             lines.append("")
             lines.extend(report.details[:8])
-        QMessageBox.information(self, "Move Result", "\n".join(lines))
+        has_issues = int(report.failed) > 0 or int(report.conflicts) > 0
+        if has_issues:
+            QMessageBox.warning(self, "Move Result", "\n".join(lines))
+            return
+        self._show_success_popup("Move Result", "\n".join(lines))
 
     def _execute_archive_moves_with_teracopy(
         self, plan_items: list[MovePlanItem]

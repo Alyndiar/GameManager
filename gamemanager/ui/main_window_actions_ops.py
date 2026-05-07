@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox
 
 from gamemanager.models import InventoryItem
 from gamemanager.services.normalization import cleaned_name_from_full
+from gamemanager.services.storefronts.priority import normalize_store_name, sort_stores
 
 
 class MainWindowActionsOpsMixin:
@@ -83,6 +84,21 @@ class MainWindowActionsOpsMixin:
         edit_tip_action = QAction("Manual InfoTip Entry...\tAlt+E", menu)
         edit_tip_action.triggered.connect(self._on_edit_selected_infotip)
         menu.addAction(edit_tip_action)
+        assign_steamid_action = QAction("Assign SteamID (Selected)...", menu)
+        assign_steamid_action.triggered.connect(self._on_assign_steam_appid_selected)
+        menu.addAction(assign_steamid_action)
+        assign_steamid_all_action = QAction("Assign SteamID (All Visible)...", menu)
+        assign_steamid_all_action.triggered.connect(self._on_assign_steam_appid_all_visible)
+        menu.addAction(assign_steamid_all_action)
+        recheck_ids_action = QAction("Recheck IDs + Stores (Selected)...", menu)
+        recheck_ids_action.triggered.connect(self._on_recheck_ids_and_stores_selected)
+        menu.addAction(recheck_ids_action)
+        recheck_ids_all_action = QAction("Recheck IDs + Stores (All Visible)...", menu)
+        recheck_ids_all_action.triggered.connect(self._on_recheck_ids_and_stores_all_visible)
+        menu.addAction(recheck_ids_all_action)
+        store_action = QAction("Set Owned Store(s)...", menu)
+        store_action.triggered.connect(self._on_set_owned_stores_selected)
+        menu.addAction(store_action)
         rename_action = QAction("Edit Name...\tF2", menu)
         rename_action.triggered.connect(self._on_manual_rename_selected_entry)
         menu.addAction(rename_action)
@@ -131,6 +147,21 @@ class MainWindowActionsOpsMixin:
         edit_tip_action = QAction("Manual InfoTip Entry...\tAlt+E", menu)
         edit_tip_action.triggered.connect(self._on_edit_selected_infotip)
         menu.addAction(edit_tip_action)
+        assign_steamid_action = QAction("Assign SteamID (Selected)...", menu)
+        assign_steamid_action.triggered.connect(self._on_assign_steam_appid_selected)
+        menu.addAction(assign_steamid_action)
+        assign_steamid_all_action = QAction("Assign SteamID (All Visible)...", menu)
+        assign_steamid_all_action.triggered.connect(self._on_assign_steam_appid_all_visible)
+        menu.addAction(assign_steamid_all_action)
+        recheck_ids_action = QAction("Recheck IDs + Stores (Selected)...", menu)
+        recheck_ids_action.triggered.connect(self._on_recheck_ids_and_stores_selected)
+        menu.addAction(recheck_ids_action)
+        recheck_ids_all_action = QAction("Recheck IDs + Stores (All Visible)...", menu)
+        recheck_ids_all_action.triggered.connect(self._on_recheck_ids_and_stores_all_visible)
+        menu.addAction(recheck_ids_all_action)
+        store_action = QAction("Set Owned Store(s)...", menu)
+        store_action.triggered.connect(self._on_set_owned_stores_selected)
+        menu.addAction(store_action)
         rename_action = QAction("Edit Name...\tF2", menu)
         rename_action.triggered.connect(self._on_manual_rename_selected_entry)
         menu.addAction(rename_action)
@@ -192,6 +223,90 @@ class MainWindowActionsOpsMixin:
                 "Search on Google",
                 f"Could not open browser for query:\n{query}\n\n{exc}",
             )
+
+    def _on_set_owned_stores_selected(self) -> None:
+        selected = [entry for entry in self._selected_right_entries() if entry.is_dir]
+        if not selected:
+            QMessageBox.information(
+                self,
+                "Set Owned Store(s)",
+                "Select at least one game folder first.",
+            )
+            return
+        available = self.state.available_store_names()
+        current = ", ".join(selected[0].owned_stores)
+        prompt = (
+            "Comma-separated stores.\n"
+            f"Available: {', '.join(available)}\n"
+            "Leave empty to clear ownership links."
+        )
+        raw, ok = QInputDialog.getText(
+            self,
+            "Set Owned Store(s)",
+            prompt,
+            text=current,
+        )
+        if not ok:
+            return
+        tokens = [
+            normalize_store_name(token)
+            for token in str(raw or "").replace(";", ",").split(",")
+        ]
+        stores = sort_stores([token for token in tokens if token])
+        updated = 0
+        for entry in selected:
+            updated += self.state.set_manual_owned_stores(entry.full_path, stores)
+        self.refresh_all()
+        if len(selected) == 1 and updated > 0:
+            return
+        self._show_success_popup(
+            "Set Owned Store(s)",
+            f"Updated {len(selected)} game(s). Assigned stores per game: {len(stores)}",
+        )
+
+    @staticmethod
+    def _store_from_strip_click(
+        stores: list[str],
+        *,
+        local_x: int,
+        badge_size: int = 16,
+        spacing: int = 2,
+    ) -> str | None:
+        ordered = sort_stores(list(stores or []))
+        if not ordered:
+            return None
+        x = int(local_x)
+        if x < 0:
+            return None
+        step = badge_size + spacing
+        for idx, store in enumerate(ordered):
+            start = idx * step
+            end = start + badge_size
+            if start <= x < end:
+                return store
+        return None
+
+    def _open_store_page_for_entry(self, entry: InventoryItem, store_name: str) -> bool:
+        canonical = normalize_store_name(store_name)
+        if not canonical:
+            return False
+        url = self.state.store_page_url_for_inventory(
+            entry.full_path,
+            store_name=canonical,
+            game_title=entry.cleaned_name or entry.full_name,
+        )
+        if not url:
+            return False
+        try:
+            webbrowser.open(url, new=2)
+            return True
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Open Store Page",
+                f"Could not open store page:\n{url}\n\n{exc}",
+            )
+            return False
 
     def _delete_path(self, full_path: str) -> None:
         if os.path.isdir(full_path):
@@ -421,4 +536,4 @@ class MainWindowActionsOpsMixin:
                 f"Deleted before cancel: {deleted}",
             )
             return
-        QMessageBox.information(self, "Deletion Completed", f"Deleted: {deleted}")
+        self._show_success_popup("Deletion Completed", f"Deleted: {deleted}")
