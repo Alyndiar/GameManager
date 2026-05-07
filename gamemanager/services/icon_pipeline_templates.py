@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 import threading
 
-from PIL import Image, ImageChops, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +45,41 @@ _SQUARE_TEMPLATE_PATHS: list[Path] = []
 _TEMPLATE_MAP_LOCK = threading.Lock()
 _TEMPLATE_MAP_CACHE: dict[str, IconTemplate] | None = None
 _TEMPLATE_MAP_CACHE_KEY: tuple[str, str, int, int] | None = None
+BACKGROUND_FILL_MODE_OPTIONS: list[tuple[str, str]] = [
+    ("Black", "black"),
+    ("Average Color", "average"),
+    ("Blur Extend", "blur"),
+    ("Edge Stretch", "edge_stretch"),
+    ("Mirror Extend", "mirror"),
+    ("Soft Gradient", "soft_gradient"),
+    ("Radial Blur", "radial_blur"),
+    ("Zoom Blur", "zoom_blur"),
+    ("Hybrid Extend+Blur", "hybrid"),
+]
+_BACKGROUND_FILL_MODE_VALUES: set[str] = {
+    value for _label, value in BACKGROUND_FILL_MODE_OPTIONS
+}
+_DEFAULT_BACKGROUND_FILL_PARAMS: dict[str, int] = {
+    "blur_strength": 55,
+    "edge_softness": 24,
+    "mirror_softness": 18,
+    "gradient_blur": 58,
+    "gradient_mix": 22,
+    "radial_strength": 72,
+    "radial_curve": 160,
+    "zoom_strength": 30,
+    "zoom_samples": 8,
+    "hybrid_blur": 26,
+    "hybrid_mix": 18,
+}
+
+
+def _clamp_int(value: object, fallback: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(fallback)
+    return max(int(low), min(int(high), int(parsed)))
 
 
 def configure_template_sources(
@@ -301,6 +336,323 @@ def border_shader_to_dict(
         "tone": int(normalized.tone),
         "intensity": int(normalized.intensity),
     }
+
+
+def normalize_background_fill_mode(mode: str | None) -> str:
+    normalized = str(mode or "black").strip().casefold()
+    if normalized in _BACKGROUND_FILL_MODE_VALUES:
+        return normalized
+    return "black"
+
+
+def normalize_background_fill_params(params: dict[str, object] | None) -> dict[str, int]:
+    raw = dict(params or {})
+    defaults = dict(_DEFAULT_BACKGROUND_FILL_PARAMS)
+    return {
+        "blur_strength": _clamp_int(
+            raw.get("blur_strength"),
+            defaults["blur_strength"],
+            0,
+            100,
+        ),
+        "edge_softness": _clamp_int(
+            raw.get("edge_softness"),
+            defaults["edge_softness"],
+            0,
+            100,
+        ),
+        "mirror_softness": _clamp_int(
+            raw.get("mirror_softness"),
+            defaults["mirror_softness"],
+            0,
+            100,
+        ),
+        "gradient_blur": _clamp_int(
+            raw.get("gradient_blur"),
+            defaults["gradient_blur"],
+            0,
+            100,
+        ),
+        "gradient_mix": _clamp_int(
+            raw.get("gradient_mix"),
+            defaults["gradient_mix"],
+            0,
+            100,
+        ),
+        "radial_strength": _clamp_int(
+            raw.get("radial_strength"),
+            defaults["radial_strength"],
+            0,
+            100,
+        ),
+        "radial_curve": _clamp_int(
+            raw.get("radial_curve"),
+            defaults["radial_curve"],
+            50,
+            250,
+        ),
+        "zoom_strength": _clamp_int(
+            raw.get("zoom_strength"),
+            defaults["zoom_strength"],
+            0,
+            100,
+        ),
+        "zoom_samples": _clamp_int(
+            raw.get("zoom_samples"),
+            defaults["zoom_samples"],
+            2,
+            20,
+        ),
+        "hybrid_blur": _clamp_int(
+            raw.get("hybrid_blur"),
+            defaults["hybrid_blur"],
+            0,
+            100,
+        ),
+        "hybrid_mix": _clamp_int(
+            raw.get("hybrid_mix"),
+            defaults["hybrid_mix"],
+            0,
+            100,
+        ),
+    }
+
+
+def default_background_fill_params() -> dict[str, int]:
+    return dict(_DEFAULT_BACKGROUND_FILL_PARAMS)
+
+
+def _param_int(params: dict[str, int], key: str) -> int:
+    return int(params.get(key, _DEFAULT_BACKGROUND_FILL_PARAMS[key]))
+
+
+def _radius_from_strength(
+    size: int,
+    strength: int,
+    *,
+    min_frac: float,
+    max_frac: float,
+) -> float:
+    norm = max(0.0, min(1.0, float(strength) / 100.0))
+    frac = min_frac + ((max_frac - min_frac) * norm)
+    return max(0.4, float(size) * frac)
+
+
+def _contained_centered(
+    source: Image.Image,
+    size: int,
+) -> tuple[Image.Image, int, int, int, int]:
+    fitted = ImageOps.contain(source, (size, size), method=Image.Resampling.LANCZOS)
+    left = (size - fitted.width) // 2
+    top = (size - fitted.height) // 2
+    return fitted, left, top, fitted.width, fitted.height
+
+
+def _center_crop(image: Image.Image, size: int) -> Image.Image:
+    width, height = image.size
+    left = max(0, (width - size) // 2)
+    top = max(0, (height - size) // 2)
+    return image.crop((left, top, left + size, top + size))
+
+
+def _build_edge_stretch_fill(source: Image.Image, size: int, params: dict[str, int]) -> Image.Image:
+    fitted, left, top, fit_w, fit_h = _contained_centered(source, size)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    canvas.paste(fitted, (left, top), fitted)
+    right = size - (left + fit_w)
+    bottom = size - (top + fit_h)
+    if left > 0:
+        strip = fitted.crop((0, 0, 1, fit_h)).resize((left, fit_h), Image.Resampling.BILINEAR)
+        canvas.paste(strip, (0, top), strip)
+    if right > 0:
+        strip = fitted.crop((fit_w - 1, 0, fit_w, fit_h)).resize(
+            (right, fit_h),
+            Image.Resampling.BILINEAR,
+        )
+        canvas.paste(strip, (left + fit_w, top), strip)
+    if top > 0:
+        row = canvas.crop((0, top, size, top + 1)).resize((size, top), Image.Resampling.BILINEAR)
+        canvas.paste(row, (0, 0), row)
+    if bottom > 0:
+        row = canvas.crop((0, top + fit_h - 1, size, top + fit_h)).resize(
+            (size, bottom),
+            Image.Resampling.BILINEAR,
+        )
+        canvas.paste(row, (0, top + fit_h), row)
+    softness = _param_int(params, "edge_softness")
+    if softness > 0:
+        canvas = canvas.filter(
+            ImageFilter.GaussianBlur(
+                radius=_radius_from_strength(size, softness, min_frac=0.004, max_frac=0.045)
+            )
+        )
+    return canvas
+
+
+def _build_mirror_fill(source: Image.Image, size: int, params: dict[str, int]) -> Image.Image:
+    fitted, left, top, fit_w, fit_h = _contained_centered(source, size)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    canvas.paste(fitted, (left, top), fitted)
+    right = size - (left + fit_w)
+    bottom = size - (top + fit_h)
+    if left > 0:
+        sample_w = max(1, min(fit_w, left))
+        strip = ImageOps.mirror(fitted.crop((0, 0, sample_w, fit_h))).resize(
+            (left, fit_h),
+            Image.Resampling.BILINEAR,
+        )
+        canvas.paste(strip, (0, top), strip)
+    if right > 0:
+        sample_w = max(1, min(fit_w, right))
+        strip = ImageOps.mirror(fitted.crop((fit_w - sample_w, 0, fit_w, fit_h))).resize(
+            (right, fit_h),
+            Image.Resampling.BILINEAR,
+        )
+        canvas.paste(strip, (left + fit_w, top), strip)
+    if top > 0:
+        sample_h = max(1, min(fit_h, top))
+        band = ImageOps.flip(canvas.crop((0, top, size, top + sample_h))).resize(
+            (size, top),
+            Image.Resampling.BILINEAR,
+        )
+        canvas.paste(band, (0, 0), band)
+    if bottom > 0:
+        sample_h = max(1, min(fit_h, bottom))
+        band = ImageOps.flip(
+            canvas.crop((0, top + fit_h - sample_h, size, top + fit_h))
+        ).resize((size, bottom), Image.Resampling.BILINEAR)
+        canvas.paste(band, (0, top + fit_h), band)
+    softness = _param_int(params, "mirror_softness")
+    if softness > 0:
+        canvas = canvas.filter(
+            ImageFilter.GaussianBlur(
+                radius=_radius_from_strength(size, softness, min_frac=0.003, max_frac=0.04)
+            )
+        )
+    return canvas
+
+
+def _build_soft_gradient_fill(source: Image.Image, size: int, params: dict[str, int]) -> Image.Image:
+    base = ImageOps.fit(source, (size, size), method=Image.Resampling.LANCZOS)
+    blur_strength = _param_int(params, "gradient_blur")
+    blur_radius = _radius_from_strength(size, blur_strength, min_frac=0.02, max_frac=0.14)
+    soft = base.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    avg = build_background_fill_layer(source, size, fill_mode="average")
+    mix = max(0.0, min(1.0, float(_param_int(params, "gradient_mix")) / 100.0))
+    return Image.blend(soft, avg, mix)
+
+
+def _radial_edge_mask(size: int) -> Image.Image:
+    center = (float(size) - 1.0) / 2.0
+    max_dist = max(1.0, (2.0**0.5) * center)
+    values: list[int] = []
+    for y in range(size):
+        dy = float(y) - center
+        for x in range(size):
+            dx = float(x) - center
+            dist = (dx * dx + dy * dy) ** 0.5
+            ratio = max(0.0, min(1.0, dist / max_dist))
+            alpha = int(round((ratio**1.6) * 255.0))
+            values.append(alpha)
+    mask = Image.new("L", (size, size))
+    mask.putdata(values)
+    return mask
+
+
+def _build_radial_blur_fill(source: Image.Image, size: int, params: dict[str, int]) -> Image.Image:
+    base = ImageOps.fit(source, (size, size), method=Image.Resampling.LANCZOS)
+    strength = _param_int(params, "radial_strength")
+    blur_radius = _radius_from_strength(size, strength, min_frac=0.02, max_frac=0.16)
+    blurred = base.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    mask = _radial_edge_mask(size)
+    curve = max(50, min(250, _param_int(params, "radial_curve")))
+    curve_power = max(0.5, min(2.5, float(curve) / 100.0))
+    shaped_mask = mask.point(
+        lambda value: max(
+            0,
+            min(255, int(round(((float(value) / 255.0) ** curve_power) * 255.0))),
+        )
+    )
+    return Image.composite(blurred, base, shaped_mask)
+
+
+def _build_zoom_blur_fill(source: Image.Image, size: int, params: dict[str, int]) -> Image.Image:
+    base = ImageOps.fit(source, (size, size), method=Image.Resampling.LANCZOS)
+    blended = base
+    samples = max(2, min(20, _param_int(params, "zoom_samples")))
+    strength = max(0.0, min(1.0, float(_param_int(params, "zoom_strength")) / 100.0)) * 0.48
+    for idx in range(1, samples):
+        t = float(idx) / float(max(1, samples - 1))
+        scale = 1.0 + (strength * t)
+        scaled_size = max(size + 1, int(round(float(size) * scale)))
+        scaled = base.resize((scaled_size, scaled_size), Image.Resampling.LANCZOS)
+        cropped = _center_crop(scaled, size)
+        blended = Image.blend(blended, cropped, 0.18)
+    return blended.filter(
+        ImageFilter.GaussianBlur(
+            radius=_radius_from_strength(size, _param_int(params, "zoom_strength"), min_frac=0.004, max_frac=0.02)
+        )
+    )
+
+
+def _build_hybrid_fill(source: Image.Image, size: int, params: dict[str, int]) -> Image.Image:
+    mirrored = _build_mirror_fill(source, size, params)
+    radial = _build_radial_blur_fill(source, size, params)
+    zoom = _build_zoom_blur_fill(source, size, params)
+    mixed = Image.blend(mirrored, radial, 0.42)
+    mixed = Image.blend(mixed, zoom, 0.28)
+    avg = build_background_fill_layer(source, size, fill_mode="average")
+    avg_mix = max(0.0, min(1.0, float(_param_int(params, "hybrid_mix")) / 100.0))
+    blur = _param_int(params, "hybrid_blur")
+    if blur > 0:
+        mixed = mixed.filter(
+            ImageFilter.GaussianBlur(
+                radius=_radius_from_strength(size, blur, min_frac=0.003, max_frac=0.028)
+            )
+        )
+    return Image.blend(mixed, avg, avg_mix)
+
+
+def build_background_fill_layer(
+    source: Image.Image,
+    size: int,
+    *,
+    fill_mode: str | None = None,
+    params: dict[str, object] | None = None,
+) -> Image.Image:
+    normalized = normalize_background_fill_mode(fill_mode)
+    normalized_params = normalize_background_fill_params(params)
+    size = max(1, int(size))
+    if normalized == "black":
+        return Image.new("RGBA", (size, size), (0, 0, 0, 255))
+    rgba = source.convert("RGBA")
+    if normalized == "average":
+        alpha = rgba.getchannel("A")
+        if alpha.getextrema()[1] <= 0:
+            return Image.new("RGBA", (size, size), (0, 0, 0, 255))
+        stat = ImageStat.Stat(rgba.convert("RGB"), alpha)
+        means = [max(0, min(255, int(round(channel)))) for channel in stat.mean[:3]]
+        return Image.new("RGBA", (size, size), (means[0], means[1], means[2], 255))
+    if normalized == "edge_stretch":
+        return _build_edge_stretch_fill(rgba, size, normalized_params)
+    if normalized == "mirror":
+        return _build_mirror_fill(rgba, size, normalized_params)
+    if normalized == "soft_gradient":
+        return _build_soft_gradient_fill(rgba, size, normalized_params)
+    if normalized == "radial_blur":
+        return _build_radial_blur_fill(rgba, size, normalized_params)
+    if normalized == "zoom_blur":
+        return _build_zoom_blur_fill(rgba, size, normalized_params)
+    if normalized == "hybrid":
+        return _build_hybrid_fill(rgba, size, normalized_params)
+    fitted = ImageOps.fit(rgba, (size, size), method=Image.Resampling.LANCZOS)
+    blur_radius = _radius_from_strength(
+        size,
+        _param_int(normalized_params, "blur_strength"),
+        min_frac=0.012,
+        max_frac=0.13,
+    )
+    return fitted.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
 
 def _shader_rgb(config: BorderShaderConfig) -> tuple[int, int, int]:
@@ -577,6 +929,8 @@ def build_composited_icon(
     template: IconTemplate,
     foreground: Image.Image | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | object | None = None,
+    background_fill_mode: str | None = None,
+    background_fill_params: dict[str, object] | None = None,
 ) -> Image.Image:
     if template.template_id == "none":
         base = _fit_to_square(master, size)
@@ -585,9 +939,14 @@ def build_composited_icon(
         base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         interior_mask = template_interior_mask(template, size)
         if interior_mask is not None:
-            # Keep outside area transparent; black-fill only within template interior.
-            black_fill = Image.new("RGBA", (size, size), (0, 0, 0, 255))
-            base.paste(black_fill, (0, 0), interior_mask)
+            # Keep outside area transparent; fill only within template interior.
+            fill_layer = build_background_fill_layer(
+                source,
+                size,
+                fill_mode=background_fill_mode,
+                params=background_fill_params,
+            )
+            base.paste(fill_layer, (0, 0), interior_mask)
             src_alpha = source.getchannel("A")
             combined_mask = ImageChops.multiply(src_alpha, interior_mask)
             base.paste(source, (0, 0), combined_mask)

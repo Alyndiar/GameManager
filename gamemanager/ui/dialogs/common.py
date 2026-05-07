@@ -24,6 +24,8 @@ class IconPickerResult:
     bg_removal_params: dict[str, object]
     text_preserve_config: dict[str, object]
     border_shader: dict[str, object]
+    background_fill_mode: str
+    background_fill_params: dict[str, object]
 
 
 @dataclass(slots=True)
@@ -31,9 +33,10 @@ class IconProviderSettingsResult:
     steamgriddb_enabled: bool
     steamgriddb_api_key: str
     steamgriddb_api_base: str
-    iconfinder_enabled: bool
-    iconfinder_api_key: str
-    iconfinder_api_base: str
+    igdb_enabled: bool
+    igdb_client_id: str
+    igdb_client_secret: str
+    igdb_api_base: str
 
 
 @dataclass(slots=True)
@@ -43,6 +46,7 @@ class PerformanceSettingsResult:
     dir_cache_enabled: bool
     dir_cache_max_entries: int
     startup_prewarm_mode: str
+    success_popups_enabled: bool = True
     web_capture_download_mode: str = "auto"
     web_capture_download_dir: str = ""
     icon_rebuild_create_backups: bool = True

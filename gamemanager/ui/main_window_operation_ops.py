@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import threading
+import time
+from typing import TypeVar, cast
 
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gamemanager.models import OperationReport
+
+_T = TypeVar("_T")
 
 
 class MainWindowOperationOpsMixin:
@@ -158,4 +163,41 @@ class MainWindowOperationOpsMixin:
             and not self._teracopy_processes
         ):
             self._clear_operation_progress()
+
+    def _run_ui_pumped_call(
+        self,
+        stage: str,
+        fn: Callable[[], _T],
+    ) -> _T:
+        state: dict[str, object] = {
+            "done": False,
+            "value": None,
+            "error": None,
+        }
+
+        def _worker() -> None:
+            try:
+                state["value"] = fn()
+            except Exception as exc:
+                state["error"] = exc
+            finally:
+                state["done"] = True
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        while not bool(state["done"]):
+            self._set_operation_progress(stage, 0, 0)
+            QApplication.processEvents()
+            time.sleep(0.02)
+        err = state.get("error")
+        if isinstance(err, Exception):
+            raise err
+        if (
+            not self._refresh_in_progress
+            and not self._operation_in_progress
+            and not self._interactive_operation_active
+            and not self._teracopy_processes
+        ):
+            self._clear_operation_progress()
+        return cast(_T, state.get("value"))
 

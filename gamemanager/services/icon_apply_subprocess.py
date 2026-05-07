@@ -26,6 +26,8 @@ def apply_folder_icon_in_subprocess(
     bg_removal_params: dict[str, object] | None,
     text_preserve_config: dict[str, object] | None,
     border_shader: dict[str, object] | None,
+    background_fill_mode: str,
+    background_fill_params: dict[str, object] | None,
     size_improvements: dict[int, dict[str, object]] | None,
     temp_dir: Path,
     timeout_seconds: int = 180,
@@ -63,6 +65,10 @@ def apply_folder_icon_in_subprocess(
         json.dumps(text_preserve_config or {}, ensure_ascii=False),
         "--border-shader-json",
         json.dumps(border_shader or {}, ensure_ascii=False),
+        "--background-fill-mode",
+        str(background_fill_mode or "black"),
+        "--background-fill-params-json",
+        json.dumps(background_fill_params or {}, ensure_ascii=False),
         "--size-improvements-json",
         json.dumps(size_improvements or {}, ensure_ascii=False),
     ]
@@ -144,6 +150,8 @@ def _worker_main(args: argparse.Namespace) -> int:
             bg_removal_params=json.loads(args.bg_removal_params_json or "{}"),
             text_preserve_config=json.loads(args.text_preserve_config_json or "{}"),
             border_shader=json.loads(args.border_shader_json or "{}"),
+            background_fill_mode=args.background_fill_mode,
+            background_fill_params=json.loads(args.background_fill_params_json or "{}"),
             size_improvements=json.loads(args.size_improvements_json or "{}"),
         )
         result = apply_folder_icon(
@@ -175,6 +183,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bg-removal-params-json", default="{}")
     parser.add_argument("--text-preserve-config-json", default="{}")
     parser.add_argument("--border-shader-json", default="{}")
+    parser.add_argument("--background-fill-mode", default="black")
+    parser.add_argument("--background-fill-params-json", default="{}")
     parser.add_argument("--size-improvements-json", default="{}")
     parser.add_argument("--info-tip", default=None)
     return parser.parse_args(argv)

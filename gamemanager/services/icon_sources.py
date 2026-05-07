@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Iterable
+from collections import deque
 import re
+import threading
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -12,11 +15,33 @@ from gamemanager.models import IconCandidate
 
 
 DEFAULT_STEAMGRIDDB_API_BASE = "https://www.steamgriddb.com/api/v2"
-DEFAULT_ICONFINDER_API_BASE = "https://api.iconfinder.com/v4"
+DEFAULT_IGDB_API_BASE = "https://api.igdb.com/v4"
+DEFAULT_TWITCH_OAUTH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 SUPPORTED_SGDB_RESOURCES: tuple[str, ...] = ("icons", "logos", "grids", "heroes")
 DEFAULT_SGDB_RESOURCE_ORDER: tuple[str, ...] = ("icons", "logos", "grids", "heroes")
 DEFAULT_SGDB_ENABLED_RESOURCES: tuple[str, ...] = ("icons", "logos")
 _DIMENSIONS_RE = re.compile(r"(?<!\d)(\d{2,5})\s*[xX]\s*(\d{2,5})(?!\d)")
+_IGDB_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+_IGDB_SOURCE_TO_STORE: dict[int, str] = {
+    1: "Steam",
+    5: "GOG",
+    20: "Amazon Games",
+    22: "Amazon Games",
+    23: "Amazon Games",
+    26: "EGS",
+    30: "Itch.io",
+}
+_IGDB_WEBSITE_TYPE_TO_STORE: dict[int, str] = {
+    13: "Steam",
+    15: "Itch.io",
+    16: "EGS",
+    17: "GOG",
+}
+_STEAM_APP_RE = re.compile(r"/app/(\d+)", re.IGNORECASE)
+_IGDB_RATE_LOCK = threading.Lock()
+_IGDB_RATE_TIMESTAMPS: deque[float] = deque()
+_IGDB_CONCURRENCY_SEMAPHORE = threading.Semaphore(8)
+_IGDB_RATE_LIMIT_PER_SEC = 4
 
 
 @dataclass(slots=True)
@@ -24,9 +49,11 @@ class IconSearchSettings:
     steamgriddb_enabled: bool
     steamgriddb_api_key: str
     steamgriddb_api_base: str = DEFAULT_STEAMGRIDDB_API_BASE
-    iconfinder_enabled: bool = True
-    iconfinder_api_key: str = ""
-    iconfinder_api_base: str = DEFAULT_ICONFINDER_API_BASE
+    igdb_enabled: bool = False
+    igdb_client_id: str = ""
+    igdb_client_secret: str = ""
+    igdb_api_base: str = DEFAULT_IGDB_API_BASE
+    twitch_oauth_token_url: str = DEFAULT_TWITCH_OAUTH_TOKEN_URL
     timeout_seconds: float = 15.0
 
 
@@ -62,7 +89,23 @@ def _score_candidate(candidate: IconCandidate) -> float:
             for token in ("library_", "capsule_", "header_image", "background")
         ):
             score -= 0.9
+    if candidate.provider == "IGDB":
+        if ":cover:" in candidate_id:
+            score -= 0.25
+        elif ":artwork:" in candidate_id:
+            score += 0.1
     return score
+
+
+def _provider_rank(provider: str) -> int:
+    token = str(provider or "").strip()
+    if token == "SteamGridDB":
+        return 0
+    if token == "Steam":
+        return 1
+    if token == "IGDB":
+        return 2
+    return 3
 
 
 def _session() -> requests.Session:
@@ -452,63 +495,316 @@ def _search_steamgriddb(
     return candidates
 
 
-def _best_iconfinder_raster(icon_payload: dict[str, Any]) -> tuple[str, str, int, int]:
-    best_dl = ""
-    best_preview = ""
-    best_w = 0
-    best_h = 0
-    for raster in icon_payload.get("raster_sizes") or []:
-        size = int(raster.get("size") or 0)
-        for fmt in raster.get("formats") or []:
-            dl = str(fmt.get("download_url") or "")
-            preview = str(fmt.get("preview_url") or "")
-            if not dl and not preview:
-                continue
-            if size >= max(best_w, best_h):
-                best_dl = dl or preview
-                best_preview = preview or dl
-                best_w = size
-                best_h = size
-    return best_dl, best_preview, best_w, best_h
+def _safe_post_json(
+    session: requests.Session,
+    url: str,
+    *,
+    headers: dict[str, str] | None,
+    data: dict[str, Any] | None = None,
+    body: str = "",
+    timeout: float,
+    enforce_igdb_rate_limit: bool = False,
+) -> dict[str, Any] | list[Any] | None:
+    semaphore_acquired = False
+    try:
+        if enforce_igdb_rate_limit:
+            _IGDB_CONCURRENCY_SEMAPHORE.acquire()
+            semaphore_acquired = True
+            while True:
+                sleep_for = 0.0
+                with _IGDB_RATE_LOCK:
+                    now = time.monotonic()
+                    while _IGDB_RATE_TIMESTAMPS and (now - _IGDB_RATE_TIMESTAMPS[0]) >= 1.0:
+                        _IGDB_RATE_TIMESTAMPS.popleft()
+                    if len(_IGDB_RATE_TIMESTAMPS) < _IGDB_RATE_LIMIT_PER_SEC:
+                        _IGDB_RATE_TIMESTAMPS.append(now)
+                        break
+                    oldest = _IGDB_RATE_TIMESTAMPS[0]
+                    sleep_for = max(0.01, 1.0 - (now - oldest))
+                time.sleep(sleep_for)
+        if body:
+            resp = session.post(
+                url,
+                headers=headers,
+                data=body.encode("utf-8"),
+                timeout=timeout,
+            )
+        else:
+            resp = session.post(url, headers=headers, data=data, timeout=timeout)
+        if resp.status_code >= 400:
+            return None
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    finally:
+        if semaphore_acquired:
+            _IGDB_CONCURRENCY_SEMAPHORE.release()
 
 
-def _search_iconfinder(
+def _igdb_image_url(image_id: str, size: str) -> str:
+    token = str(image_id or "").strip()
+    if not token:
+        return ""
+    return f"https://images.igdb.com/igdb/image/upload/t_{size}/{token}.jpg"
+
+
+def _normalize_name_for_compare(value: str) -> str:
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return ""
+    return " ".join(part for part in re.sub(r"[^a-z0-9]+", " ", raw).split() if part)
+
+
+def _store_id_from_store_url(store_name: str, url: str) -> str:
+    token = str(url or "").strip()
+    if not token:
+        return ""
+    if store_name == "Steam":
+        match = _STEAM_APP_RE.search(token)
+        if match:
+            appid = str(match.group(1) or "").strip()
+            return appid if appid.isdigit() else ""
+        return ""
+    if store_name == "GOG":
+        marker = "/game/"
+        idx = token.lower().find(marker)
+        if idx >= 0:
+            slug = token[idx + len(marker) :].split("?", 1)[0].split("#", 1)[0].strip("/")
+            return slug
+    if store_name == "EGS":
+        # Typical forms include /p/<slug> or /product/<slug>.
+        for marker in ("/p/", "/product/"):
+            idx = token.lower().find(marker)
+            if idx >= 0:
+                slug = token[idx + len(marker) :].split("?", 1)[0].split("#", 1)[0].strip("/")
+                return slug
+    if store_name == "Itch.io":
+        return token
+    return ""
+
+
+def _igdb_access_token(
+    session: requests.Session,
+    settings: IconSearchSettings,
+) -> str:
+    if not settings.igdb_enabled:
+        return ""
+    client_id = str(settings.igdb_client_id or "").strip()
+    client_secret = str(settings.igdb_client_secret or "").strip()
+    if not client_id or not client_secret:
+        return ""
+    cache_key = f"{client_id}:{client_secret}"
+    cached = _IGDB_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached is not None:
+        token, expires_at = cached
+        if token and now < max(0.0, float(expires_at) - 30.0):
+            return token
+    payload = _safe_post_json(
+        session,
+        str(settings.twitch_oauth_token_url or DEFAULT_TWITCH_OAUTH_TOKEN_URL).strip(),
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        },
+        headers=None,
+        timeout=settings.timeout_seconds,
+    )
+    if not isinstance(payload, dict):
+        return ""
+    token = str(payload.get("access_token") or "").strip()
+    expires_in_raw = payload.get("expires_in")
+    expires_in = 0
+    if isinstance(expires_in_raw, (int, float)):
+        expires_in = max(0, int(expires_in_raw))
+    if not token:
+        return ""
+    _IGDB_TOKEN_CACHE[cache_key] = (token, now + float(expires_in or 3600))
+    return token
+
+
+def _search_igdb(
     settings: IconSearchSettings,
     game_name: str,
     cleaned_name: str,
 ) -> list[IconCandidate]:
-    if not settings.iconfinder_enabled or not settings.iconfinder_api_key.strip():
-        return []
     session = _session()
-    headers = {"Authorization": f"Bearer {settings.iconfinder_api_key.strip()}"}
-    query = quote(f"{cleaned_name or game_name} icon logo transparent")
-    url = (
-        f"{settings.iconfinder_api_base.rstrip('/')}/icons/search"
-        f"?query={query}&count=30&premium=0&vector=0"
-    )
-    payload = _safe_get_json(session, url, headers, settings.timeout_seconds)
-    if not payload:
+    token = _igdb_access_token(session, settings)
+    if not token:
         return []
-    candidates: list[IconCandidate] = []
-    for item in payload.get("icons") or []:
-        image_url, preview_url, width, height = _best_iconfinder_raster(item)
-        if not image_url:
+    query_text = str(cleaned_name or game_name).strip()
+    if not query_text:
+        return []
+    headers = {
+        "Client-ID": str(settings.igdb_client_id or "").strip(),
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    body = (
+        f'search "{query_text.replace(chr(34), "").strip()}"; '
+        "fields id,name,cover.image_id,artworks.image_id,url; "
+        "limit 8;"
+    )
+    payload = _safe_post_json(
+        session,
+        f"{settings.igdb_api_base.rstrip('/')}/games",
+        headers=headers,
+        body=body,
+        timeout=settings.timeout_seconds,
+        enforce_igdb_rate_limit=True,
+    )
+    rows = payload if isinstance(payload, list) else []
+    out: list[IconCandidate] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        title = str(item.get("tags", ["icon"])[0] if item.get("tags") else "icon")
-        candidates.append(
-            IconCandidate(
-                provider="Iconfinder",
-                candidate_id=str(item.get("icon_id") or ""),
-                title=title,
-                preview_url=preview_url or image_url,
-                image_url=image_url,
-                width=width,
-                height=height,
-                has_alpha=True,
-                source_url=str(item.get("permalink") or image_url),
-            )
-        )
-    return candidates
+        game_id = str(row.get("id") or "").strip()
+        title = str(row.get("name") or query_text).strip() or query_text
+        source_url = str(row.get("url") or "").strip() or f"https://www.igdb.com/games/{game_id}"
+
+        cover = row.get("cover")
+        if isinstance(cover, dict):
+            image_id = str(cover.get("image_id") or "").strip()
+            if image_id:
+                image_url = _igdb_image_url(image_id, "1080p")
+                preview_url = _igdb_image_url(image_id, "cover_big")
+                if image_url and image_url not in seen:
+                    seen.add(image_url)
+                    out.append(
+                        IconCandidate(
+                            provider="IGDB",
+                            candidate_id=f"igdb:cover:{game_id}:{image_id}",
+                            title=title,
+                            preview_url=preview_url or image_url,
+                            image_url=image_url,
+                            width=264,
+                            height=374,
+                            has_alpha=False,
+                            source_url=source_url,
+                        )
+                    )
+
+        artworks = row.get("artworks")
+        if isinstance(artworks, list):
+            for artwork in artworks[:3]:
+                if not isinstance(artwork, dict):
+                    continue
+                image_id = str(artwork.get("image_id") or "").strip()
+                if not image_id:
+                    continue
+                image_url = _igdb_image_url(image_id, "1080p")
+                preview_url = _igdb_image_url(image_id, "screenshot_med")
+                if not image_url or image_url in seen:
+                    continue
+                seen.add(image_url)
+                out.append(
+                    IconCandidate(
+                        provider="IGDB",
+                        candidate_id=f"igdb:artwork:{game_id}:{image_id}",
+                        title=title,
+                        preview_url=preview_url or image_url,
+                        image_url=image_url,
+                        width=1920,
+                        height=1080,
+                        has_alpha=False,
+                        source_url=source_url,
+                    )
+                )
+    return out
+
+
+def lookup_igdb_store_ids_for_title(
+    settings: IconSearchSettings,
+    title: str,
+) -> dict[str, str]:
+    session = _session()
+    token = _igdb_access_token(session, settings)
+    if not token:
+        return {}
+    query_text = str(title or "").strip()
+    if not query_text:
+        return {}
+    headers = {
+        "Client-ID": str(settings.igdb_client_id or "").strip(),
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    safe_query = query_text.replace(chr(34), "").strip()
+    games_payload = _safe_post_json(
+        session,
+        f"{settings.igdb_api_base.rstrip('/')}/games",
+        headers=headers,
+        body=f'search "{safe_query}"; fields id,name; limit 8;',
+        timeout=settings.timeout_seconds,
+        enforce_igdb_rate_limit=True,
+    )
+    games = games_payload if isinstance(games_payload, list) else []
+    if not games:
+        return {}
+    query_norm = _normalize_name_for_compare(query_text)
+    selected_game_id = 0
+    for row in games:
+        if not isinstance(row, dict):
+            continue
+        game_id = int(row.get("id") or 0)
+        if game_id <= 0:
+            continue
+        name_norm = _normalize_name_for_compare(str(row.get("name") or ""))
+        if query_norm and name_norm and query_norm == name_norm:
+            selected_game_id = game_id
+            break
+    if selected_game_id <= 0:
+        return {}
+
+    store_ids: dict[str, str] = {}
+    external_payload = _safe_post_json(
+        session,
+        f"{settings.igdb_api_base.rstrip('/')}/external_games",
+        headers=headers,
+        body=(
+            "fields external_game_source,uid,url,name,game; "
+            f"where game = {selected_game_id}; limit 200;"
+        ),
+        timeout=settings.timeout_seconds,
+        enforce_igdb_rate_limit=True,
+    )
+    for row in external_payload if isinstance(external_payload, list) else []:
+        if not isinstance(row, dict):
+            continue
+        source_id = int(row.get("external_game_source") or 0)
+        store_name = _IGDB_SOURCE_TO_STORE.get(source_id, "")
+        if not store_name or store_name in store_ids:
+            continue
+        token = str(row.get("uid") or "").strip()
+        if not token:
+            token = _store_id_from_store_url(store_name, str(row.get("url") or ""))
+        if token:
+            store_ids[store_name] = token
+
+    websites_payload = _safe_post_json(
+        session,
+        f"{settings.igdb_api_base.rstrip('/')}/websites",
+        headers=headers,
+        body=(
+            "fields type,url,game; "
+            f"where game = {selected_game_id}; limit 200;"
+        ),
+        timeout=settings.timeout_seconds,
+        enforce_igdb_rate_limit=True,
+    )
+    for row in websites_payload if isinstance(websites_payload, list) else []:
+        if not isinstance(row, dict):
+            continue
+        type_id = int(row.get("type") or 0)
+        store_name = _IGDB_WEBSITE_TYPE_TO_STORE.get(type_id, "")
+        if not store_name or store_name in store_ids:
+            continue
+        token = _store_id_from_store_url(store_name, str(row.get("url") or ""))
+        if token:
+            store_ids[store_name] = token
+    return store_ids
 
 
 def search_icon_candidates(
@@ -527,10 +823,10 @@ def search_icon_candidates(
         )
     )
     if not candidates:
-        candidates.extend(_search_iconfinder(settings, game_name, cleaned_name))
-    # If SteamGridDB returns some but few/weak entries, augment with Iconfinder too.
+        candidates.extend(_search_igdb(settings, game_name, cleaned_name))
+    # If SteamGridDB returns some but few entries, augment with IGDB too.
     if len(candidates) < 6:
-        candidates.extend(_search_iconfinder(settings, game_name, cleaned_name))
+        candidates.extend(_search_igdb(settings, game_name, cleaned_name))
     # De-duplicate by image URL and sort by score.
     seen: set[str] = set()
     uniq: list[IconCandidate] = []
@@ -540,7 +836,13 @@ def search_icon_candidates(
             continue
         seen.add(key)
         uniq.append(c)
-    uniq.sort(key=_score_candidate, reverse=True)
+    uniq.sort(
+        key=lambda c: (
+            _provider_rank(c.provider),
+            -float(_score_candidate(c)),
+            str(c.title or "").casefold(),
+        )
+    )
     return uniq[:40]
 
 

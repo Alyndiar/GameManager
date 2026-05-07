@@ -9,3 +9,5 @@ venv/
 .DS_Store
 .gamemanager_data/
 IconTemplates/
+cache/
+work/

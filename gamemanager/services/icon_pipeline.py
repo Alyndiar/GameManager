@@ -61,6 +61,11 @@ _sync_template_sources()
 IconTemplate = _template_domain.IconTemplate
 TemplateAnalysis = _template_domain.TemplateAnalysis
 BorderShaderConfig = _template_domain.BorderShaderConfig
+BACKGROUND_FILL_MODE_OPTIONS = _template_domain.BACKGROUND_FILL_MODE_OPTIONS
+normalize_background_fill_mode = _template_domain.normalize_background_fill_mode
+build_background_fill_layer = _template_domain.build_background_fill_layer
+normalize_background_fill_params = _template_domain.normalize_background_fill_params
+default_background_fill_params = _template_domain.default_background_fill_params
 
 
 @dataclass(frozen=True, slots=True)
@@ -2477,6 +2482,8 @@ def _build_composited_icon(
     template: IconTemplate,
     foreground: Image.Image | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
+    background_fill_mode: str | None = None,
+    background_fill_params: dict[str, object] | None = None,
 ) -> Image.Image:
     _sync_template_sources()
     return _template_domain.build_composited_icon(
@@ -2485,6 +2492,8 @@ def _build_composited_icon(
         template,
         foreground=foreground,
         border_shader=border_shader,
+        background_fill_mode=background_fill_mode,
+        background_fill_params=background_fill_params,
     )
 
 
@@ -2560,6 +2569,8 @@ def build_multi_size_ico(
     bg_removal_params: dict[str, object] | None = None,
     text_preserve_config: TextPreserveConfig | dict[str, object] | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
+    background_fill_mode: str | None = None,
+    background_fill_params: dict[str, object] | None = None,
     size_improvements: dict[int, dict[str, object]] | None = None,
 ) -> bytes:
     template = resolve_icon_template(icon_style, circular_ring)
@@ -2569,6 +2580,8 @@ def build_multi_size_ico(
         text_preserve_config,
     )
     master = _build_master(image_bytes)
+    normalized_fill_mode = normalize_background_fill_mode(background_fill_mode)
+    normalized_fill_params = normalize_background_fill_params(background_fill_params)
     foreground = _escape_foreground_image(
         image_bytes,
         effective_engine,
@@ -2601,6 +2614,8 @@ def build_multi_size_ico(
             template,
             foreground=prepared_foreground,
             border_shader=border_shader,
+            background_fill_mode=normalized_fill_mode,
+            background_fill_params=normalized_fill_params,
         )
         frame = _normalize_silhouette(frame, int(size), normalized_size_improvements)
         frame = _apply_size_profile(frame, int(size), normalized_size_improvements)
@@ -2627,6 +2642,8 @@ def build_preview_png(
     bg_removal_params: dict[str, object] | None = None,
     text_preserve_config: TextPreserveConfig | dict[str, object] | None = None,
     border_shader: BorderShaderConfig | dict[str, object] | None = None,
+    background_fill_mode: str | None = None,
+    background_fill_params: dict[str, object] | None = None,
     size_improvements: dict[int, dict[str, object]] | None = None,
 ) -> bytes:
     template = resolve_icon_template(icon_style, circular_ring)
@@ -2636,6 +2653,8 @@ def build_preview_png(
         text_preserve_config,
     )
     master = _build_master(image_bytes)
+    normalized_fill_mode = normalize_background_fill_mode(background_fill_mode)
+    normalized_fill_params = normalize_background_fill_params(background_fill_params)
     foreground = _escape_foreground_image(
         image_bytes,
         effective_engine,
@@ -2660,6 +2679,8 @@ def build_preview_png(
             else None
         ),
         border_shader=border_shader,
+        background_fill_mode=normalized_fill_mode,
+        background_fill_params=normalized_fill_params,
     )
     image = _normalize_silhouette(image, size, normalized_size_improvements)
     image = _apply_size_profile(image, size, normalized_size_improvements)

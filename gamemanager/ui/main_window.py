@@ -10,11 +10,13 @@ import sys
 import threading
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QProcess, QRect, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QIcon, QKeyEvent, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeyEvent, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLayout,
     QLayoutItem,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QComboBox,
+    QMenu,
     QSlider,
     QSplitter,
     QTableWidget,
@@ -40,6 +43,12 @@ from gamemanager.models import InventoryItem, OperationReport, RootDisplayInfo
 from gamemanager.services.icon_cache import icon_cache_key
 from gamemanager.services.icon_sources import IconSearchSettings
 from gamemanager.services.background_removal import normalize_background_removal_engine
+from gamemanager.services.storefronts.priority import (
+    STORE_BADGE_COLORS,
+    STORE_SHORT_LABELS,
+    normalize_store_name,
+    sort_stores,
+)
 from gamemanager.services.teracopy import DEFAULT_TERACOPY_PATH, resolve_teracopy_path
 from gamemanager.ui.dialogs import (
     CleanupPreviewDialog,
@@ -50,6 +59,7 @@ from gamemanager.ui.dialogs import (
     IconProviderSettingsDialog,
     IconProviderSettingsResult,
     MovePreviewDialog,
+    StoreAccountsDialog,
     TagReviewDialog,
 )
 from gamemanager.ui.main_window_infotip_ops import MainWindowInfoTipOpsMixin
@@ -87,12 +97,21 @@ RIGHT_COLUMNS = [
     ("created_at", "Created"),
     ("size_bytes", "Size"),
     ("source", "Source"),
+    ("stores", "Stores"),
 ]
 
 RIGHT_VIEW_OPTIONS = {
     "List": "list",
     "Icons": "icons",
 }
+
+RIGHT_SORT_DIRECTION_OPTIONS = {
+    "Ascending": True,
+    "Descending": False,
+}
+RIGHT_STORE_FILTER_ALL = ""
+RIGHT_STORE_FILTER_ANY = "__any__"
+RIGHT_STORE_FILTER_NONE = "__none__"
 
 ICON_VIEW_SIZES = [16, 24, 32, 48, 64, 128, 256]
 ENABLE_ICON_PATH_REPAIR_ACTION = True
@@ -104,7 +123,23 @@ DEFAULT_RIGHT_SORT_CHAIN: list[tuple[str, bool]] = [
     ("created_at", False),
     ("size_bytes", False),
     ("source", True),
+    ("stores", True),
 ]
+
+RIGHT_COLUMN_LAYOUT_ORDER_PREF = "right_columns_order_v1"
+RIGHT_COLUMN_LAYOUT_HIDDEN_PREF = "right_columns_hidden_v1"
+RIGHT_COLUMN_LAYOUT_WIDTHS_PREF = "right_columns_widths_v1"
+STORE_BADGE_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets" / "store_badges"
+STORE_BADGE_ICON_FILES: dict[str, str] = {
+    "Steam": "steam.png",
+    "EGS": "egs.png",
+    "GOG": "gog.png",
+    "Itch.io": "itchio.png",
+    "Humble": "humble.png",
+    "Ubisoft": "ubisoft.png",
+    "Battle.net": "battlenet.png",
+    "Amazon Games": "amazon_games.png",
+}
 
 
 def _source_display_text(mode: str, source_label: str, drive_name: str) -> str:
@@ -387,6 +422,11 @@ class MainWindow(
         self._refresh_needed = False
         self._right_sort_column = _column_index_for_field("cleaned_name")
         self._right_sort_ascending = True
+        self._right_column_order_fields: list[str] = [field for field, _ in RIGHT_COLUMNS]
+        self._right_hidden_columns: set[int] = set()
+        self._right_column_widths: dict[int, int] = {}
+        self._right_column_layout_loaded = False
+        self._right_columns_autosized_once = False
         self._initial_split_applied = False
         self._show_only_duplicates = False
         self._visible_right_items: list[InventoryItem] = []
@@ -394,6 +434,7 @@ class MainWindow(
         self._loaded_entries_count = 0
         self._right_view_mode = "list"
         self._right_icon_size_index = ICON_VIEW_SIZES.index(64)
+        self._right_store_filter = ""
         self._teracopy_path_pref = DEFAULT_TERACOPY_PATH
         self._teracopy_executable: str | None = None
         self._teracopy_processes: dict[int, QProcess] = {}
@@ -425,8 +466,10 @@ class MainWindow(
         self._move_preview_dialog_cls = MovePreviewDialog
         self._icon_rebuild_preview_dialog_cls = IconRebuildPreviewDialog
         self._delete_group_dialog_cls = DeleteGroupDialog
+        self._store_accounts_dialog_cls = StoreAccountsDialog
         self._interactive_operation_active = False
         self._interactive_cancel_requested = False
+        self._sgdb_picker_flow_state: dict[str, object] | None = None
         self._ml_prewarm_started = False
         self._prewarm_in_progress = False
         self._prewarm_process: QProcess | None = None
@@ -445,6 +488,8 @@ class MainWindow(
         self._folder_icon_cache: dict[str, QIcon] = {}
         self._folder_icon_preview_cache: dict[str, QPixmap] = {}
         self._icon_placeholder_cache: dict[int, QIcon] = {}
+        self._store_badge_pixmap_cache: dict[tuple[str, int, int], QPixmap] = {}
+        self._store_logo_pixmap_cache: dict[tuple[str, int], QPixmap] = {}
         self._right_hovered_icon_row: int | None = None
         self._icon_converter_dialog: IconConverterDialog | None = None
         self._template_prep_dialog: TemplatePrepDialog | None = None
@@ -492,6 +537,7 @@ class MainWindow(
         self.repair_icon_paths_btn = QPushButton("Fix IcoPath")
         self.icon_settings_btn = QPushButton("Icon Src")
         self.perf_btn = QPushButton("Optns")
+        self.store_accounts_btn = QPushButton("Stores")
         self.move_backend_combo = QComboBox(self)
         self.move_backend_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
@@ -523,6 +569,7 @@ class MainWindow(
         )
         self.icon_settings_btn.setToolTip("Icon Provider Settings...\nShortcut: Alt+S")
         self.perf_btn.setToolTip("Options/Settings/Performance...\nShortcut: Alt+P")
+        self.store_accounts_btn.setToolTip("Storefront Accounts...\nShortcut: Alt+K")
         self.locate_teracopy_btn.setToolTip("Locate TeraCopy\nShortcut: Alt+L")
 
         compact_controls = [
@@ -543,6 +590,7 @@ class MainWindow(
             self.rebuild_icons_btn,
             self.icon_settings_btn,
             self.perf_btn,
+            self.store_accounts_btn,
             self.move_backend_label,
             self.move_backend_combo,
             self.locate_teracopy_btn,
@@ -595,6 +643,7 @@ class MainWindow(
             icon_group_widgets.append(self.repair_icon_paths_btn)
         icon_group_widgets.append(self.icon_settings_btn)
         icon_group_widgets.append(self.perf_btn)
+        icon_group_widgets.append(self.store_accounts_btn)
 
         top_groups = [
             _build_top_group(
@@ -691,6 +740,19 @@ class MainWindow(
         self.right_view_combo = QComboBox(right_panel)
         self.right_view_combo.addItems(RIGHT_VIEW_OPTIONS.keys())
         right_controls.addWidget(self.right_view_combo)
+        right_controls.addWidget(QLabel("Sort:"))
+        self.right_sort_combo = QComboBox(right_panel)
+        for idx, (_field, label) in enumerate(self._right_columns):
+            self.right_sort_combo.addItem(label, idx)
+        right_controls.addWidget(self.right_sort_combo)
+        right_controls.addWidget(QLabel("Order:"))
+        self.right_sort_order_combo = QComboBox(right_panel)
+        for label, value in RIGHT_SORT_DIRECTION_OPTIONS.items():
+            self.right_sort_order_combo.addItem(label, value)
+        right_controls.addWidget(self.right_sort_order_combo)
+        right_controls.addWidget(QLabel("Store:"))
+        self.right_store_filter_combo = QComboBox(right_panel)
+        right_controls.addWidget(self.right_store_filter_combo)
         right_controls.addWidget(QLabel("Icon size:"))
         self.right_icon_size_slider = QSlider(Qt.Orientation.Horizontal, right_panel)
         self.right_icon_size_slider.setMinimum(0)
@@ -708,8 +770,12 @@ class MainWindow(
         self.right_table = QTableWidget(0, len(RIGHT_COLUMNS), right_panel)
         self._update_right_headers()
         self.right_table.verticalHeader().setVisible(False)
-        self.right_table.horizontalHeader().setStretchLastSection(True)
-        self.right_table.horizontalHeader().setSectionsClickable(True)
+        right_header = self.right_table.horizontalHeader()
+        right_header.setStretchLastSection(False)
+        right_header.setSectionsClickable(True)
+        right_header.setSectionsMovable(True)
+        right_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        right_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.right_table.setWordWrap(True)
         self.right_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.right_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
@@ -847,18 +913,30 @@ class MainWindow(
             self.repair_icon_paths_btn.clicked.connect(self._on_repair_absolute_icon_paths)
         self.icon_settings_btn.clicked.connect(self._on_icon_provider_settings)
         self.perf_btn.clicked.connect(self._on_open_performance_settings)
+        self.store_accounts_btn.clicked.connect(self._on_store_accounts)
         self.move_backend_combo.currentTextChanged.connect(self._on_move_backend_changed)
         self.locate_teracopy_btn.clicked.connect(self._on_locate_teracopy)
         self.left_sort_combo.currentTextChanged.connect(self._on_left_pref_changed)
         self.left_label_combo.currentTextChanged.connect(self._on_left_pref_changed)
         self.left_filter_edit.textChanged.connect(self._on_left_filter_changed)
         self.right_view_combo.currentTextChanged.connect(self._on_right_view_changed)
+        self.right_sort_combo.currentIndexChanged.connect(self._on_right_sort_controls_changed)
+        self.right_sort_order_combo.currentIndexChanged.connect(self._on_right_sort_controls_changed)
+        self.right_store_filter_combo.currentIndexChanged.connect(self._on_right_store_filter_changed)
         self.right_icon_size_slider.valueChanged.connect(self._on_right_icon_size_changed)
         self.left_table.itemSelectionChanged.connect(self._on_left_selection_changed)
         self.left_table.viewport().installEventFilter(self)
         self.right_table.viewport().installEventFilter(self)
-        self.right_table.horizontalHeader().sectionClicked.connect(
-            self._on_right_header_clicked
+        self.right_icon_list.viewport().installEventFilter(self)
+        right_header = self.right_table.horizontalHeader()
+        right_header.sectionClicked.connect(self._on_right_header_clicked)
+        right_header.sectionMoved.connect(self._on_right_header_section_moved)
+        right_header.sectionResized.connect(self._on_right_header_section_resized)
+        right_header.sectionHandleDoubleClicked.connect(
+            self._on_right_header_handle_double_clicked
+        )
+        right_header.customContextMenuRequested.connect(
+            self._on_right_header_context_menu
         )
         self.right_table.itemDoubleClicked.connect(self._on_right_item_double_clicked)
         self.right_table.customContextMenuRequested.connect(self._on_right_context_menu)
@@ -905,6 +983,7 @@ class MainWindow(
             ("Upload Missing Icons to SteamGridDB", "Ctrl+Shift+Y", self._on_upload_missing_icons_to_steamgriddb_selected),
             ("Icon Provider Settings", "Alt+S", self._on_icon_provider_settings),
             ("Performance Settings", "Alt+P", self._on_open_performance_settings),
+            ("Storefront Accounts", "Alt+K", self._on_store_accounts),
             ("Locate TeraCopy", "Alt+L", self._on_locate_teracopy),
             ("Refresh InfoTip", "Alt+I", self._on_refresh_selected_infotips),
             ("Manual InfoTip Entry", "Alt+E", self._on_edit_selected_infotip),
@@ -960,6 +1039,7 @@ class MainWindow(
             "Ctrl+Shift+G - Find Tags",
             "Alt+S - Icon Provider Settings",
             "Alt+P - Performance Settings",
+            "Alt+K - Storefront Accounts",
             "Alt+L - Locate TeraCopy",
             "Ctrl+F - Focus Cleaned-Name Filter",
             "F1 - Show Shortcuts",
@@ -968,11 +1048,40 @@ class MainWindow(
             lines.insert(-4, "Alt+X - Repair Icon Paths")
         QMessageBox.information(self, "Shortcuts", "\n".join(lines))
 
+    def _success_popups_enabled(self) -> bool:
+        raw = str(self.state.get_ui_pref("show_success_popups", "1") or "").strip().casefold()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _set_success_popups_enabled(self, enabled: bool) -> None:
+        self.state.set_ui_pref("show_success_popups", "1" if enabled else "0")
+
+    def _show_success_popup(self, title: str, message: str) -> None:
+        if not self._success_popups_enabled():
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle(str(title or "").strip() or "Operation Complete")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(str(message or "").strip())
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dont_show = QCheckBox("Don't show success confirmations again", box)
+        box.setCheckBox(dont_show)
+        box.exec()
+        if dont_show.isChecked():
+            self._set_success_popups_enabled(False)
+
+    @staticmethod
+    def _normalize_right_store_filter_value(value: str) -> str:
+        token = str(value or "").strip()
+        if token in {RIGHT_STORE_FILTER_ALL, RIGHT_STORE_FILTER_ANY, RIGHT_STORE_FILTER_NONE}:
+            return token
+        return normalize_store_name(token)
+
     def _load_prefs(self) -> None:
         sort_pref = self.state.get_ui_pref("left_sort", "source_label")
         label_pref = self.state.get_ui_pref("left_label_mode", "source")
         right_view_pref = self.state.get_ui_pref("right_view_mode", "list")
         right_icon_size_pref = self.state.get_ui_pref("right_icon_size", "64")
+        right_store_filter_pref = self.state.get_ui_pref("right_store_filter", "")
         move_backend_pref = self.state.get_ui_pref("move_backend", "system")
         self._teracopy_path_pref = self.state.get_ui_pref(
             "teracopy_path", DEFAULT_TERACOPY_PATH
@@ -998,13 +1107,20 @@ class MainWindow(
                 self._right_icon_size_index = ICON_VIEW_SIZES.index(pref_px)
         except ValueError:
             pass
+        self._right_store_filter = self._normalize_right_store_filter_value(
+            right_store_filter_pref
+        )
         for text, value in RIGHT_VIEW_OPTIONS.items():
             if value == self._right_view_mode:
                 self.right_view_combo.setCurrentText(text)
                 break
+        self._populate_right_store_filter_options()
         self.right_icon_size_slider.setValue(self._right_icon_size_index)
+        self._load_right_column_layout_prefs()
+        self._apply_right_column_layout()
         self._apply_right_view_mode_ui()
         self._apply_right_icon_size_ui()
+        self._sync_right_sort_controls()
         self._teracopy_executable = resolve_teracopy_path(self._teracopy_path_pref)
         self._update_move_backend_ui()
 
@@ -1135,6 +1251,77 @@ class MainWindow(
             self._populate_right(self.inventory)
             self._restore_right_icon_selection(selected_paths, anchor_path)
 
+    def _sync_right_sort_controls(self) -> None:
+        if not hasattr(self, "right_sort_combo") or not hasattr(self, "right_sort_order_combo"):
+            return
+        blocked_sort = self.right_sort_combo.blockSignals(True)
+        blocked_order = self.right_sort_order_combo.blockSignals(True)
+        try:
+            sort_idx = self.right_sort_combo.findData(self._right_sort_column)
+            if sort_idx >= 0:
+                self.right_sort_combo.setCurrentIndex(sort_idx)
+            order_idx = self.right_sort_order_combo.findData(bool(self._right_sort_ascending))
+            if order_idx >= 0:
+                self.right_sort_order_combo.setCurrentIndex(order_idx)
+        finally:
+            self.right_sort_combo.blockSignals(blocked_sort)
+            self.right_sort_order_combo.blockSignals(blocked_order)
+
+    def _on_right_sort_controls_changed(self, _index: int) -> None:
+        sort_data = self.right_sort_combo.currentData()
+        order_data = self.right_sort_order_combo.currentData()
+        try:
+            sort_column = int(sort_data)
+        except Exception:
+            return
+        ascending = bool(order_data)
+        if sort_column < 0 or sort_column >= len(self._right_columns):
+            return
+        if sort_column == self._right_sort_column and ascending == self._right_sort_ascending:
+            return
+        self._right_sort_column = sort_column
+        self._right_sort_ascending = ascending
+        self._update_right_headers()
+        self._populate_right(self.inventory)
+
+    def _populate_right_store_filter_options(self) -> None:
+        blocked = self.right_store_filter_combo.blockSignals(True)
+        try:
+            self.right_store_filter_combo.clear()
+            self.right_store_filter_combo.addItem("All", RIGHT_STORE_FILTER_ALL)
+            self.right_store_filter_combo.addItem("Any", RIGHT_STORE_FILTER_ANY)
+            self.right_store_filter_combo.addItem("None", RIGHT_STORE_FILTER_NONE)
+            seen: set[str] = set()
+            for store_name in self.state.available_store_names():
+                canonical = normalize_store_name(store_name)
+                if not canonical:
+                    continue
+                key = canonical.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.right_store_filter_combo.addItem(canonical, canonical)
+            selected = self._normalize_right_store_filter_value(self._right_store_filter)
+            idx = self.right_store_filter_combo.findData(selected)
+            if idx < 0:
+                idx = 0
+            self.right_store_filter_combo.setCurrentIndex(idx)
+            self._right_store_filter = self._normalize_right_store_filter_value(
+                str(self.right_store_filter_combo.currentData() or "")
+            )
+        finally:
+            self.right_store_filter_combo.blockSignals(blocked)
+
+    def _on_right_store_filter_changed(self, _index: int) -> None:
+        selected = self._normalize_right_store_filter_value(
+            str(self.right_store_filter_combo.currentData() or "")
+        )
+        if selected == self._right_store_filter:
+            return
+        self._right_store_filter = selected
+        self.state.set_ui_pref("right_store_filter", self._right_store_filter)
+        self._populate_right(self.inventory)
+
     def _apply_right_view_mode_ui(self) -> None:
         icon_mode = self._right_view_mode == "icons"
         self.right_table.setVisible(not icon_mode)
@@ -1145,10 +1332,219 @@ class MainWindow(
     def _apply_right_icon_size_ui(self) -> None:
         px = ICON_VIEW_SIZES[self._right_icon_size_index]
         self.right_icon_size_label.setText(f"{px}px")
-        self.right_icon_list.setIconSize(QSize(px, px))
-        grid_w = max(110, px + 52)
+        icon_w = px if px >= 48 else px + 16
+        self.right_icon_list.setIconSize(QSize(icon_w, px))
+        grid_w = max(110, icon_w + 52)
         grid_h = px + 52
         self.right_icon_list.setGridSize(QSize(grid_w, grid_h))
+
+    def _right_column_index_by_field(self, field_name: str) -> int:
+        for idx, (field, _label) in enumerate(self._right_columns):
+            if field == field_name:
+                return idx
+        return -1
+
+    def _right_column_field_by_index(self, index: int) -> str:
+        if 0 <= index < len(self._right_columns):
+            return self._right_columns[index][0]
+        return ""
+
+    def _load_right_column_layout_prefs(self) -> None:
+        default_order = [field for field, _label in self._right_columns]
+        order_raw = self.state.get_ui_pref(
+            RIGHT_COLUMN_LAYOUT_ORDER_PREF,
+            "",
+        ).strip()
+        hidden_raw = self.state.get_ui_pref(
+            RIGHT_COLUMN_LAYOUT_HIDDEN_PREF,
+            "",
+        ).strip()
+        widths_raw = self.state.get_ui_pref(
+            RIGHT_COLUMN_LAYOUT_WIDTHS_PREF,
+            "",
+        ).strip()
+
+        order_fields: list[str] = []
+        if order_raw:
+            try:
+                loaded = json.loads(order_raw)
+            except json.JSONDecodeError:
+                loaded = []
+            if isinstance(loaded, list):
+                seen: set[str] = set()
+                for token in loaded:
+                    field = str(token or "").strip()
+                    if field in default_order and field not in seen:
+                        seen.add(field)
+                        order_fields.append(field)
+        for field in default_order:
+            if field not in order_fields:
+                order_fields.append(field)
+        self._right_column_order_fields = order_fields
+
+        hidden_indexes: set[int] = set()
+        if hidden_raw:
+            try:
+                loaded_hidden = json.loads(hidden_raw)
+            except json.JSONDecodeError:
+                loaded_hidden = []
+            if isinstance(loaded_hidden, list):
+                for token in loaded_hidden:
+                    idx = self._right_column_index_by_field(str(token or "").strip())
+                    if idx > 0:
+                        hidden_indexes.add(idx)
+        self._right_hidden_columns = hidden_indexes
+
+        widths: dict[int, int] = {}
+        if widths_raw:
+            try:
+                loaded_widths = json.loads(widths_raw)
+            except json.JSONDecodeError:
+                loaded_widths = {}
+            if isinstance(loaded_widths, dict):
+                for key, value in loaded_widths.items():
+                    idx = self._right_column_index_by_field(str(key or "").strip())
+                    if idx < 0:
+                        continue
+                    try:
+                        width = int(value)
+                    except Exception:
+                        continue
+                    if width >= 24:
+                        widths[idx] = width
+        self._right_column_widths = widths
+        self._right_column_layout_loaded = True
+
+    def _visible_right_columns_count(self) -> int:
+        visible = 0
+        for idx in range(len(self._right_columns)):
+            if not self.right_table.isColumnHidden(idx):
+                visible += 1
+        return visible
+
+    def _save_right_column_layout_prefs(self) -> None:
+        if not self._right_column_layout_loaded:
+            return
+        header = self.right_table.horizontalHeader()
+        order_fields: list[str] = []
+        for visual_idx in range(header.count()):
+            logical = header.logicalIndex(visual_idx)
+            field = self._right_column_field_by_index(logical)
+            if field:
+                order_fields.append(field)
+        hidden_fields = [
+            self._right_column_field_by_index(idx)
+            for idx in range(len(self._right_columns))
+            if self.right_table.isColumnHidden(idx) and idx != 0
+        ]
+        widths = {
+            self._right_column_field_by_index(idx): int(self.right_table.columnWidth(idx))
+            for idx in range(len(self._right_columns))
+            if self.right_table.columnWidth(idx) >= 24
+        }
+        self.state.set_ui_pref(
+            RIGHT_COLUMN_LAYOUT_ORDER_PREF,
+            json.dumps(order_fields, ensure_ascii=False),
+        )
+        self.state.set_ui_pref(
+            RIGHT_COLUMN_LAYOUT_HIDDEN_PREF,
+            json.dumps([field for field in hidden_fields if field], ensure_ascii=False),
+        )
+        self.state.set_ui_pref(
+            RIGHT_COLUMN_LAYOUT_WIDTHS_PREF,
+            json.dumps(widths, ensure_ascii=False),
+        )
+
+    def _apply_right_column_layout(self) -> None:
+        header = self.right_table.horizontalHeader()
+        blocked = header.blockSignals(True)
+        try:
+            ordered_logicals = [
+                self._right_column_index_by_field(field)
+                for field in self._right_column_order_fields
+            ]
+            ordered_logicals = [idx for idx in ordered_logicals if idx >= 0]
+            for visual_idx, logical in enumerate(ordered_logicals):
+                current_visual = header.visualIndex(logical)
+                if current_visual >= 0 and current_visual != visual_idx:
+                    header.moveSection(current_visual, visual_idx)
+            for idx in range(len(self._right_columns)):
+                hide = idx in self._right_hidden_columns and idx != 0
+                self.right_table.setColumnHidden(idx, hide)
+            for idx, width in self._right_column_widths.items():
+                if 0 <= idx < len(self._right_columns):
+                    self.right_table.setColumnWidth(idx, max(24, int(width)))
+        finally:
+            header.blockSignals(blocked)
+        self._save_right_column_layout_prefs()
+
+    def _toggle_right_column_visibility(self, logical_index: int, visible: bool) -> bool:
+        if logical_index <= 0:
+            self.right_table.setColumnHidden(0, False)
+            return False
+        if not visible and self._visible_right_columns_count() <= 1:
+            return False
+        self.right_table.setColumnHidden(logical_index, not visible)
+        self._save_right_column_layout_prefs()
+        return True
+
+    def _on_right_header_context_menu(self, pos: QPoint) -> None:
+        header = self.right_table.horizontalHeader()
+        menu = QMenu(header)
+        for idx, (_field, label) in enumerate(self._right_columns):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not self.right_table.isColumnHidden(idx))
+            if idx == 0:
+                action.setEnabled(False)
+                action.setToolTip("Name column is always visible.")
+                continue
+            action.triggered.connect(
+                lambda checked, logical_idx=idx: self._toggle_right_column_visibility(
+                    logical_idx, checked
+                )
+            )
+        menu.addSeparator()
+        reset_action = menu.addAction("Reset Columns Layout")
+        reset_action.triggered.connect(self._on_reset_right_columns_layout)
+        menu.exec(header.mapToGlobal(pos))
+
+    def _on_right_header_section_moved(
+        self,
+        _logical_index: int,
+        _old_visual_index: int,
+        _new_visual_index: int,
+    ) -> None:
+        self._save_right_column_layout_prefs()
+
+    def _on_right_header_section_resized(
+        self,
+        logical_index: int,
+        _old_size: int,
+        new_size: int,
+    ) -> None:
+        if logical_index < 0 or logical_index >= len(self._right_columns):
+            return
+        if new_size < 24:
+            return
+        self._right_column_widths[logical_index] = int(new_size)
+        self._save_right_column_layout_prefs()
+
+    def _on_right_header_handle_double_clicked(self, logical_index: int) -> None:
+        if logical_index < 0 or logical_index >= len(self._right_columns):
+            return
+        self.right_table.resizeColumnToContents(logical_index)
+        width = max(24, int(self.right_table.columnWidth(logical_index)))
+        self._right_column_widths[logical_index] = width
+        self._save_right_column_layout_prefs()
+
+    def _on_reset_right_columns_layout(self) -> None:
+        self._right_column_order_fields = [field for field, _label in self._right_columns]
+        self._right_hidden_columns = set()
+        self._right_column_widths = {}
+        self._right_columns_autosized_once = False
+        self._apply_right_column_layout()
+        self._populate_right(self.inventory)
 
     def _current_move_backend(self) -> str:
         return MOVE_BACKEND_OPTIONS.get(self.move_backend_combo.currentText(), "system")
@@ -1209,6 +1605,7 @@ class MainWindow(
     def _on_reset_right_sort(self) -> None:
         self._right_sort_column = _column_index_for_field("cleaned_name")
         self._right_sort_ascending = True
+        self._sync_right_sort_controls()
         self._update_right_headers()
         self._populate_right(self.inventory)
 
@@ -1302,6 +1699,23 @@ class MainWindow(
             if event.type() == QEvent.Type.MouseButtonPress:
                 if event.button() == Qt.MouseButton.LeftButton:
                     index = self.right_table.indexAt(event.pos())
+                    stores_col = self._right_column_index_by_field("stores")
+                    if index.isValid() and index.column() == stores_col:
+                        row = index.row()
+                        if 0 <= row < len(self._visible_right_items):
+                            entry = self._visible_right_items[row]
+                            cell_rect = self.right_table.visualRect(index)
+                            local_x = event.pos().x() - cell_rect.left() - 4
+                            badge_size = self._stores_badge_size_for_table_row()
+                            spacing = self._stores_badge_spacing_for_size(badge_size)
+                            store = self._store_from_strip_click(
+                                list(entry.owned_stores or []),
+                                local_x=local_x,
+                                badge_size=badge_size,
+                                spacing=spacing,
+                            )
+                            if store and self._open_store_page_for_entry(entry, store):
+                                return True
                     if index.isValid() and index.column() == 0:
                         row = index.row()
                         if 0 <= row < len(self._visible_right_items):
@@ -1337,6 +1751,33 @@ class MainWindow(
                 QEvent.Type.Wheel,
             ):
                 self._hide_right_icon_hover_preview()
+        if watched is self.right_icon_list.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    index = self.right_icon_list.indexAt(event.pos())
+                    if index.isValid() and 0 <= index.row() < len(self._visible_right_items):
+                        row = index.row()
+                        entry = self._visible_right_items[row]
+                        primary = normalize_store_name(entry.primary_store or "")
+                        if primary:
+                            item_rect = self.right_icon_list.visualRect(index)
+                            icon_px = self._icon_view_sizes[self._right_icon_size_index]
+                            icon_w = icon_px if icon_px >= 48 else icon_px + 16
+                            icon_left = item_rect.left() + max(0, (item_rect.width() - icon_w) // 2)
+                            icon_top = item_rect.top() + 4
+                            if icon_px < 48:
+                                badge_rect = QRect(icon_left + icon_w - 16, icon_top, 16, 16)
+                            else:
+                                badge_px = max(16, min(32, int(round(icon_px / 4.0))))
+                                badge_rect = QRect(
+                                    icon_left + icon_px - badge_px,
+                                    icon_top,
+                                    badge_px,
+                                    badge_px,
+                                )
+                            if badge_rect.contains(event.pos()):
+                                if self._open_store_page_for_entry(entry, primary):
+                                    return True
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -1372,19 +1813,20 @@ class MainWindow(
         self._update_counts_status()
 
     def _on_right_header_clicked(self, column: int) -> None:
-        if column < 0 or column >= len(RIGHT_COLUMNS):
+        if column < 0 or column >= len(self._right_columns):
             return
         if column == self._right_sort_column:
             self._right_sort_ascending = not self._right_sort_ascending
         else:
             self._right_sort_column = column
             self._right_sort_ascending = True
+        self._sync_right_sort_controls()
         self._update_right_headers()
         self._populate_right(self.inventory)
 
     def _update_right_headers(self) -> None:
         headers: list[str] = []
-        for idx, (_, label) in enumerate(RIGHT_COLUMNS):
+        for idx, (_field, label) in enumerate(self._right_columns):
             if idx == self._right_sort_column:
                 arrow = "↑" if self._right_sort_ascending else "↓"
                 headers.append(f"{label} {arrow}")
@@ -1398,9 +1840,10 @@ class MainWindow(
             steamgriddb_enabled=current.steamgriddb_enabled,
             steamgriddb_api_key=current.steamgriddb_api_key,
             steamgriddb_api_base=current.steamgriddb_api_base,
-            iconfinder_enabled=current.iconfinder_enabled,
-            iconfinder_api_key=current.iconfinder_api_key,
-            iconfinder_api_base=current.iconfinder_api_base,
+            igdb_enabled=current.igdb_enabled,
+            igdb_client_id=current.igdb_client_id,
+            igdb_client_secret=current.igdb_client_secret,
+            igdb_api_base=current.igdb_api_base,
         )
         dialog = IconProviderSettingsDialog(
             initial=initial,
@@ -1414,9 +1857,10 @@ class MainWindow(
             steamgriddb_enabled=payload.steamgriddb_enabled,
             steamgriddb_api_key=payload.steamgriddb_api_key,
             steamgriddb_api_base=payload.steamgriddb_api_base,
-            iconfinder_enabled=payload.iconfinder_enabled,
-            iconfinder_api_key=payload.iconfinder_api_key,
-            iconfinder_api_base=payload.iconfinder_api_base,
+            igdb_enabled=payload.igdb_enabled,
+            igdb_client_id=payload.igdb_client_id,
+            igdb_client_secret=payload.igdb_client_secret,
+            igdb_api_base=payload.igdb_api_base,
         )
         try:
             self.state.save_icon_search_settings(settings)
@@ -1448,6 +1892,7 @@ class MainWindow(
             startup_prewarm_mode=self.state.get_ui_pref(
                 "perf_startup_prewarm_mode", "minimal"
             ),
+            success_popups_enabled=self._success_popups_enabled(),
             web_capture_download_mode=self._load_web_capture_download_mode_pref(),
             web_capture_download_dir=self._load_web_capture_download_dir_pref(),
             icon_rebuild_create_backups=self.state.get_ui_pref(
@@ -1473,6 +1918,7 @@ class MainWindow(
         self.state.set_ui_pref("perf_dir_cache_enabled", "1" if payload.dir_cache_enabled else "0")
         self.state.set_ui_pref("perf_dir_cache_max_entries", str(payload.dir_cache_max_entries))
         self.state.set_ui_pref("perf_startup_prewarm_mode", payload.startup_prewarm_mode)
+        self._set_success_popups_enabled(bool(payload.success_popups_enabled))
         self._save_web_capture_download_mode_pref(payload.web_capture_download_mode)
         self._save_web_capture_download_dir_pref(payload.web_capture_download_dir)
         self.state.set_ui_pref(
@@ -1484,12 +1930,19 @@ class MainWindow(
             "icon_rebuild_mode",
             mode if mode in {"guided", "automatic"} else "guided",
         )
-        QMessageBox.information(
-            self,
+        self._show_success_popup(
             "Performance Settings",
             "Settings saved. Scan/cache settings apply on next refresh/operation. "
             "Startup preload mode applies on next app startup.",
         )
+
+    def _on_store_accounts(self) -> None:
+        dialog = self._store_accounts_dialog_cls(
+            self.state,
+            after_sync_callback=self.refresh_all,
+            parent=self,
+        )
+        dialog.exec()
 
     def _on_clean_backup_icons_from_options(self) -> None:
         decision = QMessageBox.question(
@@ -1513,18 +1966,25 @@ class MainWindow(
         if report.details:
             lines.append("")
             lines.extend(report.details[:12])
-        QMessageBox.information(self, "Clean Backup Icons", "\n".join(lines))
+        if int(report.failed) > 0:
+            QMessageBox.warning(self, "Clean Backup Icons", "\n".join(lines))
+            return
+        self._show_success_popup("Clean Backup Icons", "\n".join(lines))
 
     def _test_icon_provider_settings(self, payload: IconProviderSettingsResult) -> str:
         settings = IconSearchSettings(
             steamgriddb_enabled=payload.steamgriddb_enabled,
             steamgriddb_api_key=payload.steamgriddb_api_key,
             steamgriddb_api_base=payload.steamgriddb_api_base,
-            iconfinder_enabled=payload.iconfinder_enabled,
-            iconfinder_api_key=payload.iconfinder_api_key,
-            iconfinder_api_base=payload.iconfinder_api_base,
+            igdb_enabled=payload.igdb_enabled,
+            igdb_client_id=payload.igdb_client_id,
+            igdb_client_secret=payload.igdb_client_secret,
+            igdb_api_base=payload.igdb_api_base,
         )
-        return self.state.test_icon_search_settings(settings)
+        return self._run_ui_pumped_call(
+            "Test icon providers",
+            lambda: self.state.test_icon_search_settings(settings),
+        )
 
     def _icon_for_entry(self, entry: InventoryItem) -> QIcon:
         if entry.is_dir and entry.icon_status == "valid" and entry.folder_icon_path:
@@ -1539,6 +1999,192 @@ class MainWindow(
             self._folder_icon_cache[cache_key] = icon
             return icon
         return self._blank_icon
+
+    def _store_badge_pixmap(
+        self,
+        store_name: str,
+        size_px: int,
+        *,
+        opacity_percent: int = 100,
+    ) -> QPixmap:
+        canonical = normalize_store_name(store_name)
+        key = (canonical, int(size_px), int(opacity_percent))
+        cached = self._store_badge_pixmap_cache.get(key)
+        if cached is not None:
+            return cached
+        size = max(8, int(size_px))
+        logo_name = STORE_BADGE_ICON_FILES.get(canonical, "")
+        logo_path = STORE_BADGE_ASSETS_DIR / logo_name if logo_name else Path("")
+        logo_pix: QPixmap | None = None
+        if logo_name and logo_path.is_file():
+            logo_key = (canonical, size)
+            cached_logo = self._store_logo_pixmap_cache.get(logo_key)
+            if cached_logo is not None:
+                logo_pix = cached_logo
+            else:
+                loaded = QPixmap(str(logo_path))
+                if not loaded.isNull():
+                    logo_px = max(8, size - 2)
+                    scaled = loaded.scaled(
+                        logo_px,
+                        logo_px,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    if not scaled.isNull():
+                        self._store_logo_pixmap_cache[logo_key] = scaled
+                        logo_pix = scaled
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setOpacity(max(0.0, min(1.0, opacity_percent / 100.0)))
+            if logo_pix is not None and not logo_pix.isNull():
+                x = (size - logo_pix.width()) // 2
+                y = (size - logo_pix.height()) // 2
+                painter.drawPixmap(x, y, logo_pix)
+                self._store_badge_pixmap_cache[key] = pix
+                return pix
+            color = QColor(STORE_BADGE_COLORS.get(canonical, "#404040"))
+            painter.setBrush(color)
+            painter.setPen(QPen(QColor("#111111"), 1))
+            painter.drawRoundedRect(0, 0, size - 1, size - 1, 3, 3)
+            label = STORE_SHORT_LABELS.get(canonical, canonical[:1].upper() if canonical else "?")
+            font = QFont()
+            font.setBold(True)
+            font.setPixelSize(max(8, int(size * 0.52)))
+            painter.setFont(font)
+            painter.setPen(QColor("#F0F0F0"))
+            painter.drawText(
+                QRect(0, 0, size, size),
+                int(Qt.AlignmentFlag.AlignCenter),
+                label,
+            )
+        finally:
+            painter.end()
+        self._store_badge_pixmap_cache[key] = pix
+        return pix
+
+    @staticmethod
+    def _stores_strip_required_width(
+        store_count: int,
+        *,
+        badge_size: int = 16,
+        spacing: int = 2,
+    ) -> int:
+        count = max(0, int(store_count))
+        size = max(10, int(badge_size))
+        if count <= 0:
+            return 40
+        return 8 + (count * size) + (max(0, count - 1) * spacing) + 8
+
+    def _stores_badge_size_for_table_row(self) -> int:
+        row_h = int(self.right_table.verticalHeader().defaultSectionSize())
+        if self.right_table.rowCount() > 0:
+            row_h = max(row_h, int(self.right_table.rowHeight(0)))
+        size = max(12, row_h - 4)
+        return size
+
+    @staticmethod
+    def _stores_badge_spacing_for_size(badge_size: int) -> int:
+        return max(2, int(badge_size) // 8)
+
+    def _stores_strip_widget(
+        self,
+        stores: list[str],
+        *,
+        badge_size: int = 16,
+        spacing: int = 2,
+    ) -> QWidget:
+        ordered = sort_stores(list(stores or []))
+        size = max(10, int(badge_size))
+        container = QWidget(self.right_table)
+        container.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(max(0, int(spacing)))
+        if not ordered:
+            layout.addStretch(1)
+            return container
+        for store in ordered:
+            label = QLabel(container)
+            label.setFixedSize(size, size)
+            label.setPixmap(self._store_badge_pixmap(store, size, opacity_percent=100))
+            label.setScaledContents(False)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            layout.addWidget(label, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addStretch(1)
+        return container
+
+    def _stores_strip_icon(self, stores: list[str], *, badge_size: int = 16) -> QIcon:
+        ordered = sort_stores(list(stores or []))
+        if not ordered:
+            return self._blank_icon
+        size = max(10, int(badge_size))
+        spacing = 2
+        width = (len(ordered) * size) + (max(0, len(ordered) - 1) * spacing)
+        pix = QPixmap(width, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        try:
+            x = 0
+            for store in ordered:
+                badge = self._store_badge_pixmap(store, size, opacity_percent=100)
+                painter.drawPixmap(x, 0, badge)
+                x += size + spacing
+        finally:
+            painter.end()
+        return QIcon(pix)
+
+    def _icon_with_primary_store_badge(
+        self,
+        entry: InventoryItem,
+        base_icon: QIcon,
+        icon_px: int,
+    ) -> QIcon:
+        primary = normalize_store_name(entry.primary_store or "")
+        if not primary:
+            return base_icon
+        if icon_px < 48:
+            canvas_w = icon_px + 16
+            canvas_h = icon_px
+            base_pix = base_icon.pixmap(icon_px, icon_px)
+            if base_pix.isNull():
+                base_pix = self._icon_placeholder(icon_px).pixmap(icon_px, icon_px)
+            if base_pix.isNull():
+                return base_icon
+            badge_px = 16
+            badge = self._store_badge_pixmap(primary, badge_px, opacity_percent=100)
+            out = QPixmap(canvas_w, canvas_h)
+            out.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(out)
+            try:
+                painter.drawPixmap(0, 0, base_pix)
+                badge_x = canvas_w - badge_px
+                painter.drawPixmap(badge_x, 0, badge)
+            finally:
+                painter.end()
+            return QIcon(out)
+
+        base_pix = base_icon.pixmap(icon_px, icon_px)
+        if base_pix.isNull():
+            base_pix = self._icon_placeholder(icon_px).pixmap(icon_px, icon_px)
+        if base_pix.isNull():
+            return base_icon
+        badge_px = max(16, min(32, int(round(icon_px / 4.0))))
+        badge = self._store_badge_pixmap(primary, badge_px, opacity_percent=66)
+        out = QPixmap(icon_px, icon_px)
+        out.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(out)
+        try:
+            painter.drawPixmap(0, 0, base_pix)
+            badge_x = max(0, icon_px - badge_px)
+            painter.drawPixmap(badge_x, 0, badge)
+        finally:
+            painter.end()
+        return QIcon(out)
 
     def _icon_placeholder(self, size_px: int) -> QIcon:
         cached = self._icon_placeholder_cache.get(size_px)
@@ -1760,7 +2406,10 @@ class MainWindow(
             if report.details:
                 lines.append("")
                 lines.extend(report.details[:8])
-            QMessageBox.information(self, "Cleanup Result", "\n".join(lines))
+            if int(report.failed) > 0 or int(conflict_count) > 0:
+                QMessageBox.warning(self, "Cleanup Result", "\n".join(lines))
+            else:
+                self._show_success_popup("Cleanup Result", "\n".join(lines))
             self.refresh_all()
 
         self._start_report_operation("Cleanup names", _run, _done)

@@ -104,6 +104,16 @@ class PerformanceSettingsDialog(QDialog):
         rebuild_mode_row.addStretch(1)
         layout.addLayout(rebuild_mode_row)
 
+        popup_row = QHBoxLayout()
+        self.success_popups_enabled = QCheckBox(
+            "Show success confirmation popups",
+            self,
+        )
+        self.success_popups_enabled.setChecked(bool(initial.success_popups_enabled))
+        popup_row.addWidget(self.success_popups_enabled)
+        popup_row.addStretch(1)
+        layout.addLayout(popup_row)
+
         max_row = QHBoxLayout()
         max_row.addWidget(QLabel("Cache max entries:", self))
         self.cache_max_spin = QSpinBox(self)
@@ -188,6 +198,7 @@ class PerformanceSettingsDialog(QDialog):
             dir_cache_enabled=self.cache_enabled.isChecked(),
             dir_cache_max_entries=int(self.cache_max_spin.value()),
             startup_prewarm_mode=str(self.prewarm_mode_combo.currentData() or "minimal"),
+            success_popups_enabled=self.success_popups_enabled.isChecked(),
             web_capture_download_mode=str(
                 self.web_capture_mode_combo.currentData() or "auto"
             ),
@@ -289,16 +300,19 @@ class IconProviderSettingsDialog(QDialog):
         self.steam_base.setPlaceholderText("SteamGridDB API Base URL")
         layout.addWidget(self.steam_base)
 
-        self.iconfinder_enabled = QCheckBox("Enable Iconfinder")
-        self.iconfinder_enabled.setChecked(initial.iconfinder_enabled)
-        layout.addWidget(self.iconfinder_enabled)
-        self.iconfinder_key = QLineEdit(initial.iconfinder_api_key)
-        self.iconfinder_key.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
-        self.iconfinder_key.setPlaceholderText("Iconfinder API Key")
-        layout.addWidget(self.iconfinder_key)
-        self.iconfinder_base = QLineEdit(initial.iconfinder_api_base)
-        self.iconfinder_base.setPlaceholderText("Iconfinder API Base URL")
-        layout.addWidget(self.iconfinder_base)
+        self.igdb_enabled = QCheckBox("Enable IGDB")
+        self.igdb_enabled.setChecked(initial.igdb_enabled)
+        layout.addWidget(self.igdb_enabled)
+        self.igdb_client_id = QLineEdit(initial.igdb_client_id)
+        self.igdb_client_id.setPlaceholderText("IGDB Client ID")
+        layout.addWidget(self.igdb_client_id)
+        self.igdb_client_secret = QLineEdit(initial.igdb_client_secret)
+        self.igdb_client_secret.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.igdb_client_secret.setPlaceholderText("IGDB Client Secret")
+        layout.addWidget(self.igdb_client_secret)
+        self.igdb_base = QLineEdit(initial.igdb_api_base)
+        self.igdb_base.setPlaceholderText("IGDB API Base URL")
+        layout.addWidget(self.igdb_base)
 
         actions = QHBoxLayout()
         self.test_btn = QPushButton("Test Credentials")
@@ -352,9 +366,10 @@ class IconProviderSettingsDialog(QDialog):
             steamgriddb_enabled=self.steam_enabled.isChecked(),
             steamgriddb_api_key=self.steam_key.text().strip(),
             steamgriddb_api_base=self.steam_base.text().strip(),
-            iconfinder_enabled=self.iconfinder_enabled.isChecked(),
-            iconfinder_api_key=self.iconfinder_key.text().strip(),
-            iconfinder_api_base=self.iconfinder_base.text().strip(),
+            igdb_enabled=self.igdb_enabled.isChecked(),
+            igdb_client_id=self.igdb_client_id.text().strip(),
+            igdb_client_secret=self.igdb_client_secret.text().strip(),
+            igdb_api_base=self.igdb_base.text().strip(),
         )
 
 

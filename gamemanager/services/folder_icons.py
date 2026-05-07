@@ -414,6 +414,39 @@ def set_folder_icon_metadata(
     return True
 
 
+def clear_folder_icon_metadata(folder_path: Path) -> bool:
+    if not folder_path.exists() or not folder_path.is_dir():
+        return False
+    desktop_ini = folder_path / "desktop.ini"
+    if not desktop_ini.exists():
+        return False
+    parser = _read_desktop_ini_parser(desktop_ini)
+    if parser is None or not parser.has_section(_SHELLCLASSINFO_SECTION):
+        return False
+    if not parser.has_section(_GM_ICON_SECTION):
+        return False
+    icon_resource = _extract_icon_resource(parser)
+    if not icon_resource:
+        return False
+    info_tip = _read_existing_info_tip(parser)
+    flags = _read_existing_flags(parser)
+    rebuilt = _read_existing_rebuilt(parser)
+    parser.remove_section(_GM_ICON_SECTION)
+    try:
+        _write_shellclassinfo(
+            desktop_ini,
+            folder_path,
+            icon_resource=icon_resource,
+            info_tip=info_tip,
+            flags=flags,
+            rebuilt=rebuilt,
+            parser=parser,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def apply_folder_icon(
     folder_path: Path,
     icon_bytes: bytes,

@@ -8,8 +8,13 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QListWidgetItem, QTab
 
 from gamemanager.models import InventoryItem, RootDisplayInfo
 from gamemanager.services.icon_cache import icon_cache_key
+from gamemanager.services.storefronts.priority import normalize_store_name
 from gamemanager.services.sorting import natural_key
 from gamemanager.services.storage import mountpoint_sort_key
+
+
+RIGHT_STORE_FILTER_ANY = "__any__"
+RIGHT_STORE_FILTER_NONE = "__none__"
 
 
 class MainWindowInventoryOpsMixin:
@@ -72,6 +77,37 @@ class MainWindowInventoryOpsMixin:
         if not needle:
             return items
         return [item for item in items if needle in item.cleaned_name.casefold()]
+
+    @staticmethod
+    def _filter_by_owned_store(
+        items: list[InventoryItem],
+        selected_store: str,
+    ) -> list[InventoryItem]:
+        token_raw = str(selected_store or "").strip()
+        if token_raw == "":
+            return items
+        token = normalize_store_name(token_raw)
+        out: list[InventoryItem] = []
+        for item in items:
+            stores = {
+                normalize_store_name(name)
+                for name in list(item.owned_stores or [])
+                if normalize_store_name(name)
+            }
+            primary = normalize_store_name(item.primary_store or "")
+            if primary:
+                stores.add(primary)
+            if token_raw == RIGHT_STORE_FILTER_ANY:
+                if stores:
+                    out.append(item)
+                continue
+            if token_raw == RIGHT_STORE_FILTER_NONE:
+                if not stores:
+                    out.append(item)
+                continue
+            if token and token in stores:
+                out.append(item)
+        return out
 
     def _build_sort_chain(self, primary_field: str, primary_ascending: bool) -> list[tuple[str, bool]]:
         ordered = [(primary_field, primary_ascending)] + list(self._default_right_sort_chain)
@@ -139,6 +175,8 @@ class MainWindowInventoryOpsMixin:
             return entry.size_bytes
         if field == "source":
             return natural_key(self._source_for_item(entry, root_info_by_id))
+        if field == "stores":
+            return natural_key(",".join(entry.owned_stores))
         return natural_key(entry.full_name)
 
     def _sorted_inventory(
@@ -212,6 +250,10 @@ class MainWindowInventoryOpsMixin:
         visible_items = self._filter_by_cleaned_name_query(
             visible_items, self.left_filter_edit.text()
         )
+        visible_items = self._filter_by_owned_store(
+            visible_items,
+            str(getattr(self, "_right_store_filter", "") or ""),
+        )
         visible_items = (
             self._filter_only_duplicate_cleaned_names(visible_items)
             if self._show_only_duplicates
@@ -219,6 +261,10 @@ class MainWindowInventoryOpsMixin:
         )
         sorted_items = self._sorted_inventory(visible_items, root_info_by_id)
         icon_px = self._icon_view_sizes[self._right_icon_size_index]
+        store_badge_size = self._stores_badge_size_for_table_row()
+        store_badge_spacing = self._stores_badge_spacing_for_size(store_badge_size)
+        stores_col = self._right_column_index_by_field("stores")
+        max_store_count = 0
         self._visible_right_items = sorted_items
         self.right_table.setUpdatesEnabled(False)
         self.right_icon_list.setUpdatesEnabled(False)
@@ -230,18 +276,52 @@ class MainWindowInventoryOpsMixin:
                 row_source = self._source_for_item(entry, root_info_by_id)
                 name_item = QTableWidgetItem(entry.full_name)
                 name_item.setIcon(row_icon)
-                self.right_table.setItem(row, 0, name_item)
-                self.right_table.setItem(row, 1, QTableWidgetItem(entry.cleaned_name))
+                stores_ordered = list(entry.owned_stores or [])
+                max_store_count = max(max_store_count, len(stores_ordered))
+                stores_item = QTableWidgetItem("")
+                stores_item.setData(Qt.ItemDataRole.UserRole, ", ".join(stores_ordered))
+                stores_item.setToolTip(", ".join(stores_ordered) if stores_ordered else "No linked ownership")
+                self.right_table.setItem(row, self._right_column_index_by_field("full_name"), name_item)
                 self.right_table.setItem(
-                    row, 2, QTableWidgetItem(entry.modified_at.strftime("%Y-%m-%d %H:%M:%S"))
+                    row,
+                    self._right_column_index_by_field("cleaned_name"),
+                    QTableWidgetItem(entry.cleaned_name),
                 )
                 self.right_table.setItem(
-                    row, 3, QTableWidgetItem(entry.created_at.strftime("%Y-%m-%d %H:%M:%S"))
+                    row,
+                    self._right_column_index_by_field("modified_at"),
+                    QTableWidgetItem(entry.modified_at.strftime("%Y-%m-%d %H:%M:%S")),
                 )
-                self.right_table.setItem(row, 4, QTableWidgetItem(self._format_bytes(entry.size_bytes)))
                 self.right_table.setItem(
-                    row, 5, QTableWidgetItem(row_source)
+                    row,
+                    self._right_column_index_by_field("created_at"),
+                    QTableWidgetItem(entry.created_at.strftime("%Y-%m-%d %H:%M:%S")),
                 )
+                self.right_table.setItem(
+                    row,
+                    self._right_column_index_by_field("size_bytes"),
+                    QTableWidgetItem(self._format_bytes(entry.size_bytes)),
+                )
+                self.right_table.setItem(
+                    row,
+                    self._right_column_index_by_field("source"),
+                    QTableWidgetItem(row_source),
+                )
+                if stores_col >= 0:
+                    self.right_table.setItem(
+                        row,
+                        stores_col,
+                        stores_item,
+                    )
+                    self.right_table.setCellWidget(
+                        row,
+                        stores_col,
+                        self._stores_strip_widget(
+                            stores_ordered,
+                            badge_size=store_badge_size,
+                            spacing=store_badge_spacing,
+                        ),
+                    )
                 tooltip = self._entry_tooltip_text(entry, row_source)
                 for col in range(len(self._right_columns)):
                     cell = self.right_table.item(row, col)
@@ -249,7 +329,11 @@ class MainWindowInventoryOpsMixin:
                         cell.setToolTip(tooltip)
 
                 tile_text = entry.cleaned_name.strip() or entry.full_name
-                tile_icon = row_icon
+                tile_icon = self._icon_with_primary_store_badge(
+                    entry,
+                    row_icon,
+                    icon_px,
+                )
                 if tile_icon.cacheKey() == self._blank_icon.cacheKey():
                     tile_icon = self._icon_placeholder(icon_px)
                 tile = QListWidgetItem(tile_icon, tile_text)
@@ -259,11 +343,27 @@ class MainWindowInventoryOpsMixin:
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
                 )
                 self.right_icon_list.addItem(tile)
-
-            self.right_table.resizeColumnsToContents()
         finally:
             self.right_table.setUpdatesEnabled(True)
             self.right_icon_list.setUpdatesEnabled(True)
+        if not self._right_columns_autosized_once:
+            for idx in range(len(self._right_columns)):
+                if not self.right_table.isColumnHidden(idx):
+                    self.right_table.resizeColumnToContents(idx)
+            self._right_columns_autosized_once = True
+            self._save_right_column_layout_prefs()
+        if stores_col >= 0 and not self.right_table.isColumnHidden(stores_col):
+            required_width = self._stores_strip_required_width(
+                max_store_count,
+                badge_size=store_badge_size,
+                spacing=store_badge_spacing,
+            )
+            required_width = max(
+                required_width,
+                self.right_table.fontMetrics().horizontalAdvance("Stores") + 24,
+            )
+            if self.right_table.columnWidth(stores_col) < required_width:
+                self.right_table.setColumnWidth(stores_col, required_width)
         self._apply_right_icon_size_ui()
         self._update_counts_status()
 

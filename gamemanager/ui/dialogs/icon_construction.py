@@ -41,10 +41,12 @@ from gamemanager.services.background_removal import (
     remove_background_bytes,
 )
 from gamemanager.services.icon_pipeline import (
+    BACKGROUND_FILL_MODE_OPTIONS,
     BorderShaderConfig,
     TEXT_EXTRACTION_METHOD_OPTIONS,
     TextPreserveConfig,
     border_shader_to_dict,
+    build_background_fill_layer,
     build_template_interior_mask_png,
     build_text_extraction_alpha_mask,
     build_text_extraction_overlay,
@@ -53,6 +55,8 @@ from gamemanager.services.icon_pipeline import (
     build_template_overlay_preview,
     icon_style_options,
     normalize_border_shader_config,
+    normalize_background_fill_mode,
+    normalize_background_fill_params,
     normalize_icon_style,
     normalize_text_preserve_config,
     normalize_text_extraction_method,
@@ -89,11 +93,12 @@ from .shared import (
 from .template_management import TemplateGalleryDialog
 
 try:
-    from PIL import Image, ImageFilter, ImageOps
+    from PIL import Image, ImageFilter, ImageOps, ImageStat
 except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     ImageFilter = None  # type: ignore[assignment]
     ImageOps = None  # type: ignore[assignment]
+    ImageStat = None  # type: ignore[assignment]
 
 
 class BorderShaderControls(QWidget):
@@ -392,10 +397,15 @@ class IconFrameCanvas(QWidget):
         self._upscale_method = "lanczos_unsharp"
         self._bg_removal_engine = "none"
         self._bg_removal_params = normalize_background_removal_params(None)
+        self._background_fill_mode = "black"
+        self._background_fill_params = normalize_background_fill_params(None)
         self._text_preserve_config = text_preserve_to_dict(None)
         self._cutout_pixmap_cache: dict[str, QPixmap | None] = {}
         self._text_overlay_pixmap_cache: dict[str, QPixmap | None] = {}
         self._text_alpha_mask_pixmap_cache: dict[str, QPixmap | None] = {}
+        self._background_fill_image_cache: dict[tuple[str, int, int], QImage] = {}
+        self._background_fill_average_rgb: tuple[int, int, int] | None = None
+        self._preview_dim_alpha = 120
         self._debug_text_alpha_only = False
         self._cutout_error: str | None = None
         self._async_processing_busy = False
@@ -585,6 +595,38 @@ class IconFrameCanvas(QWidget):
 
     def bg_removal_params(self) -> dict[str, object]:
         return dict(self._bg_removal_params)
+
+    def set_background_fill_mode(self, mode: str | None) -> None:
+        normalized = normalize_background_fill_mode(mode)
+        if normalized == self._background_fill_mode:
+            return
+        self._background_fill_mode = normalized
+        self._background_fill_image_cache.clear()
+        self.update()
+
+    def background_fill_mode(self) -> str:
+        return self._background_fill_mode
+
+    def set_background_fill_params(self, params: dict[str, object] | None) -> None:
+        normalized = normalize_background_fill_params(params)
+        if normalized == self._background_fill_params:
+            return
+        self._background_fill_params = normalized
+        self._background_fill_image_cache.clear()
+        self.update()
+
+    def background_fill_params(self) -> dict[str, int]:
+        return dict(self._background_fill_params)
+
+    def set_preview_dim_alpha(self, alpha: int) -> None:
+        normalized = max(0, min(255, int(alpha)))
+        if normalized == int(self._preview_dim_alpha):
+            return
+        self._preview_dim_alpha = normalized
+        self.update()
+
+    def preview_dim_alpha(self) -> int:
+        return int(self._preview_dim_alpha)
 
     def set_text_preserve_config(self, config: dict[str, object] | TextPreserveConfig | None) -> None:
         normalized = text_preserve_to_dict(normalize_text_preserve_config(config))
@@ -1311,7 +1353,7 @@ class IconFrameCanvas(QWidget):
         template_path.addRect(template)
         # Preview-only dim: area inside template bounds but outside the real
         # interior shape should be masked significantly.
-        painter.fillPath(template_path - interior, QColor(0, 0, 0, 165))
+        painter.fillPath(template_path - interior, QColor(0, 0, 0, self.preview_dim_alpha()))
 
     def _apply_border_shader_to_pixmap(
         self, pixmap: QPixmap, template_spec
@@ -1382,7 +1424,7 @@ class IconFrameCanvas(QWidget):
 
         if show_background:
             if self._border_style != "none":
-                painter.fillRect(template, QColor(0, 0, 0))
+                self._paint_background_fill(painter, template)
             painter.drawPixmap(image_rect, self._pixmap, QRectF(self._pixmap.rect()))
 
         if show_template:
@@ -1390,7 +1432,7 @@ class IconFrameCanvas(QWidget):
             outside.addRect(QRectF(self.rect()))
             template_path = QPainterPath()
             template_path.addRect(template)
-            painter.fillPath(outside - template_path, QColor(0, 0, 0, 120))
+            painter.fillPath(outside - template_path, QColor(0, 0, 0, self.preview_dim_alpha()))
             self._dim_non_interior_template_area_for_preview(painter, template)
             self._draw_template_overlay(painter, template)
 
@@ -1519,6 +1561,105 @@ class IconFrameCanvas(QWidget):
         except Exception:
             return None
 
+    def _average_fill_rgb(self) -> tuple[int, int, int]:
+        cached = self._background_fill_average_rgb
+        if cached is not None:
+            return cached
+        if Image is None or ImageStat is None or ImageOps is None:
+            self._background_fill_average_rgb = (0, 0, 0)
+            return self._background_fill_average_rgb
+        try:
+            with Image.open(BytesIO(self._source_image_bytes)) as loaded:
+                loaded.load()
+                rgba = ImageOps.exif_transpose(loaded).convert("RGBA")
+            alpha = rgba.getchannel("A")
+            if alpha.getextrema()[1] <= 0:
+                rgb = (0, 0, 0)
+            else:
+                stat = ImageStat.Stat(rgba.convert("RGB"), alpha)
+                rgb = (
+                    max(0, min(255, int(round(stat.mean[0])))),
+                    max(0, min(255, int(round(stat.mean[1])))),
+                    max(0, min(255, int(round(stat.mean[2])))),
+                )
+            self._background_fill_average_rgb = rgb
+            return rgb
+        except Exception:
+            self._background_fill_average_rgb = (0, 0, 0)
+            return self._background_fill_average_rgb
+
+    def _background_fill_image(self, width: int, height: int) -> QImage | None:
+        mode = normalize_background_fill_mode(self._background_fill_mode)
+        if mode == "black":
+            return None
+        width = max(1, int(width))
+        height = max(1, int(height))
+        key = (mode, width, height)
+        params_key = json.dumps(self._background_fill_params, sort_keys=True)
+        key = (f"{mode}|{params_key}", width, height)
+        cached = self._background_fill_image_cache.get(key)
+        if cached is not None:
+            return cached
+        if Image is None or ImageOps is None:
+            return None
+        try:
+            with Image.open(BytesIO(self._source_image_bytes)) as loaded:
+                loaded.load()
+                rgba = ImageOps.exif_transpose(loaded).convert("RGBA")
+            if mode == "average":
+                red, green, blue = self._average_fill_rgb()
+                fill = Image.new("RGBA", (width, height), (red, green, blue, 255))
+            else:
+                edge_size = max(width, height)
+                fill = build_background_fill_layer(
+                    rgba,
+                    edge_size,
+                    fill_mode=mode,
+                    params=self._background_fill_params,
+                )
+                if fill.size != (width, height):
+                    fill = fill.resize((width, height), Image.Resampling.LANCZOS)
+            out = BytesIO()
+            fill.save(out, format="PNG")
+            image = QImage()
+            if image.loadFromData(out.getvalue()):
+                self._background_fill_image_cache[key] = image
+                return image
+        except Exception:
+            return None
+        return None
+
+    def _paint_background_fill(
+        self,
+        painter: QPainter,
+        target_rect: QRectF,
+        *,
+        clip_path: QPainterPath | None = None,
+    ) -> None:
+        mode = normalize_background_fill_mode(self._background_fill_mode)
+        if clip_path is not None:
+            painter.save()
+            painter.setClipPath(clip_path)
+        try:
+            if mode == "black":
+                painter.fillRect(target_rect, QColor(0, 0, 0))
+                return
+            if mode == "average":
+                red, green, blue = self._average_fill_rgb()
+                painter.fillRect(target_rect, QColor(red, green, blue))
+                return
+            fill = self._background_fill_image(
+                int(round(target_rect.width())),
+                int(round(target_rect.height())),
+            )
+            if fill is not None:
+                painter.drawImage(target_rect, fill)
+                return
+            painter.fillRect(target_rect, QColor(0, 0, 0))
+        finally:
+            if clip_path is not None:
+                painter.restore()
+
     def export_png_bytes(self, output_size: int = 512) -> bytes:
         template = self._template_rect()
         image_rect = self._image_rect(template)
@@ -1543,7 +1684,7 @@ class IconFrameCanvas(QWidget):
         if clip_path is not None:
             painter.save()
             painter.setClipPath(clip_path)
-            painter.fillRect(output_rect, QColor(0, 0, 0))
+            self._paint_background_fill(painter, output_rect)
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
             painter.restore()
         else:
@@ -1589,14 +1730,14 @@ class IconFrameCanvas(QWidget):
                 if clip_path is not None:
                     painter.save()
                     painter.setClipPath(clip_path)
-                    painter.fillRect(output_rect, QColor(0, 0, 0))
+                    self._paint_background_fill(painter, output_rect)
                     if base_resampled is not None:
                         painter.drawImage(output_rect, base_resampled)
                     else:
                         painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
                     painter.restore()
                 else:
-                    painter.fillRect(output_rect, QColor(0, 0, 0))
+                    self._paint_background_fill(painter, output_rect)
                     if base_resampled is not None:
                         painter.drawImage(output_rect, base_resampled)
                     else:
@@ -1652,6 +1793,8 @@ class IconFramingDialog(
         initial_bg_removal_engine: str = "none",
         initial_bg_removal_params: dict[str, object] | None = None,
         initial_text_preserve_config: dict[str, object] | None = None,
+        initial_background_fill_mode: str = "black",
+        initial_background_fill_params: dict[str, object] | None = None,
         border_shader: dict[str, object] | None = None,
         size_improvements: dict[int, dict[str, object]] | None = None,
         parent: QWidget | None = None,
@@ -1706,6 +1849,8 @@ class IconFramingDialog(
         self._canvas.set_border_shader(border_shader)
         self._canvas.set_bg_removal_engine(initial_bg_removal_engine)
         self._canvas.set_bg_removal_params(initial_bg_removal_params or {})
+        self._canvas.set_background_fill_mode(initial_background_fill_mode)
+        self._canvas.set_background_fill_params(initial_background_fill_params)
         self._canvas.set_text_preserve_config(text_preserve_to_dict(initial_text_cfg))
         self._canvas.set_upscale_method("lanczos_unsharp")
         self._canvas.roiChanged.connect(self._on_canvas_roi_changed)
@@ -1772,6 +1917,33 @@ class IconFramingDialog(
         zoom_row.addWidget(self.reset_btn)
         side.addLayout(zoom_row)
 
+        preview_dim_row = QHBoxLayout()
+        preview_dim_row.setContentsMargins(0, 0, 0, 0)
+        preview_dim_row.setSpacing(6)
+        self.preview_dim_label = QLabel("Preview dim:", self)
+        preview_dim_row.addWidget(self.preview_dim_label)
+        self.preview_dim_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.preview_dim_slider.setRange(0, 255)
+        self.preview_dim_slider.setSingleStep(1)
+        self.preview_dim_slider.setPageStep(10)
+        self.preview_dim_slider.setToolTip(
+            "Preview-only darkening outside the template interior. 0 = no dim."
+        )
+        self.preview_dim_slider.setValue(self._canvas.preview_dim_alpha())
+        self.preview_dim_slider.valueChanged.connect(self._on_preview_dim_changed)
+        preview_dim_row.addWidget(self.preview_dim_slider, 1)
+        self.preview_dim_spin = QSpinBox(self)
+        self.preview_dim_spin.setRange(0, 255)
+        self.preview_dim_spin.setSuffix(" a")
+        self.preview_dim_spin.setKeyboardTracking(False)
+        self.preview_dim_spin.setToolTip(
+            "Preview-only darkening outside the template interior. 0 = no dim."
+        )
+        self.preview_dim_spin.setValue(self._canvas.preview_dim_alpha())
+        self.preview_dim_spin.valueChanged.connect(self._on_preview_dim_changed)
+        preview_dim_row.addWidget(self.preview_dim_spin)
+        side.addLayout(preview_dim_row)
+
         upscale_row = QHBoxLayout()
         upscale_row.setContentsMargins(0, 0, 0, 0)
         upscale_row.setSpacing(6)
@@ -1788,6 +1960,175 @@ class IconFramingDialog(
         )
         upscale_row.addWidget(self.upscale_method_combo, 1)
         side.addLayout(upscale_row)
+
+        fill_row = QHBoxLayout()
+        fill_row.setContentsMargins(0, 0, 0, 0)
+        fill_row.setSpacing(6)
+        self.fill_label = QLabel("Background fill:", self)
+        fill_row.addWidget(self.fill_label)
+        self.background_fill_combo = QComboBox(self)
+        for label, value in BACKGROUND_FILL_MODE_OPTIONS:
+            self.background_fill_combo.addItem(label, value)
+        fill_idx = self.background_fill_combo.findData(self._canvas.background_fill_mode())
+        if fill_idx >= 0:
+            self.background_fill_combo.setCurrentIndex(fill_idx)
+        self.background_fill_combo.currentIndexChanged.connect(self._on_background_fill_changed)
+        fill_row.addWidget(self.background_fill_combo, 1)
+        side.addLayout(fill_row)
+
+        self._fill_mode_param_keys: dict[str, list[str]] = {
+            "black": [],
+            "average": [],
+            "blur": ["blur_strength"],
+            "edge_stretch": ["edge_softness"],
+            "mirror": ["mirror_softness"],
+            "soft_gradient": ["gradient_blur", "gradient_mix"],
+            "radial_blur": ["radial_strength", "radial_curve"],
+            "zoom_blur": ["zoom_strength", "zoom_samples"],
+            "hybrid": ["hybrid_blur", "hybrid_mix"],
+        }
+        self._fill_param_rows: dict[str, tuple[QWidget, QSlider, QSpinBox]] = {}
+        fill_params = self._canvas.background_fill_params()
+        self.fill_params_container = QWidget(self)
+        fill_params_layout = QVBoxLayout(self.fill_params_container)
+        fill_params_layout.setContentsMargins(0, 0, 0, 0)
+        fill_params_layout.setSpacing(4)
+
+        def _add_fill_param_row(
+            key: str,
+            label_text: str,
+            minimum: int,
+            maximum: int,
+            suffix: str = "",
+            tooltip: str = "",
+        ) -> None:
+            row_widget = QWidget(self.fill_params_container)
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            label = QLabel(label_text, row_widget)
+            row.addWidget(label)
+            slider = QSlider(Qt.Orientation.Horizontal, row_widget)
+            slider.setRange(int(minimum), int(maximum))
+            slider.setSingleStep(1)
+            slider.setPageStep(max(1, int((maximum - minimum) / 10)))
+            spin = QSpinBox(row_widget)
+            spin.setRange(int(minimum), int(maximum))
+            spin.setKeyboardTracking(False)
+            if suffix:
+                spin.setSuffix(suffix)
+            if tooltip:
+                label.setToolTip(tooltip)
+                slider.setToolTip(tooltip)
+                spin.setToolTip(tooltip)
+            value = int(fill_params.get(key, minimum))
+            slider.setValue(value)
+            spin.setValue(value)
+            slider.valueChanged.connect(
+                lambda new_value, target_key=key: self._on_background_fill_param_slider_changed(
+                    target_key, new_value
+                )
+            )
+            spin.valueChanged.connect(
+                lambda new_value, target_key=key: self._on_background_fill_param_spin_changed(
+                    target_key, new_value
+                )
+            )
+            row.addWidget(slider, 1)
+            row.addWidget(spin)
+            fill_params_layout.addWidget(row_widget)
+            self._fill_param_rows[key] = (row_widget, slider, spin)
+
+        _add_fill_param_row(
+            "blur_strength",
+            "Blur strength:",
+            0,
+            100,
+            " %",
+            "Controls blur amount for Blur Extend mode.",
+        )
+        _add_fill_param_row(
+            "edge_softness",
+            "Edge softness:",
+            0,
+            100,
+            " %",
+            "Softens seams in Edge Stretch mode.",
+        )
+        _add_fill_param_row(
+            "mirror_softness",
+            "Mirror softness:",
+            0,
+            100,
+            " %",
+            "Softens seams in Mirror Extend mode.",
+        )
+        _add_fill_param_row(
+            "gradient_blur",
+            "Gradient blur:",
+            0,
+            100,
+            " %",
+            "Blur amount for Soft Gradient mode.",
+        )
+        _add_fill_param_row(
+            "gradient_mix",
+            "Color mix:",
+            0,
+            100,
+            " %",
+            "Average-color blend in Soft Gradient mode.",
+        )
+        _add_fill_param_row(
+            "radial_strength",
+            "Radial strength:",
+            0,
+            100,
+            " %",
+            "Edge blur strength for Radial Blur mode.",
+        )
+        _add_fill_param_row(
+            "radial_curve",
+            "Edge curve:",
+            50,
+            250,
+            " %",
+            "Higher values focus blur closer to the frame edge.",
+        )
+        _add_fill_param_row(
+            "zoom_strength",
+            "Zoom strength:",
+            0,
+            100,
+            " %",
+            "Strength of outward zoom smear for Zoom Blur mode.",
+        )
+        _add_fill_param_row(
+            "zoom_samples",
+            "Zoom samples:",
+            2,
+            20,
+            "",
+            "Number of zoom passes (higher is smoother but slower).",
+        )
+        _add_fill_param_row(
+            "hybrid_blur",
+            "Hybrid blur:",
+            0,
+            100,
+            " %",
+            "Extra smoothing applied in Hybrid mode.",
+        )
+        _add_fill_param_row(
+            "hybrid_mix",
+            "Hybrid color mix:",
+            0,
+            100,
+            " %",
+            "Average-color mix amount in Hybrid mode.",
+        )
+        side.addWidget(self.fill_params_container)
+        self._sync_background_fill_param_controls()
 
         self.shader_controls = BorderShaderControls(
             initial_config=self._canvas.border_shader(),
@@ -2257,6 +2598,75 @@ class IconFramingDialog(
 
     def _on_upscale_method_changed(self) -> None:
         self._canvas.set_upscale_method(str(self.upscale_method_combo.currentData() or "qt_smooth"))
+
+    def _on_preview_dim_changed(self, value: int) -> None:
+        alpha = max(0, min(255, int(value)))
+        self._canvas.set_preview_dim_alpha(alpha)
+        blocked = self.preview_dim_slider.blockSignals(True)
+        self.preview_dim_slider.setValue(alpha)
+        self.preview_dim_slider.blockSignals(blocked)
+        blocked = self.preview_dim_spin.blockSignals(True)
+        self.preview_dim_spin.setValue(alpha)
+        self.preview_dim_spin.blockSignals(blocked)
+
+    def _on_background_fill_changed(self) -> None:
+        self._canvas.set_background_fill_mode(
+            str(self.background_fill_combo.currentData() or "black")
+        )
+        self._sync_background_fill_param_controls()
+        self._apply_background_fill_params_to_canvas()
+
+    def _on_background_fill_param_slider_changed(self, key: str, value: int) -> None:
+        row = self._fill_param_rows.get(str(key))
+        if row is None:
+            return
+        _row_widget, slider, spin = row
+        normalized = int(value)
+        blocked = spin.blockSignals(True)
+        spin.setValue(normalized)
+        spin.blockSignals(blocked)
+        blocked = slider.blockSignals(True)
+        slider.setValue(normalized)
+        slider.blockSignals(blocked)
+        self._apply_background_fill_params_to_canvas()
+
+    def _on_background_fill_param_spin_changed(self, key: str, value: int) -> None:
+        row = self._fill_param_rows.get(str(key))
+        if row is None:
+            return
+        _row_widget, slider, spin = row
+        normalized = int(value)
+        blocked = slider.blockSignals(True)
+        slider.setValue(normalized)
+        slider.blockSignals(blocked)
+        blocked = spin.blockSignals(True)
+        spin.setValue(normalized)
+        spin.blockSignals(blocked)
+        self._apply_background_fill_params_to_canvas()
+
+    def _selected_background_fill_params(self) -> dict[str, int]:
+        payload: dict[str, int] = {}
+        for key, row in self._fill_param_rows.items():
+            _row_widget, _slider, spin = row
+            payload[str(key)] = int(spin.value())
+        return normalize_background_fill_params(payload)
+
+    def _apply_background_fill_params_to_canvas(self) -> None:
+        self._canvas.set_background_fill_params(self._selected_background_fill_params())
+
+    def _sync_background_fill_param_controls(self) -> None:
+        mode = normalize_background_fill_mode(
+            str(self.background_fill_combo.currentData() or "black")
+        )
+        template_enabled = self._template_enabled()
+        visible_keys = set(self._fill_mode_param_keys.get(mode, []))
+        any_visible = False
+        for key, row in self._fill_param_rows.items():
+            row_widget, _slider, _spin = row
+            show = template_enabled and key in visible_keys
+            row_widget.setVisible(show)
+            any_visible = any_visible or show
+        self.fill_params_container.setVisible(template_enabled and any_visible)
 
     def _on_bg_engine_changed(self) -> None:
         self._sync_template_dependents()
@@ -3149,6 +3559,8 @@ class IconFramingDialog(
         self.shader_controls.setVisible(template_enabled)
         self.cutout_label.setVisible(template_enabled)
         self.bg_removal_combo.setVisible(template_enabled)
+        self.fill_label.setVisible(template_enabled)
+        self.background_fill_combo.setVisible(template_enabled)
         self.cutout_advanced_container.setVisible(cutout_advanced_enabled)
         self.cutout_pick_colors_container.setVisible(cutout_pick_colors_enabled)
         self.text_label.setVisible(template_enabled)
@@ -3165,6 +3577,11 @@ class IconFramingDialog(
 
         self.layer_cutout_check.setEnabled(template_enabled)
         self.layer_text_check.setEnabled(template_enabled)
+        self.preview_dim_label.setEnabled(template_enabled)
+        self.preview_dim_slider.setEnabled(template_enabled)
+        self.preview_dim_spin.setEnabled(template_enabled)
+        self.background_fill_combo.setEnabled(template_enabled)
+        self.fill_params_container.setEnabled(template_enabled)
         self.shader_controls.setEnabled(template_enabled)
         self.layer_cutout_check.setVisible(template_enabled)
         self.layer_text_check.setVisible(template_enabled)
@@ -3175,6 +3592,7 @@ class IconFramingDialog(
         self._update_roi_label()
         self._update_manual_history_buttons()
         self.manual_mark_show_dots_check.setEnabled(text_enabled)
+        self._sync_background_fill_param_controls()
 
     def selected_bg_removal_engine(self) -> str:
         if not self._template_enabled():
@@ -3182,6 +3600,16 @@ class IconFramingDialog(
         return normalize_background_removal_engine(
             str(self.bg_removal_combo.currentData() or "none")
         )
+
+    def selected_background_fill_mode(self) -> str:
+        if not self._template_enabled():
+            return "black"
+        return normalize_background_fill_mode(
+            str(self.background_fill_combo.currentData() or "black")
+        )
+
+    def selected_background_fill_params(self) -> dict[str, int]:
+        return self._selected_background_fill_params()
 
     def selected_bg_removal_params(self) -> dict[str, object]:
         advanced = bool(self.cutout_falloff_advanced_check.isChecked())
@@ -3250,6 +3678,9 @@ class IconConverterDialog(QDialog):
         icon_style_saver: Callable[[str], None] | None = None,
         initial_bg_removal_engine: str = "none",
         bg_removal_engine_saver: Callable[[str], None] | None = None,
+        initial_background_fill_mode: str = "black",
+        initial_background_fill_params: dict[str, object] | None = None,
+        background_fill_mode_saver: Callable[[str], None] | None = None,
         initial_border_shader: dict[str, object] | None = None,
         border_shader_saver: Callable[[dict[str, object]], None] | None = None,
         processing_controls_visible: bool = True,
@@ -3262,12 +3693,16 @@ class IconConverterDialog(QDialog):
         self._prepared_is_final_composite = False
         self._icon_style_saver = icon_style_saver
         self._bg_removal_engine_saver = bg_removal_engine_saver
+        self._background_fill_mode_saver = background_fill_mode_saver
         self._border_shader_saver = border_shader_saver
         self._processing_controls_visible = bool(processing_controls_visible)
         self._size_improvements = dict(size_improvements or {})
         self._border_shader = border_shader_to_dict(initial_border_shader)
         self._bg_removal_params = normalize_background_removal_params(
             dict(DEFAULT_BG_REMOVAL_PARAMS)
+        )
+        self._background_fill_params = normalize_background_fill_params(
+            initial_background_fill_params
         )
         self._text_preserve_config = text_preserve_to_dict(None)
 
@@ -3335,6 +3770,18 @@ class IconConverterDialog(QDialog):
             self.bg_removal_combo.setCurrentIndex(bg_idx)
         self.bg_removal_combo.currentIndexChanged.connect(self._on_bg_engine_changed)
         style_row.addWidget(self.bg_removal_combo)
+        self.fill_label = QLabel("Fill:", self)
+        style_row.addWidget(self.fill_label)
+        self.background_fill_combo = QComboBox(self)
+        for label, value in BACKGROUND_FILL_MODE_OPTIONS:
+            self.background_fill_combo.addItem(label, value)
+        fill_idx = self.background_fill_combo.findData(
+            normalize_background_fill_mode(initial_background_fill_mode)
+        )
+        if fill_idx >= 0:
+            self.background_fill_combo.setCurrentIndex(fill_idx)
+        self.background_fill_combo.currentIndexChanged.connect(self._on_background_fill_mode_changed)
+        style_row.addWidget(self.background_fill_combo)
         self.text_label = QLabel("Text:", self)
         style_row.addWidget(self.text_label)
         self.text_extract_combo = QComboBox(self)
@@ -3378,6 +3825,8 @@ class IconConverterDialog(QDialog):
                 self.border_shader_btn,
                 self.cutout_label,
                 self.bg_removal_combo,
+                self.fill_label,
+                self.background_fill_combo,
                 self.text_label,
                 self.text_extract_combo,
             ):
@@ -3440,10 +3889,16 @@ class IconConverterDialog(QDialog):
                 blocked = self.text_extract_combo.blockSignals(True)
                 self.text_extract_combo.setCurrentIndex(text_idx)
                 self.text_extract_combo.blockSignals(blocked)
+            fill_idx = self.background_fill_combo.findData("black")
+            if fill_idx >= 0 and self.background_fill_combo.currentIndex() != fill_idx:
+                blocked = self.background_fill_combo.blockSignals(True)
+                self.background_fill_combo.setCurrentIndex(fill_idx)
+                self.background_fill_combo.blockSignals(blocked)
             cfg = dict(self._text_preserve_config)
             cfg.update({"enabled": False, "method": "none"})
             self._text_preserve_config = text_preserve_to_dict(cfg)
         self.bg_removal_combo.setEnabled(template_enabled)
+        self.background_fill_combo.setEnabled(template_enabled)
         self.text_extract_combo.setEnabled(template_enabled)
         self.border_shader_btn.setEnabled(template_enabled)
 
@@ -3451,6 +3906,13 @@ class IconConverterDialog(QDialog):
         if not self._template_enabled():
             return "none"
         return str(self.bg_removal_combo.currentData() or "none")
+
+    def _current_background_fill_mode(self) -> str:
+        if not self._template_enabled():
+            return "black"
+        return normalize_background_fill_mode(
+            str(self.background_fill_combo.currentData() or "black")
+        )
 
     def _border_shader_config(self) -> dict[str, object]:
         return dict(self._border_shader)
@@ -3538,6 +4000,17 @@ class IconConverterDialog(QDialog):
             except Exception:
                 pass
 
+    def _on_background_fill_mode_changed(self, *_args) -> None:
+        if self._prepared_is_final_composite:
+            self._prepared_image_bytes = None
+            self._prepared_is_final_composite = False
+            self._set_status("Settings changed after framing. Re-run Adjust Framing.")
+        if self._background_fill_mode_saver is not None:
+            try:
+                self._background_fill_mode_saver(self._current_background_fill_mode())
+            except Exception:
+                pass
+
     def _on_text_extract_method_changed(self, _index: int) -> None:
         if not self._template_enabled():
             method = "none"
@@ -3615,6 +4088,8 @@ class IconConverterDialog(QDialog):
             initial_bg_removal_engine=self._current_bg_removal_engine(),
             initial_bg_removal_params=dict(self._bg_removal_params),
             initial_text_preserve_config=dict(self._text_preserve_config),
+            initial_background_fill_mode=self._current_background_fill_mode(),
+            initial_background_fill_params=dict(self._background_fill_params),
             border_shader=self._border_shader,
             size_improvements=self._size_improvements,
             parent=self,
@@ -3627,6 +4102,10 @@ class IconConverterDialog(QDialog):
         bg_idx = self.bg_removal_combo.findData(dialog.selected_bg_removal_engine())
         if bg_idx >= 0:
             self.bg_removal_combo.setCurrentIndex(bg_idx)
+        fill_idx = self.background_fill_combo.findData(dialog.selected_background_fill_mode())
+        if fill_idx >= 0:
+            self.background_fill_combo.setCurrentIndex(fill_idx)
+        self._background_fill_params = dialog.selected_background_fill_params()
         self._bg_removal_params = dialog.selected_bg_removal_params()
         self._text_preserve_config = dialog.selected_text_preserve_config()
         text_idx = self.text_extract_combo.findData(
@@ -3682,6 +4161,8 @@ class IconConverterDialog(QDialog):
                     bg_removal_params=self._bg_removal_params,
                     text_preserve_config=self._text_preserve_config,
                     border_shader=self._border_shader_config(),
+                    background_fill_mode=self._current_background_fill_mode(),
+                    background_fill_params=self._background_fill_params,
                     size_improvements=self._size_improvements,
                 )
         except Exception as exc:

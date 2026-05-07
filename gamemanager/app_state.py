@@ -5,7 +5,9 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import re
 from typing import Callable
+from urllib import request
 
 from gamemanager.db import Database
 from gamemanager.models import (
@@ -18,6 +20,8 @@ from gamemanager.models import (
     RenamePlanItem,
     RootDisplayInfo,
     RootFolder,
+    StoreAccount,
+    StoreOwnedGame,
     SgdbGameBinding,
     SgdbGameCandidate,
     SgdbOriginStatus,
@@ -33,7 +37,10 @@ from gamemanager.services.icon_readability import (
     rebuild_existing_local_icons,
 )
 from gamemanager.services.icon_cache import DiskImageCache
-from gamemanager.services.icon_pipeline import build_preview_png
+from gamemanager.services.icon_pipeline import (
+    build_preview_png,
+    normalize_background_fill_mode,
+)
 from gamemanager.services.icon_apply_subprocess import apply_folder_icon_in_subprocess
 from gamemanager.services.icon_source_probe_subprocess import probe_icon_source_in_subprocess
 from gamemanager.services.sgdb_upload_subprocess import upload_icon_to_sgdb_in_subprocess
@@ -44,19 +51,20 @@ from gamemanager.services.icon_origin import (
 )
 from gamemanager.services.game_infotips import fetch_game_infotip
 from gamemanager.services.folder_icons import (
-    read_folder_icon_metadata,
+    clear_folder_icon_metadata,
+    read_folder_icon_metadata as read_legacy_folder_icon_metadata,
     read_folder_info_tip,
-    set_folder_icon_metadata,
     set_folder_info_tip,
 )
 from gamemanager.services.cancellation import OperationCancelled
 from gamemanager.services.icon_sources import (
-    DEFAULT_ICONFINDER_API_BASE,
+    DEFAULT_IGDB_API_BASE,
     DEFAULT_SGDB_ENABLED_RESOURCES,
     DEFAULT_SGDB_RESOURCE_ORDER,
     DEFAULT_STEAMGRIDDB_API_BASE,
     IconSearchSettings,
     download_candidate_image,
+    lookup_igdb_store_ids_for_title,
     normalize_sgdb_resources,
     search_icon_candidates,
 )
@@ -65,6 +73,7 @@ from gamemanager.services.steamgriddb_targeting import (
     resolve_target_candidates,
 )
 from gamemanager.services.steamgriddb_upload import (
+    resolve_game_by_platform_id as sgdb_resolve_game_by_platform_id,
     resolve_game_by_id as sgdb_resolve_game_by_id,
 )
 from gamemanager.services.pillow_image import load_image_rgba_bytes
@@ -78,7 +87,30 @@ from gamemanager.services.operations import (
 from gamemanager.services.scan_cache import DirectorySizeCache
 from gamemanager.services.scanner import list_root_display_infos, scan_roots
 from gamemanager.services.secret_store import delete_secret, get_secret, set_secret
+from gamemanager.services.store_linking import (
+    ownership_map_from_store_links,
+    persist_store_id_hint,
+    preferred_store_id_for_owned_game,
+    strict_match_inventory_to_owned_games,
+)
+from gamemanager.services.storefront_sync import StorefrontSyncCoordinator
+from gamemanager.services.storefronts.priority import normalize_store_name, primary_store, sort_stores
+from gamemanager.services.storefronts.registry import available_store_names, connector_for_store
+from gamemanager.services.storefronts.store_urls import store_game_url
 from gamemanager.services.tagging import collect_tag_candidates
+
+_STORE_ID_HINT_KEYS: dict[str, tuple[str, ...]] = {
+    "Steam": ("steamappid", "steam_appid", "steamid"),
+    "EGS": ("epicgameid", "epic_game_id", "egs_game_id", "catalogitemid"),
+    "GOG": ("gogid", "gog_game_id", "gog_product_id"),
+    "Itch.io": ("itchid", "itch_game_id"),
+    "Humble": ("humbleid", "humble_game_id", "humble_subproduct_id"),
+    "Ubisoft": ("ubisoftid", "uplayid", "ubisoft_game_id"),
+    "Battle.net": ("bnetid", "battlenetid", "battlenet_game_id"),
+    "Amazon Games": ("amazonid", "amazon_game_id", "prime_game_id"),
+}
+_STORE_IDS_FILENAME = ".gm_store_ids.json"
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 class AppState:
@@ -165,6 +197,13 @@ class AppState:
         if not token:
             return ""
         return os.path.normpath(os.path.abspath(token))
+
+    @staticmethod
+    def _norm_store_inventory_path(path: str) -> str:
+        token = str(path or "").strip()
+        if not token:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(token)))
 
     @staticmethod
     def _serialize_evidence(evidence: list[str]) -> str:
@@ -280,23 +319,139 @@ class AppState:
         normalized = self._norm_folder_path(folder_path)
         if not normalized:
             return {}
-        return read_folder_icon_metadata(Path(normalized))
+        metadata = self.db.read_folder_metadata(normalized)
+        if metadata:
+            return metadata
+        legacy = read_legacy_folder_icon_metadata(Path(normalized))
+        if not legacy:
+            return {}
+        self.db.replace_folder_metadata(normalized, legacy)
+        clear_folder_icon_metadata(Path(normalized))
+        return legacy
 
     def upsert_folder_icon_metadata(self, folder_path: str, updates: dict[str, str]) -> bool:
         normalized = self._norm_folder_path(folder_path)
         if not normalized:
             return False
-        merged = read_folder_icon_metadata(Path(normalized))
+        merged = self.read_folder_icon_metadata(normalized)
+        changed = False
         for key, value in dict(updates or {}).items():
             if value is None:
-                merged.pop(str(key), None)
+                key_token = str(key)
+                if key_token in merged:
+                    changed = True
+                    merged.pop(key_token, None)
                 continue
             token = str(value).strip()
             if token:
-                merged[str(key)] = token
+                key_token = str(key)
+                if merged.get(key_token, "") != token:
+                    changed = True
+                merged[key_token] = token
             else:
-                merged.pop(str(key), None)
-        return set_folder_icon_metadata(Path(normalized), merged)
+                key_token = str(key)
+                if key_token in merged:
+                    changed = True
+                    merged.pop(key_token, None)
+        if not changed:
+            return False
+        self.db.replace_folder_metadata(normalized, merged)
+        clear_folder_icon_metadata(Path(normalized))
+        return True
+
+    def read_assigned_steam_appid(self, folder_path: str) -> str:
+        normalized = self._norm_folder_path(folder_path)
+        if not normalized:
+            return ""
+        marker = Path(normalized) / "steam_appid.txt"
+        if marker.exists() and marker.is_file():
+            try:
+                token = marker.read_text(encoding="utf-8", errors="ignore").strip()
+            except OSError:
+                token = ""
+            if token:
+                return token
+        metadata = self.read_folder_icon_metadata(normalized)
+        for key in ("SteamAppId", "steam_appid", "steamappid", "SteamID", "steamid"):
+            token = str(metadata.get(key, "")).strip()
+            if token:
+                return token
+        return ""
+
+    def assign_store_id_hint(
+        self,
+        *,
+        folder_path: str,
+        store_name: str,
+        store_id: str,
+    ) -> bool:
+        normalized = self._norm_folder_path(folder_path)
+        canonical = normalize_store_name(store_name)
+        token = str(store_id or "").strip()
+        if not normalized or not canonical or not token:
+            return False
+        changed = persist_store_id_hint(
+            inventory_path=normalized,
+            store_name=canonical,
+            store_id=token,
+        )
+        if canonical == "Steam":
+            changed = (
+                self.upsert_folder_icon_metadata(
+                    normalized,
+                    {
+                        "SteamAppId": token,
+                        "steam_appid": token,
+                        "steamappid": token,
+                        "SteamID": token,
+                        "steamid": token,
+                    },
+                )
+                or changed
+            )
+        return changed
+
+    def assign_steam_appid(self, folder_path: str, steam_appid: str) -> bool:
+        return self.assign_store_id_hint(
+            folder_path=folder_path,
+            store_name="Steam",
+            store_id=steam_appid,
+        )
+
+    def clear_owned_store_info_for_inventory(self, folder_path: str) -> bool:
+        normalized = self._norm_folder_path(folder_path)
+        if not normalized:
+            return False
+        changed = False
+        self.db.delete_store_links_for_inventory_path(normalized, include_manual=True)
+        ids_file = Path(normalized) / ".gm_store_ids.json"
+        if ids_file.exists():
+            try:
+                ids_file.unlink()
+                changed = True
+            except OSError:
+                pass
+        steam_marker = Path(normalized) / "steam_appid.txt"
+        if steam_marker.exists():
+            try:
+                steam_marker.unlink()
+                changed = True
+            except OSError:
+                pass
+        changed = (
+            self.upsert_folder_icon_metadata(
+                normalized,
+                {
+                    "SteamAppId": None,
+                    "steam_appid": None,
+                    "steamappid": None,
+                    "SteamID": None,
+                    "steamid": None,
+                },
+            )
+            or changed
+        )
+        return changed
 
     def processed_source_fingerprint256(self, source_image_bytes: bytes) -> str:
         return processed_fingerprint256_from_source_image(source_image_bytes)
@@ -338,6 +493,8 @@ class AppState:
         folder_path: str,
         cleaned_name: str,
         full_name: str,
+        *,
+        include_assigned_hints: bool = True,
     ) -> SgdbTargetResolution:
         settings = self.icon_search_settings()
         candidates, _variants, exact_appid_game_id = resolve_target_candidates(
@@ -345,6 +502,7 @@ class AppState:
             folder_path=self._norm_folder_path(folder_path),
             cleaned_name=cleaned_name,
             full_name=full_name,
+            include_assigned_hints=bool(include_assigned_hints),
         )
         binding = self.get_sgdb_binding(folder_path)
         drift_reasons: list[str] = []
@@ -399,13 +557,89 @@ class AppState:
 
     def resolve_sgdb_game_by_id(self, game_id: int) -> SgdbGameCandidate:
         details = sgdb_resolve_game_by_id(self.icon_search_settings(), int(game_id))
+        steam_appid = str(details.steam_appid or "").strip()
+        store_ids = {"Steam": steam_appid} if steam_appid.isdigit() else {}
         return SgdbGameCandidate(
             game_id=int(details.game_id),
             title=details.title,
             confidence=1.0,
             evidence=[f"Manual SGDB ID {int(game_id)}"],
             steam_appid=details.steam_appid,
+            store_ids=store_ids,
         )
+
+    def resolve_sgdb_game_by_store_id(
+        self,
+        store_name: str,
+        store_id: str,
+    ) -> SgdbGameCandidate:
+        canonical = normalize_store_name(store_name)
+        token = str(store_id or "").strip()
+        if not canonical or not token:
+            raise ValueError("Store name and store ID are required.")
+        platform_candidates: dict[str, tuple[str, ...]] = {
+            "Steam": ("steam",),
+            "EGS": ("epic", "egs"),
+            "GOG": ("gog",),
+            "Itch.io": ("itchio", "itch"),
+            "Humble": ("humble",),
+            "Ubisoft": ("ubisoft", "uplay"),
+            "Battle.net": ("battlenet", "blizzard"),
+            "Amazon Games": ("amazon", "primegaming"),
+        }
+        candidates = platform_candidates.get(canonical, (canonical.casefold(),))
+        last_error: Exception | None = None
+        for platform in candidates:
+            try:
+                details = sgdb_resolve_game_by_platform_id(
+                    self.icon_search_settings(),
+                    platform,
+                    token,
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+            steam_appid = str(details.steam_appid or "").strip()
+            if canonical == "Steam" and token.isdigit():
+                steam_appid = steam_appid or token
+            return SgdbGameCandidate(
+                game_id=int(details.game_id),
+                title=details.title,
+                confidence=1.0,
+                evidence=[f"Manual {canonical} ID {token} (platform={platform})"],
+                steam_appid=steam_appid or None,
+                identity_store=canonical,
+                identity_store_id=token,
+                store_ids={canonical: token},
+            )
+        if canonical == "Steam" and token.isdigit():
+            title = f"Steam App {token}"
+            try:
+                url = f"https://store.steampowered.com/api/appdetails?appids={token}&l=english"
+                with request.urlopen(url, timeout=12) as response:
+                    payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+                node = payload.get(token, {}) if isinstance(payload, dict) else {}
+                data = node.get("data", {}) if isinstance(node, dict) else {}
+                name = str(data.get("name") or "").strip()
+                if name:
+                    title = name
+            except Exception:
+                pass
+            return SgdbGameCandidate(
+                game_id=0,
+                title=title,
+                confidence=0.95,
+                evidence=[f"Manual Steam AppID {token} (no SGDB mapping)"],
+                steam_appid=token,
+                identity_store=canonical,
+                identity_store_id=token,
+                store_ids={canonical: token},
+            )
+        if last_error is not None:
+            raise RuntimeError(
+                f"Could not resolve SGDB game using {canonical} ID '{token}': {last_error}"
+            ) from last_error
+        raise RuntimeError(f"Could not resolve SGDB game using {canonical} ID '{token}'.")
 
     def detect_sgdb_origin_status(
         self,
@@ -591,6 +825,9 @@ class AppState:
                 "SourceGameId": str(int(game.game_id)),
             },
         )
+        game_steam_appid = str(game.steam_appid or "").strip()
+        if game_steam_appid.isdigit():
+            self.assign_steam_appid(normalized_folder, game_steam_appid)
         report.succeeded = 1
         report.details.append(f"Uploaded to SteamGridDB game {int(game.game_id)} ({game.title}).")
         return report
@@ -669,6 +906,21 @@ class AppState:
             size_workers=self._perf_scan_workers(),
             progress_interval_s=self._perf_progress_interval_s(),
         )
+        path_map = self.db.list_store_links_for_paths(
+            [item.full_path for item in items if item.is_dir],
+            verified_only=True,
+        )
+        owned_by_path = ownership_map_from_store_links(path_map)
+        for item in items:
+            if not item.is_dir:
+                item.owned_stores = []
+                item.primary_store = None
+                continue
+            key = self._norm_store_inventory_path(item.full_path)
+            stores = owned_by_path.get(key, [])
+            ordered = sort_stores(stores)
+            item.owned_stores = ordered
+            item.primary_store = primary_store(ordered)
         if cache_obj is not None:
             cache_obj.save()
         return root_infos, items
@@ -676,6 +928,489 @@ class AppState:
     def refresh_roots_only(self) -> list[RootDisplayInfo]:
         roots = self.list_roots()
         return list_root_display_infos(roots)
+
+    def list_store_accounts(self, *, enabled_only: bool = False) -> list[StoreAccount]:
+        return self.db.list_store_accounts(enabled_only=enabled_only)
+
+    def available_store_names(self) -> list[str]:
+        return available_store_names()
+
+    @staticmethod
+    def _store_secret_key(store_name: str, account_id: str) -> str:
+        return f"store_token:{normalize_store_name(store_name)}:{str(account_id or '').strip()}"
+
+    @staticmethod
+    def _store_link_name_signature(item: InventoryItem) -> str:
+        source = str(item.cleaned_name or item.full_name or "").strip().casefold()
+        if not source:
+            return ""
+        return " ".join(part for part in _NON_ALNUM_RE.sub(" ", source).split() if part)
+
+    @staticmethod
+    def _store_link_ids_signature_from_json(raw: str) -> dict[str, str]:
+        token = str(raw or "").strip()
+        if not token:
+            return {}
+        try:
+            parsed = json.loads(token)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        out: dict[str, str] = {}
+        for key, value in parsed.items():
+            canonical_store = normalize_store_name(str(key or "").replace("_", " ").strip())
+            value_token = str(value or "").strip().casefold()
+            if canonical_store and value_token:
+                out[canonical_store] = value_token
+        return out
+
+    def _store_link_ids_signature_for_path(self, folder_path: str) -> dict[str, str]:
+        normalized = self._norm_folder_path(folder_path)
+        if not normalized:
+            return {}
+        metadata = self.read_folder_icon_metadata(normalized)
+        folded_meta = {
+            str(key or "").strip().casefold(): str(value or "").strip()
+            for key, value in metadata.items()
+            if str(key or "").strip() and str(value or "").strip()
+        }
+        by_store: dict[str, set[str]] = {}
+        for store_name, keys in _STORE_ID_HINT_KEYS.items():
+            canonical = normalize_store_name(store_name)
+            if not canonical:
+                continue
+            numeric_only = canonical == "Steam"
+            values = by_store.setdefault(canonical, set())
+            for key in keys:
+                token = str(folded_meta.get(str(key or "").strip().casefold(), "")).strip()
+                if not token:
+                    continue
+                if numeric_only and not token.isdigit():
+                    continue
+                values.add(token.casefold())
+
+        steam_file = Path(normalized) / "steam_appid.txt"
+        if steam_file.is_file():
+            try:
+                token = steam_file.read_text(encoding="utf-8", errors="ignore").strip()
+            except OSError:
+                token = ""
+            if token.isdigit():
+                by_store.setdefault("Steam", set()).add(token.casefold())
+
+        ids_file = Path(normalized) / _STORE_IDS_FILENAME
+        if ids_file.is_file():
+            try:
+                parsed = json.loads(ids_file.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, json.JSONDecodeError):
+                parsed = {}
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    canonical = normalize_store_name(str(key or "").replace("_", " ").strip())
+                    token = str(value or "").strip()
+                    if not canonical or not token:
+                        continue
+                    if canonical == "Steam" and not token.isdigit():
+                        continue
+                    by_store.setdefault(canonical, set()).add(token.casefold())
+
+        return {
+            store_name: "|".join(sorted(values))
+            for store_name, values in by_store.items()
+            if values
+        }
+
+    @staticmethod
+    def _store_link_row_key(row: dict[str, object]) -> tuple[str, str, str]:
+        return (
+            normalize_store_name(str(row.get("store_name") or "").strip()),
+            str(row.get("account_id") or "").strip(),
+            str(row.get("entitlement_id") or "").strip(),
+        )
+
+    @staticmethod
+    def _store_link_row_payload(row: dict[str, object]) -> tuple[str, float, bool, str]:
+        return (
+            str(row.get("match_method") or "").strip(),
+            round(float(row.get("confidence") or 0.0), 6),
+            bool(row.get("verified")),
+            str(row.get("notes") or "").strip(),
+        )
+
+    def connect_store_account(
+        self,
+        store_name: str,
+        auth_payload: dict[str, str] | None = None,
+    ) -> StoreAccount | None:
+        connector = connector_for_store(store_name)
+        if connector is None:
+            return None
+        result = connector.connect(auth_payload)
+        if not result.success:
+            return None
+        canonical_store = normalize_store_name(store_name)
+        account_id = str(result.account_id or "").strip()
+        if not account_id:
+            return None
+        if result.token_secret:
+            if not set_secret(self._store_secret_key(canonical_store, account_id), result.token_secret):
+                raise RuntimeError(
+                    "Could not store store-account token in secure secret storage (Credential Manager)."
+                )
+        self.db.upsert_store_account(
+            canonical_store,
+            account_id,
+            str(result.display_name or "").strip() or account_id,
+            auth_kind=str(result.auth_kind or result.status or "launcher_import"),
+            enabled=True,
+        )
+        self.db.upsert_store_token_meta(
+            canonical_store,
+            account_id,
+            expires_utc=str(result.expires_utc or "").strip(),
+            scopes=str(result.scopes or "").strip(),
+            status=str(result.status or "").strip(),
+        )
+        for account in self.db.list_store_accounts():
+            if (
+                normalize_store_name(account.store_name) == canonical_store
+                and account.account_id == account_id
+            ):
+                return account
+        return None
+
+    def disconnect_store_account(self, store_name: str, account_id: str) -> bool:
+        canonical_store = normalize_store_name(store_name)
+        account = str(account_id or "").strip()
+        if not canonical_store or not account:
+            return False
+        connector = connector_for_store(canonical_store)
+        if connector is not None:
+            try:
+                connector.disconnect(account)
+            except Exception:
+                pass
+        delete_secret(self._store_secret_key(canonical_store, account))
+        self.db.delete_store_account(canonical_store, account)
+        return True
+
+    def sync_store_accounts(
+        self,
+        progress_cb: Callable[[str, int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        launch_client_by_store: dict[str, bool] | None = None,
+    ) -> list[dict[str, object]]:
+        coordinator = StorefrontSyncCoordinator(
+            self.db,
+            token_loader=lambda store, account: get_secret(
+                self._store_secret_key(store, account)
+            ),
+            token_saver=lambda store, account, token: set_secret(
+                self._store_secret_key(store, account),
+                token,
+            ),
+        )
+        return coordinator.sync_enabled_accounts(
+            progress_cb=progress_cb,
+            should_cancel=should_cancel,
+            launch_client_by_store=launch_client_by_store,
+            keep_existing_on_unreachable=True,
+        )
+
+    def rebuild_store_links_from_inventory(
+        self,
+        inventory: list[InventoryItem],
+        progress_cb: Callable[[str, int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        force_rebuild_all: bool = False,
+    ) -> int:
+        accounts = self.db.list_store_accounts(enabled_only=True)
+        if not accounts:
+            return 0
+        owned_by_store: dict[str, list[StoreOwnedGame]] = {}
+        owned_lookup: dict[tuple[str, str, str], StoreOwnedGame] = {}
+        total_accounts = max(1, len(accounts))
+        if progress_cb is not None:
+            progress_cb("Rebuild links: load owned libraries", 0, total_accounts)
+        for idx, account in enumerate(accounts, start=1):
+            if should_cancel is not None and should_cancel():
+                return 0
+            canonical_store = normalize_store_name(account.store_name)
+            rows = self.db.list_store_owned_games(canonical_store, account.account_id)
+            if rows:
+                owned_by_store.setdefault(canonical_store, []).extend(rows)
+                for row in rows:
+                    entitlement = str(row.entitlement_id or "").strip()
+                    if not entitlement:
+                        continue
+                    owned_lookup[(canonical_store, account.account_id, entitlement)] = row
+            if progress_cb is not None:
+                progress_cb("Rebuild links: load owned libraries", idx, total_accounts)
+        evidence_rows = strict_match_inventory_to_owned_games(
+            inventory,
+            metadata_loader=lambda path: self.read_folder_icon_metadata(path),
+            owned_games_by_store=owned_by_store,
+            progress_cb=progress_cb,
+            should_cancel=should_cancel,
+        )
+        if should_cancel is not None and should_cancel():
+            return 0
+        dir_items = [item for item in inventory if item.is_dir]
+        all_paths: list[str] = []
+        current_name_sig_by_path: dict[str, str] = {}
+        current_ids_sig_by_path: dict[str, dict[str, str]] = {}
+        total_dirs = max(1, len(dir_items))
+        if progress_cb is not None:
+            progress_cb("Rebuild links: collect local signatures", 0, total_dirs)
+        for idx, item in enumerate(dir_items, start=1):
+            normalized_path = self._norm_store_inventory_path(item.full_path)
+            if normalized_path:
+                all_paths.append(normalized_path)
+                current_name_sig_by_path[normalized_path] = self._store_link_name_signature(item)
+                current_ids_sig_by_path[normalized_path] = self._store_link_ids_signature_for_path(
+                    item.full_path
+                )
+            if progress_cb is not None:
+                progress_cb("Rebuild links: collect local signatures", idx, total_dirs)
+        all_paths = list(dict.fromkeys(all_paths))
+        if not all_paths:
+            return 0
+
+        existing_rows = self.db.list_store_link_rows_for_paths(all_paths, include_manual=False)
+        previous_states = self.db.list_store_link_rebuild_state_for_paths(all_paths)
+
+        desired_by_path: dict[str, dict[tuple[str, str, str], dict[str, object]]] = {}
+        for row in evidence_rows:
+            normalized_path = self._norm_store_inventory_path(row.inventory_path)
+            store_name = normalize_store_name(row.store_name)
+            account_id = str(row.account_id or "").strip()
+            entitlement_id = str(row.entitlement_id or "").strip()
+            if not normalized_path or not store_name or not account_id or not entitlement_id:
+                continue
+            payload = {
+                "inventory_path": normalized_path,
+                "store_name": store_name,
+                "account_id": account_id,
+                "entitlement_id": entitlement_id,
+                "match_method": str(row.match_method or "").strip() or "unknown",
+                "confidence": float(row.confidence),
+                "verified": True,
+                "notes": str(row.notes or "").strip(),
+            }
+            desired_by_path.setdefault(normalized_path, {})[self._store_link_row_key(payload)] = payload
+
+        existing_by_path: dict[str, dict[tuple[str, str, str], dict[str, object]]] = {}
+        for path in all_paths:
+            existing_map: dict[tuple[str, str, str], dict[str, object]] = {}
+            for row in existing_rows.get(path, []):
+                key = self._store_link_row_key(row)
+                if not key[0] or not key[1] or not key[2]:
+                    continue
+                existing_map[key] = row
+            existing_by_path[path] = existing_map
+
+        force_all_paths: set[str] = set()
+        force_stores_by_path: dict[str, set[str]] = {}
+        if force_rebuild_all:
+            force_all_paths = set(all_paths)
+        for path in all_paths:
+            if path in force_all_paths:
+                continue
+            prev = previous_states.get(path, {})
+            prev_name_sig = str(prev.get("name_sig") or "").strip()
+            prev_ids_sig = self._store_link_ids_signature_from_json(
+                str(prev.get("store_ids_sig_json") or "{}")
+            )
+            cur_name_sig = str(current_name_sig_by_path.get(path) or "").strip()
+            cur_ids_sig = current_ids_sig_by_path.get(path, {})
+            if prev and prev_name_sig != cur_name_sig:
+                force_all_paths.add(path)
+                continue
+            changed_stores = {
+                store_name
+                for store_name in set(prev_ids_sig.keys()) | set(cur_ids_sig.keys())
+                if str(prev_ids_sig.get(store_name, "")).strip()
+                != str(cur_ids_sig.get(store_name, "")).strip()
+            }
+            if changed_stores:
+                force_stores_by_path[path] = changed_stores
+
+        changes = 0
+        delta_ops: list[tuple[str, dict[str, object]]] = []
+        for path in all_paths:
+            existing_map = dict(existing_by_path.get(path, {}))
+            desired_map = dict(desired_by_path.get(path, {}))
+
+            if path in force_all_paths and existing_map:
+                deleted = self.db.delete_store_links_for_inventory_path(path, include_manual=False)
+                if deleted > 0:
+                    changes += deleted
+                existing_map.clear()
+            else:
+                forced_stores = force_stores_by_path.get(path, set())
+                for store_name in sorted(forced_stores):
+                    deleted = self.db.delete_store_links_for_inventory_store(
+                        path,
+                        store_name,
+                        include_manual=False,
+                    )
+                    if deleted > 0:
+                        changes += deleted
+                    existing_map = {
+                        key: row
+                        for key, row in existing_map.items()
+                        if key[0] != store_name
+                    }
+
+            for key in sorted(existing_map.keys()):
+                if key in desired_map:
+                    continue
+                deleted = self.db.delete_store_link(
+                    inventory_path=path,
+                    store_name=key[0],
+                    account_id=key[1],
+                    entitlement_id=key[2],
+                )
+                if deleted > 0:
+                    changes += deleted
+
+            for key, payload in desired_map.items():
+                existing = existing_map.get(key)
+                should_upsert = existing is None
+                if existing is not None:
+                    should_upsert = (
+                        self._store_link_row_payload(existing)
+                        != self._store_link_row_payload(payload)
+                    )
+                if not should_upsert:
+                    continue
+                delta_ops.append(("upsert", payload))
+
+        total_delta_ops = max(1, len(delta_ops))
+        if progress_cb is not None:
+            progress_cb("Rebuild links: apply changed links", 0, total_delta_ops)
+        for idx, (_op, payload) in enumerate(delta_ops, start=1):
+            self.db.upsert_store_link(
+                inventory_path=str(payload.get("inventory_path") or ""),
+                store_name=str(payload.get("store_name") or ""),
+                account_id=str(payload.get("account_id") or ""),
+                entitlement_id=str(payload.get("entitlement_id") or ""),
+                match_method=str(payload.get("match_method") or "unknown"),
+                confidence=float(payload.get("confidence") or 0.0),
+                verified=bool(payload.get("verified")),
+                notes=str(payload.get("notes") or ""),
+            )
+            changes += 1
+            if progress_cb is not None:
+                progress_cb("Rebuild links: apply changed links", idx, total_delta_ops)
+
+        total_rows = max(1, len(evidence_rows))
+        if progress_cb is not None:
+            progress_cb("Rebuild links: persist discovered IDs", 0, total_rows)
+        for idx, row in enumerate(evidence_rows, start=1):
+            if row.match_method == "strong_id":
+                if progress_cb is not None:
+                    progress_cb("Rebuild links: persist discovered IDs", idx, total_rows)
+                continue
+            owned = owned_lookup.get(
+                (
+                    normalize_store_name(row.store_name),
+                    str(row.account_id or "").strip(),
+                    str(row.entitlement_id or "").strip(),
+                )
+            )
+            if owned is not None:
+                token = preferred_store_id_for_owned_game(row.store_name, owned)
+                if token:
+                    self.assign_store_id_hint(
+                        folder_path=row.inventory_path,
+                        store_name=row.store_name,
+                        store_id=token,
+                    )
+            if progress_cb is not None:
+                progress_cb("Rebuild links: persist discovered IDs", idx, total_rows)
+
+        total_state = max(1, len(all_paths))
+        if progress_cb is not None:
+            progress_cb("Rebuild links: save rebuild state", 0, total_state)
+        for idx, path in enumerate(all_paths, start=1):
+            self.db.upsert_store_link_rebuild_state(
+                inventory_path=path,
+                name_sig=current_name_sig_by_path.get(path, ""),
+                store_ids_sig_json=json.dumps(
+                    current_ids_sig_by_path.get(path, {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+            if progress_cb is not None:
+                progress_cb("Rebuild links: save rebuild state", idx, total_state)
+        return changes
+
+    def set_manual_owned_stores(self, folder_path: str, stores: list[str]) -> int:
+        path = self._norm_folder_path(folder_path)
+        if not path:
+            return 0
+        ordered = sort_stores(stores)
+        self.db.delete_store_links_for_inventory_path(path, include_manual=True)
+        for store_name in ordered:
+            canonical = normalize_store_name(store_name)
+            if not canonical:
+                continue
+            self.db.upsert_store_link(
+                inventory_path=path,
+                store_name=canonical,
+                account_id="__manual__",
+                entitlement_id=f"manual:{canonical.casefold()}:{path.casefold()}",
+                match_method="manual_confirmed",
+                confidence=1.0,
+                verified=True,
+                notes="Manual ownership assignment.",
+            )
+        return len(ordered)
+
+    def store_page_url_for_inventory(
+        self,
+        folder_path: str,
+        *,
+        store_name: str,
+        game_title: str = "",
+    ) -> str:
+        canonical = normalize_store_name(store_name)
+        if not canonical:
+            return ""
+        target = self.db.first_store_link_target(folder_path, store_name=canonical) or {}
+        store_game_id = str(target.get("store_game_id", "") or target.get("entitlement_id", "")).strip()
+        title = str(target.get("title", "")).strip() or str(game_title or "").strip()
+        return store_game_url(
+            canonical,
+            store_game_id=store_game_id,
+            title=title,
+        )
+
+    def store_targets_for_inventory(
+        self,
+        folder_path: str,
+        *,
+        game_title: str = "",
+    ) -> list[dict[str, str]]:
+        rows = self.db.list_store_link_targets_for_inventory(folder_path, verified_only=True)
+        by_store: dict[str, dict[str, str]] = {}
+        for row in rows:
+            canonical = normalize_store_name(str(row.get("store_name") or ""))
+            if not canonical or canonical in by_store:
+                continue
+            store_id = str(row.get("store_game_id") or row.get("entitlement_id") or "").strip()
+            title = str(row.get("title") or "").strip() or str(game_title or "").strip()
+            by_store[canonical] = {
+                "store_name": canonical,
+                "store_id": store_id,
+                "title": title,
+                "url": store_game_url(canonical, store_game_id=store_id, title=title),
+            }
+        ordered = sort_stores(list(by_store.keys()))
+        return [by_store[store] for store in ordered if store in by_store]
 
     def find_tag_candidates(self, items: list[InventoryItem]) -> list[TagCandidate]:
         names = [(item.full_name, not item.is_dir) for item in items]
@@ -775,12 +1510,12 @@ class AppState:
             if set_secret("steamgriddb_api_key", legacy_steam_key):
                 self.set_ui_pref("steamgriddb_api_key", "")
 
-        iconfinder_key = get_secret("iconfinder_api_key")
-        legacy_iconfinder_key = self.get_ui_pref("iconfinder_api_key", "")
-        if not iconfinder_key and legacy_iconfinder_key:
-            iconfinder_key = legacy_iconfinder_key
-            if set_secret("iconfinder_api_key", legacy_iconfinder_key):
-                self.set_ui_pref("iconfinder_api_key", "")
+        igdb_secret = get_secret("igdb_client_secret")
+        legacy_igdb_secret = self.get_ui_pref("igdb_client_secret", "")
+        if not igdb_secret and legacy_igdb_secret:
+            igdb_secret = legacy_igdb_secret
+            if set_secret("igdb_client_secret", legacy_igdb_secret):
+                self.set_ui_pref("igdb_client_secret", "")
 
         return IconSearchSettings(
             steamgriddb_enabled=self.get_ui_pref("steamgriddb_enabled", "1") == "1",
@@ -788,20 +1523,24 @@ class AppState:
             steamgriddb_api_base=self.get_ui_pref(
                 "steamgriddb_api_base", DEFAULT_STEAMGRIDDB_API_BASE
             ),
-            iconfinder_enabled=self.get_ui_pref("iconfinder_enabled", "1") == "1",
-            iconfinder_api_key=iconfinder_key,
-            iconfinder_api_base=self.get_ui_pref(
-                "iconfinder_api_base", DEFAULT_ICONFINDER_API_BASE
-            ),
+            igdb_enabled=self.get_ui_pref("igdb_enabled", "0") == "1",
+            igdb_client_id=self.get_ui_pref("igdb_client_id", ""),
+            igdb_client_secret=igdb_secret,
+            igdb_api_base=self.get_ui_pref("igdb_api_base", DEFAULT_IGDB_API_BASE),
             timeout_seconds=15.0,
         )
 
     def save_icon_search_settings(self, settings: IconSearchSettings) -> None:
         self.set_ui_pref("steamgriddb_enabled", "1" if settings.steamgriddb_enabled else "0")
         self.set_ui_pref("steamgriddb_api_base", settings.steamgriddb_api_base)
-        self.set_ui_pref("iconfinder_enabled", "1" if settings.iconfinder_enabled else "0")
-        self.set_ui_pref("iconfinder_api_base", settings.iconfinder_api_base)
+        self.set_ui_pref("igdb_enabled", "1" if settings.igdb_enabled else "0")
+        self.set_ui_pref("igdb_client_id", settings.igdb_client_id)
+        self.set_ui_pref("igdb_api_base", settings.igdb_api_base)
         self.set_ui_pref("steamgriddb_api_key", "")
+        self.set_ui_pref("igdb_client_secret", "")
+        # Retire legacy provider prefs and plaintext key.
+        self.set_ui_pref("iconfinder_enabled", "0")
+        self.set_ui_pref("iconfinder_api_base", "")
         self.set_ui_pref("iconfinder_api_key", "")
 
         steam_ok = (
@@ -809,12 +1548,13 @@ class AppState:
             if not settings.steamgriddb_api_key
             else set_secret("steamgriddb_api_key", settings.steamgriddb_api_key)
         )
-        iconfinder_ok = (
-            delete_secret("iconfinder_api_key")
-            if not settings.iconfinder_api_key
-            else set_secret("iconfinder_api_key", settings.iconfinder_api_key)
+        igdb_ok = (
+            delete_secret("igdb_client_secret")
+            if not settings.igdb_client_secret
+            else set_secret("igdb_client_secret", settings.igdb_client_secret)
         )
-        if not steam_ok or not iconfinder_ok:
+        delete_secret("iconfinder_api_key")
+        if not steam_ok or not igdb_ok:
             raise RuntimeError(
                 "Could not store API keys in secure secret storage (Credential Manager)."
             )
@@ -848,6 +1588,12 @@ class AppState:
         chunks = [f"{name}: {count}" for name, count in sorted(by_provider.items())]
         return f"Success. Candidates found: {', '.join(chunks)}"
 
+    def discover_store_ids_for_title(self, title: str) -> dict[str, str]:
+        return lookup_igdb_store_ids_for_title(
+            self.icon_search_settings(),
+            str(title or "").strip(),
+        )
+
     def download_candidate(self, candidate: IconCandidate) -> bytes:
         local_path = Path(str(candidate.image_url or "").strip())
         if local_path.exists() and local_path.is_file():
@@ -867,11 +1613,17 @@ class AppState:
         size: int = 64,
         bg_removal_engine: str = "none",
         border_shader: dict[str, object] | None = None,
+        background_fill_mode: str = "black",
+        background_fill_params: dict[str, object] | None = None,
     ) -> bytes:
         style_key = icon_style.strip().casefold() or "none"
         bg_key = bg_removal_engine.strip().casefold() or "none"
         shader_key = json.dumps(border_shader or {}, sort_keys=True)
-        cache_key = f"{candidate.preview_url}|{style_key}|{bg_key}|{shader_key}|s{size}"
+        fill_key = normalize_background_fill_mode(background_fill_mode)
+        fill_params_key = json.dumps(background_fill_params or {}, sort_keys=True)
+        cache_key = (
+            f"{candidate.preview_url}|{style_key}|{bg_key}|{shader_key}|f:{fill_key}|fp:{fill_params_key}|s{size}"
+        )
         cached = self.preview_cache.read(cache_key, extension=".png")
         if cached is not None:
             return cached
@@ -888,6 +1640,8 @@ class AppState:
             icon_style=style_key,
             bg_removal_engine=bg_key,
             border_shader=border_shader,
+            background_fill_mode=fill_key,
+            background_fill_params=background_fill_params,
         )
         self.preview_cache.write(cache_key, preview, extension=".png")
         return preview
@@ -903,6 +1657,8 @@ class AppState:
         bg_removal_params: dict[str, object] | None = None,
         text_preserve_config: dict[str, object] | None = None,
         border_shader: dict[str, object] | None = None,
+        background_fill_mode: str = "black",
+        background_fill_params: dict[str, object] | None = None,
         size_improvements: dict[int, dict[str, object]] | None = None,
     ) -> IconApplyResult:
         # Isolate icon build/apply in a subprocess so decoder/plugin crashes cannot
@@ -917,6 +1673,8 @@ class AppState:
             bg_removal_params=bg_removal_params,
             text_preserve_config=text_preserve_config,
             border_shader=border_shader,
+            background_fill_mode=background_fill_mode,
+            background_fill_params=background_fill_params,
             size_improvements=size_improvements,
             temp_dir=self.db.db_path.parent / "tmp",
         )
